@@ -89,7 +89,7 @@ motor_control_t motor_control = {
 /* ========================================================================== */
 
 /**
-  * @brief  7-segment SVPWM update — writes CCR1/2/3 for TIM1
+  * @brief  11-segment SVPWM update — writes CCR1/2/3 for TIM1
   */
 void SVPWM_Update(float Ud, float Uq, float angle, uint32_t period)
 {
@@ -624,7 +624,7 @@ void foc_forward(float d, float q, float angle_el)
 
     /* Inverse Park transform */
     float mod_alpha = mod_d * cosf(angle_el) - mod_q * sinf(angle_el);
-    float mod_beta  = mod_d * sinf(angle_el) + mod_q * cosf(angle_el); // 将最后的 + 改为 -
+    float mod_beta  = mod_d * sinf(angle_el) + mod_q * cosf(angle_el);
 
     /* SVM → duty cycles */
     SVM(mod_alpha, mod_beta, &d_u, &d_v, &d_w);

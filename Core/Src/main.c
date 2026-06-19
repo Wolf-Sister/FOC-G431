@@ -163,7 +163,7 @@ int main(void)
       //             tor_p   tor_i   vel_p   vel_i   pos_p
 motor_pid_init(0.05f,  5.0f,   0.0f,   0.0f,   0.0f);
       set_motor_mode(MOTOR_TORQUE);
-      motor_control.set_torque = 0.2f;  /* 0.2A barely moves motor; 1A needed */
+      motor_control.set_torque = 0.1f;
 
       /* current_loop_enable already set inside foc_alignSensor() */
       test_phase = 2;
@@ -271,7 +271,6 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
     static uint32_t calib_sum_c = 0;
     static uint16_t calib_cnt    = 0;
     static uint8_t  cl_divider   = 0;  /* software divider for 20kHz→5kHz */
-    static uint8_t  enc_divider  = 0;  /* software divider for 20kHz→1kHz */
 
     if (hadc->Instance == ADC1)
     {
@@ -310,21 +309,21 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
             foc_sync_phase_currents();
 
             cl_divider++;
-            if (cl_divider >= 4)   /* 20kHz / 4 = 5kHz */
-            {
-                cl_divider = 0;
-                if (current_loop_enable) {
-                    foc_current_loop();
-                }
-            }
-
-            /* 5. Encoder sensor update at 5 kHz (20kHz / 4) */
-            enc_divider++;
-            if (enc_divider >= 4)
-            {
-                enc_divider = 0;
-                AS5047P_Sensor_Update(&AngleSensor);
-            }
+			if (cl_divider >= 4) // 20kHz / 4 = 5kHz
+			{
+				cl_divider = 0;
+    
+				// 1. 先更新编码器，获取最新角度
+				AS5047P_Sensor_Update(&AngleSensor);
+    
+				// 2. 同步电流数据
+				foc_sync_phase_currents();
+    
+				// 3. 执行电流环
+				if (current_loop_enable) {
+					foc_current_loop();
+				}
+			}
         }
     }
 }
