@@ -1,0 +1,119 @@
+/**
+  ******************************************************************************
+  * @file    as5047p_ext.c
+  * @brief   AS5047P encoder extension — velocity, multi-turn accumulation
+  *
+  *          Usage pattern (identical to TinyFoc's AS5600):
+  *            1. AS5047P_Sensor_Init(&AngleSensor);
+  *            2. Call AS5047P_Sensor_Update(&AngleSensor) at fixed rate (1kHz)
+  *            3. Read with AS5047P_GetAngle / GetVelocity / GetAccumulateAngle
+  ******************************************************************************
+  */
+
+/* Includes ------------------------------------------------------------------*/
+#include "as5047p_ext.h"
+#include "as5047p.h"
+#include "utils.h"
+
+/* Conversion constant: AS5047P is 14-bit (0–16383) → 0–2π radians -----------*/
+#define AS5047P_ANGLE_MAX 16383.0f
+#define AS5047P_RAD_SCALE (_2PI / AS5047P_ANGLE_MAX)
+
+/* Global sensor instance ----------------------------------------------------*/
+AS5047P_Sensor_T AngleSensor = {0};
+
+/* --------------------------------------------------------------------------*/
+/**
+  * @brief  Initialize sensor state
+  */
+void AS5047P_Sensor_Init(AS5047P_Sensor_T *s)
+{
+    s->prev_angle_raw   = 0.0f;
+    s->prev_update_ts   = 0;
+    s->rotation_offset  = 0.0f;
+    s->total_angle_rad  = 0.0f;
+    s->velocity_rad_s   = 0.0f;
+}
+
+/**
+  * @brief  Update sensor reading — call at fixed rate (e.g. 1kHz TIM ISR)
+  *
+  *         1. Reads latest DMA-captured raw angle
+  *         2. Detects wrap-around for multi-turn accumulation
+  *         3. Computes velocity from delta-angle / delta-time
+  */
+void AS5047P_Sensor_Update(AS5047P_Sensor_T *s)
+{
+    /* Read latest DMA result (14-bit raw) */
+    uint16_t raw = AS5047P_DMA_GetAngleCallback();
+    if (raw == 0xFFFFU) return;   /* Invalid read, skip this cycle */
+
+    float current_angle = (float)raw * AS5047P_RAD_SCALE;
+
+    /* First valid reading — initialize state */
+    if (s->prev_update_ts == 0) {
+        s->prev_angle_raw  = current_angle;
+        s->total_angle_rad = current_angle;
+        s->prev_update_ts  = dwt_get_micros();
+        return;
+    }
+
+    /* Detect full-rotation wrap */
+    float delta = current_angle - s->prev_angle_raw;
+    if (delta > PI) {
+        /* Wrapped from near-2π to near-0 (forward rotation) */
+        s->rotation_offset -= _2PI;
+    } else if (delta < -PI) {
+        /* Wrapped from near-0 to near-2π (reverse rotation) */
+        s->rotation_offset += _2PI;
+    }
+
+    s->total_angle_rad = current_angle + s->rotation_offset;
+
+    /* Velocity from delta-angle / delta-time */
+    unsigned long now = dwt_get_micros();
+    float dt = (float)(now - s->prev_update_ts) * 1e-6f;
+    if (dt > 0.0f && dt < 1.0f) {
+        s->velocity_rad_s = delta / dt;
+    }
+
+    s->prev_angle_raw  = current_angle;
+    s->prev_update_ts  = now;
+
+    /* Queue next DMA read for the next Update() call */
+    AS5047P_DMA_StartRequest();
+}
+
+/**
+  * @brief  Get current mechanical angle [0, 2π)
+  */
+float AS5047P_GetAngle(const AS5047P_Sensor_T *s)
+{
+    return s->prev_angle_raw;
+}
+
+/**
+  * @brief  Get instantaneous angular velocity [rad/s]
+  */
+float AS5047P_GetVelocity(const AS5047P_Sensor_T *s)
+{
+    return s->velocity_rad_s;
+}
+
+/**
+  * @brief  Get accumulated multi-turn angle [rad]
+  */
+float AS5047P_GetAccumulateAngle(const AS5047P_Sensor_T *s)
+{
+    return s->total_angle_rad;
+}
+
+/**
+  * @brief  Get raw angle, single conversion (blocking, for calibration use only)
+  */
+float AS5047P_GetOnceAngle(const AS5047P_Sensor_T *s)
+{
+    uint16_t raw = AS5047P_DMA_GetAngleCallback();
+    if (raw == 0xFFFFU) return s->prev_angle_raw;
+    return (float)raw * AS5047P_RAD_SCALE;
+}

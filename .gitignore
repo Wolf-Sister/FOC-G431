@@ -1,0 +1,143 @@
+# ============================================================
+# FOC_v1 - STM32G431 FOC Motor Controller
+# Git Ignore Rules
+# ============================================================
+
+# ----------------------------------------------------------
+# Keil MDK-ARM Build Outputs
+# ----------------------------------------------------------
+# Object files
+*.o
+*.obj
+*.crf
+
+# Dependency files
+*.d
+*.dep
+
+# Listing files
+*.lst
+*.LST
+
+# Preprocessor output
+*.i
+*.ii
+
+# Linker output
+*.map
+*.htm
+*.html
+
+# Executables / binaries
+*.axf
+*.elf
+*.out
+
+# Hex / binary output (keep if you want to track release binaries)
+# *.hex
+# *.bin
+
+# Keil build intermediate folders
+MDK-ARM/FOC_v1/
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.uvguix
+MDK-ARM/JLinkLog.txt
+MDK-ARM/JLinkSettings.ini
+MDK-ARM/*.scvd
+MDK-ARM/*.dbgconf
+
+# Keil project backup files
+*.uvprojx.bak
+*.uvoptx.bak
+*.uvguix.bak
+
+# Keil browse info
+*.uvprojx_bak
+*.uvoptx_bak
+*.crf.dep
+
+# ARM Compiler specific
+*.__i
+*.scvd
+*.uvguix.*
+
+# ----------------------------------------------------------
+# STM32CubeMX generated (temporary)
+# ----------------------------------------------------------
+*.ioc.bak
+*.ioc.orig
+
+# ----------------------------------------------------------
+# Debug / Trace
+# ----------------------------------------------------------
+*.JLinkLog.txt
+*.jlink
+JLinkLog.txt
+JLinkSettings.ini
+
+# ----------------------------------------------------------
+# Editor / IDE
+# ----------------------------------------------------------
+# Visual Studio Code
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# Eclipse / EIDE
+.settings/
+.eide/
+.eide.usr.ctx.json
+*.ept
+*.eide-template
+
+# JetBrains CLion
+.idea/
+cmake-build-*/
+
+# ----------------------------------------------------------
+# OS Files
+# ----------------------------------------------------------
+# Windows
+Thumbs.db
+Desktop.ini
+*.tmp
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+.directory
+
+# ----------------------------------------------------------
+# AI / SpecStory (conversation history - not source)
+# ----------------------------------------------------------
+.specstory/
+
+# ----------------------------------------------------------
+# Reference & Large Third-party Code
+# (Uncomment if you want to exclude reference projects)
+# ----------------------------------------------------------
+MCU_Develop-main/
+参考/
+
+# ----------------------------------------------------------
+# Build output directories (if using custom build system)
+# ----------------------------------------------------------
+/build/
+/bin/
+/obj/
+/out/
+
+# ----------------------------------------------------------
+# Misc
+# ----------------------------------------------------------
+*.log
+*.bak
+*.tmp
