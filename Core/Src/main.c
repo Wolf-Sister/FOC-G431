@@ -156,7 +156,7 @@ int main(void)
       UART2_SendString("[FOC] Open-loop vector test running...\r\n");
 #else
       /* Sensor alignment */
-      foc_alignSensor(5.0f);  /* stronger alignment to overcome cogging */
+      foc_alignSensor(4.0f);  /* stronger alignment to overcome cogging */
 
       /* Init motor state & PID */
       motor_control_parm_init();
@@ -198,10 +198,12 @@ motor_pid_init(0.05f,  5.0f,   0.0f,   0.0f,   0.0f);
         float elec_deg = _normalizeAngle(11.0f * AS5047P_GetAngle(&AngleSensor)
                                          - motor_control.zero_elec_angle) * 57.29578f;
         sprintf(buf,
-          "Mech:%5.1f Elec:%5.1f | Ia:%+.3f Ib:%+.3f Ic:%+.3f | Id:%.3f Iq:%.3f Ref:%.3f Vq:%.2fV\r\n",
+          "Mech:%5.1f Elec:%5.1f | Ia:%+.3f Ib:%+.3f Ic:%+.3f | "
+          "Id:%.3f Iq:%.3f Ref:%.3f | Vd:%.2f Vq:%.2fV\r\n",
           mech_deg, elec_deg,
           motor_control.IphA, motor_control.IphB, motor_control.IphC,
-          motor_control.id_meas, motor_control.iq_meas, motor_control.set_torque, motor_control.iq_set);
+          motor_control.id_meas, motor_control.iq_meas, motor_control.set_torque,
+          motor_control.id_set, motor_control.iq_set);
         UART2_SendString(buf);
       }
     }

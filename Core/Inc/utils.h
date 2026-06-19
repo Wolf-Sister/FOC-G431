@@ -31,7 +31,7 @@ void           DWT_Init(void);
 unsigned long  dwt_get_micros(void);
 
 /* Signal processing ---------------------------------------------------------*/
-float lowPassFilter(float new_val, float alpha);
+float lowPassFilter(float new_val, float alpha, float *state);
 
 /* Angle utilities -----------------------------------------------------------*/
 float _normalizeAngle(float angle);

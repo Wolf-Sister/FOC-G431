@@ -17,9 +17,10 @@
 #define MAX_MODULATION      12 * 0.9f        /* Max modulation voltage       */
 
 /* Global PID instance definitions -------------------------------------------*/
-struct PIDController angle_loop   = {.P = 2.0f, .I = 0.0f,  .limit = MAX_ANGLE_SPEED};
-struct PIDController vel_loop     = {.P = 2.0f, .I = 20.0f, .limit = MAX_IQ_CURRENT};
-struct PIDController current_loop = {.P = 1.0f, .I = 10.0f, .limit = MAX_MODULATION};
+struct PIDController angle_loop      = {.P = 2.0f, .I = 0.0f,  .limit = MAX_ANGLE_SPEED};
+struct PIDController vel_loop        = {.P = 2.0f, .I = 20.0f, .limit = MAX_IQ_CURRENT};
+struct PIDController current_loop    = {.P = 1.0f, .I = 10.0f, .limit = MAX_MODULATION};
+struct PIDController id_current_loop = {.P = 1.0f, .I = 10.0f, .limit = MAX_MODULATION};
 
 /* --------------------------------------------------------------------------*/
 /**
@@ -56,6 +57,17 @@ void foc_set_current_pid(float P, float I, float D, float ramp)
     current_loop.I           = I;
     current_loop.D           = D;
     current_loop.output_ramp = ramp;
+}
+
+/**
+  * @brief  Set Id current-loop PID parameters
+  */
+void foc_set_id_current_pid(float P, float I, float D, float ramp)
+{
+    id_current_loop.P           = P;
+    id_current_loop.I           = I;
+    id_current_loop.D           = D;
+    id_current_loop.output_ramp = ramp;
 }
 
 /**
@@ -124,4 +136,6 @@ void motor_pid_init(float tor_p, float tor_i, float vel_p, float vel_i, float po
                     0.0f, 100000.0f, LIMIT_CURRENT, VEL_ALPHA);
     foc_set_current_pid(motor_config.torque_gain,
                         motor_config.torque_integrator_gain, 0.0f, 0.0f);
+    foc_set_id_current_pid(motor_config.torque_gain,
+                           motor_config.torque_integrator_gain, 0.0f, 0.0f);
 }

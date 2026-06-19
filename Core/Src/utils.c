@@ -33,16 +33,16 @@ unsigned long dwt_get_micros(void)
 }
 
 /**
-  * @brief  First-order low-pass filter
+  * @brief  First-order low-pass filter (instance-based)
   * @param  new_val  new sample
   * @param  alpha    smoothing factor (0～1, smaller = more filtering)
+  * @param  state    pointer to persistent filter state variable
   * @retval filtered value
   */
-float lowPassFilter(float new_val, float alpha)
+float lowPassFilter(float new_val, float alpha, float *state)
 {
-    static float filtered = 0.0f;
-    filtered = alpha * new_val + (1.0f - alpha) * filtered;
-    return filtered;
+    *state = alpha * new_val + (1.0f - alpha) * (*state);
+    return *state;
 }
 
 /**

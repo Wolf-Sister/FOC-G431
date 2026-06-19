@@ -44,10 +44,15 @@ extern "C" {
 
 /* Motor power ---------------------------------------------------------------*/
 #define MOTOR_VBUS      12       /* Motor supply voltage (V)                  */
-#define LIMIT_CURRENT   5.0f     /* Max phase current (A)                     */
+#define LIMIT_CURRENT   10.0f    /* Max phase current (A)                     */
 #define VEL_ALPHA       0.05f    /* Velocity low-pass filter coefficient      */
 #define KV_FF           0.002f   /* Velocity feed-forward gain                */
 #define VEL_DEADBAND    1.0f     /* Velocity dead-zone threshold              */
+
+/* Motor electrical parameters — TUNE THESE for your motor! ------------------*/
+#define MOTOR_Lq        0.0005f  /* q-axis inductance (H) — 0.5 mH typical    */
+#define MOTOR_Ld        0.0005f  /* d-axis inductance (H) — same for SPM      */
+#define MOTOR_FLUX      0.005f   /* PM flux linkage (Wb) — Ke=V·s/rad         */
 
 /* ========================================================================== */
 /*  Open-loop control (kept from existing G431 code)                          */
@@ -126,10 +131,16 @@ typedef struct {
     int32_t pos_abs;
 
     /* dq-axis */
-    float iq_set;             /* PID output → Uq command                       */
+    float iq_set;             /* PID output → Uq command (V)                   */
+    float id_set;             /* PID output → Ud command (V)                   */
     float iq_meas;            /* Measured Iq (filtered)                        */
     float id_meas;            /* Measured Id (filtered)                        */
     float mod_q;              /* Normalized q-axis modulation                  */
+    float mod_d;              /* Normalized d-axis modulation                  */
+
+    /* Current filter state (instance-based, avoids static clash)             */
+    float iq_filter_state;
+    float id_filter_state;
 
     /* PWM duty (0~1) */
     float du, dv, dw;

@@ -230,12 +230,16 @@ void foc_sync_phase_currents(void)
 void motor_control_parm_init(void)
 {
     motor_control.iq_set     = 0.0f;
+    motor_control.id_set     = 0.0f;
     motor_control.Iq_target  = 0.0f;
     motor_control.iq_meas    = 0.0f;
+    motor_control.id_meas    = 0.0f;
     motor_control.set_pos    = AS5047P_GetAngle(&AngleSensor);
     motor_control.set_vel    = 0.0f;
     motor_control.pos_target = 0.0f;
     motor_control.vel_target = 0.0f;
+    motor_control.id_filter_state = 0.0f;
+    motor_control.iq_filter_state = 0.0f;
 }
 
 void set_motor_mode(Motor_Mode_e mode)
@@ -334,11 +338,20 @@ void foc_alignSensor(float q_voltage)
     /* Compute zero-electric-angle via averaged readings */
     motor_control.zero_elec_angle = _calculate_zero_electric_angle();
 
-    /* Reset current-loop PID so it starts from 0V smoothly */
+    /* Reset both current-loop PIDs so they start from 0V smoothly */
     current_loop.integral_prev   = 0.0f;
     current_loop.output_prev     = 0.0f;
     current_loop.error_prev      = 0.0f;
     current_loop.timestamp_prev  = dwt_get_micros();
+
+    id_current_loop.integral_prev   = 0.0f;
+    id_current_loop.output_prev     = 0.0f;
+    id_current_loop.error_prev      = 0.0f;
+    id_current_loop.timestamp_prev  = dwt_get_micros();
+
+    /* Reset filter states so they don't carry stale values */
+    motor_control.id_filter_state = 0.0f;
+    motor_control.iq_filter_state = 0.0f;
 
     /* Enable current loop BEFORE clearing alignment flag —
      * this guarantees the very next ADC ISR takes over PWM,
@@ -393,55 +406,84 @@ void foc_velocity_loop(void)
 
 /**
   * @brief  Current (torque) loop — 5 kHz execution in ADC injection callback
+  *
+  *          Features:
+  *            - Iq PI control (torque / speed / position outer loop)
+  *            - Id PI control → keeps Id at 0 (MTPA for SPM motors)
+  *            - Cross-coupling decoupling: Vd_ff = -ω·Lq·Iq
+  *            - Back-EMF feedforward:      Vq_ff = +ω·(Ld·Id + ψm)
+  *            - Single angle read per iteration → no drift between Park & iPark
   */
 void foc_current_loop(void)
 {
-    float error;
-
-    /* Clarke + Park: compute Id & Iq from B,C phase currents */
+    /* ── 1. Read electrical angle & velocity ONCE ── */
     float angle_el = _electricalAngle();
-    float I_alpha  = -(motor_control.IphB + motor_control.IphC);
-    float I_beta   = _1_SQRT3 * (motor_control.IphB - motor_control.IphC);
-    float I_d_raw  = I_alpha * cosf(angle_el) + I_beta * sinf(angle_el);
-    float I_q_raw  = I_beta  * cosf(angle_el) - I_alpha * sinf(angle_el);
+    float elec_vel = _electricalVelocity();
 
-    motor_control.iq_meas = lowPassFilter(I_q_raw, 0.1f);
-    motor_control.id_meas = I_d_raw;   /* raw Id for debug, no filter needed */
+    /* ── 2. Clarke + Park: compute Id & Iq from B,C phase currents ── */
+    float I_alpha = -(motor_control.IphB + motor_control.IphC);
+    float I_beta  = _1_SQRT3 * (motor_control.IphB - motor_control.IphC);
+    float I_d_raw = I_alpha * cosf(angle_el) + I_beta * sinf(angle_el);
+    float I_q_raw = I_beta  * cosf(angle_el) - I_alpha * sinf(angle_el);
 
-    /* Error source depends on mode */
+    /* ── 3. Low-pass filter both axes (instance-based, no static clash) ── */
+    motor_control.id_meas = lowPassFilter(I_d_raw, 0.1f, &motor_control.id_filter_state);
+    motor_control.iq_meas = lowPassFilter(I_q_raw, 0.1f, &motor_control.iq_filter_state);
+
+    /* ── 4. Cross-coupling + back-EMF feedforward ── */
+    /*     Vd = Rs·Id + Ld·dId/dt - ω·Lq·Iq   →   Vd_ff = -ω·Lq·Iq            */
+    /*     Vq = Rs·Iq + Lq·dIq/dt + ω·(Ld·Id+ψm) → Vq_ff = +ω·(Ld·Id+ψm)      */
+    float Vd_ff = -elec_vel * MOTOR_Lq * motor_control.iq_meas;
+    float Vq_ff =  elec_vel * (MOTOR_Ld * motor_control.id_meas + MOTOR_FLUX);
+
+    /* ── 5. Iq error (torque / speed / position) ── */
+    float error_q;
     if (motor_control.mode == MOTOR_SPEED
         || motor_control.mode == MOTOR_POSITION) {
-        error = motor_control.Iq_target - motor_control.iq_meas;
+        error_q = motor_control.Iq_target - motor_control.iq_meas;
     } else {
         /* MOTOR_TORQUE: direct torque/current command */
-        error = motor_control.set_torque - motor_control.iq_meas;
+        error_q = motor_control.set_torque - motor_control.iq_meas;
     }
 
-    /* Dead-band to prevent dithering */
-    if (fabsf(error) <= 0.00f) {
-        error = 0.0f;
+    /* ── 6. Id error — always regulate to 0 for SPM motors ── */
+    float error_d = 0.0f - motor_control.id_meas;
+
+    /* ── 7. Dead-band (Iq only — Id needs continuous regulation) ── */
+    if (fabsf(error_q) <= 0.001f) {
+        error_q = 0.0f;
+    }
+    if (fabsf(error_d) <= 0.001f) {
+        error_d = 0.0f;
     }
 
-    /* PID controller */
-    motor_control.iq_set = PIDController_Update(&current_loop, error);
+    /* ── 8. PI controllers ── */
+    float Vd_pi = PIDController_Update(&id_current_loop, error_d);
+    float Vq_pi = PIDController_Update(&current_loop,    error_q);
 
-    /* Current dead-band */
-    if (fabsf(motor_control.iq_set) < 0.02f) {
-        motor_control.iq_set = 0.0f;
+    /* ── 9. Combine PI output + feedforward ── */
+    float Vd = Vd_pi + Vd_ff;
+    float Vq = Vq_pi + Vq_ff;
+
+    /* ── 10. Saturation — respect SVM linear modulation limit ── */
+    float mod_to_V  = (2.0f / 3.0f) * motor_config.voltage_supply;
+    float V_limit   = mod_to_V * SQRT3_BY_2;   /* SVM inscribed circle       */
+    float V_mag     = sqrtf(Vd * Vd + Vq * Vq);
+    if (V_mag > V_limit) {
+        float scale = V_limit / V_mag;
+        Vd *= scale;
+        Vq *= scale;
     }
 
-    /* Saturation */
-    motor_control.iq_set = _constrain(motor_control.iq_set,
-                                      -LIMIT_CURRENT, LIMIT_CURRENT);
+    motor_control.id_set = Vd;   /* for debug telemetry                      */
+    motor_control.iq_set = Vq;   /* for debug telemetry                      */
 
-    /* Feed-forward angle compensation for computational delay */
+    /* ── 11. Feed-forward angle compensation for computational delay ── */
     float t_delay   = 1.6f * current_meas_period;
-    float elec_angle = _electricalAngle();
-    float elec_vel   = _electricalVelocity();
-    float angle_ff   = elec_angle + elec_vel * t_delay;
+    float angle_ff  = angle_el + elec_vel * t_delay;
 
-    /* SVPWM output */
-    foc_forward(0.0f, motor_control.iq_set, angle_ff);
+    /* ── 12. SVPWM output ── */
+    foc_forward(Vd, Vq, angle_ff);
 }
 
 /* ========================================================================== */
@@ -572,8 +614,8 @@ void foc_forward(float d, float q, float angle_el)
     float mod_q     = V_to_mod * q;
     motor_control.mod_q = mod_q;
 
-    /* Over-modulation clamping */
-    float mod_scale = 0.80f * SQRT3_BY_2
+    /* Over-modulation clamping — keep inside SVM linear hexagon */
+    float mod_scale = SQRT3_BY_2
                       * 1.0f / sqrtf(mod_d * mod_d + mod_q * mod_q);
     if (mod_scale < 1.0f) {
         mod_d *= mod_scale;
