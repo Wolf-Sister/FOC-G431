@@ -23,6 +23,7 @@
 #include "foc.h"
 #include "pid.h"
 #include "utils.h"
+#include "vofa.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -96,11 +97,10 @@ int main(void)
   MX_SPI1_Init();
   MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
-  char buf[128];
   uint32_t last_print_time = 0;
 
   UART2_SendString("========================================\r\n");
-  UART2_SendString("  STM32G431 FOC v1 - Current Loop FOC\r\n");
+  UART2_SendString("  STM32G431 FOC v1\r\n");
   UART2_SendString("========================================\r\n");
 
   /* 1. Init DWT for PID microsecond timing */
@@ -129,6 +129,9 @@ int main(void)
   __HAL_TIM_CLEAR_IT(&htim1, TIM_IT_UPDATE);
   HAL_TIM_Base_Start_IT(&htim1);
 
+  /* 8. Start UART2 DMA RX for VOFA+ command reception */
+  VOFA_InitRx();
+
   UART2_SendString("[FOC] Waiting for current calibration...\r\n");
   /* USER CODE END 2 */
 
@@ -136,6 +139,9 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    /* Process incoming VOFA+ commands (PC → MCU) */
+    VOFA_ProcessCmd();
+
     /* --- Phase 0: calibration done → sensor alignment → closed loop --- */
     if (motor_current.Calibrated == 1 && test_phase == 0)
     {
@@ -151,30 +157,46 @@ int main(void)
 
       /* Init motor state & PID */
       motor_control_parm_init();
-      motor_pid_init(2.5f, 150.0f,   /* Iq: P=2.5, I=150.0 */
-					 2.5f, 160.0f);  /* Id: P=2.5, I=150.0 */
+              motor_pid_init(1.4850f, 371.25f,   /* Iq: P, I */
+                             1.4850f, 371.25f   /* Id: P, I */
+                            );
 
-      motor_control.set_torque = 0.2f;
+      motor_control.set_torque = 0.1f;
 
       /* current_loop_enable already set inside foc_alignSensor() */
       test_phase = 2;
 
-      UART2_SendString("[FOC] Current Loop ACTIVE - Torque Mode\r\n");
     }
 
-    /* --- Phase 2: closed-loop telemetry --- */
+    /* --- Phase 2: closed-loop telemetry via VOFA+ JustFloat --- */
     if (test_phase == 2)
     {
       if (HAL_GetTick() - last_print_time >= 100)
       {
         last_print_time = HAL_GetTick();
-        sprintf(buf,
-          "Ia:%+.3f Ib:%+.3f Ic:%+.3f | "
-          "Id:%.3f Iq:%.3f Ref:%.3f | Vd:%.2f Vq:%.2fV\r\n",
-          motor_control.IphA, motor_control.IphB, motor_control.IphC,
-          motor_control.id_meas, motor_control.iq_meas, motor_control.set_torque,
-          motor_control.id_set, motor_control.iq_set);
-        UART2_SendString(buf);
+
+        /* Channel layout for VOFA+ / Python tuning script:
+         *   [0] id_target   - D-axis target current (A)
+         *   [1] id_meas     - D-axis actual current (A)
+         *   [2] iq_target   - Q-axis target current (A)
+         *   [3] iq_meas     - Q-axis actual current (A)
+         *   [4] vd_cmd      - D-axis voltage command (V)
+         *   [5] vq_cmd      - Q-axis voltage command (V)
+         *   [6] vbus        - DC bus voltage (V)
+         *   [7] status_flag - Step-sync flag (1=cmd received)
+         */
+        float vofa_data[8] = {
+            motor_control.id_target,
+            motor_control.id_meas,
+            motor_control.set_torque,
+            motor_control.iq_meas,
+            motor_control.id_set,
+            motor_control.iq_set,
+            motor_config.voltage_supply,
+            (float)motor_control.status_flag
+        };
+        VOFA_SendData(vofa_data, 8);
+        motor_control.status_flag = 0;  /* clear after TX */
       }
     }
 
@@ -233,7 +255,9 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 
 /**
-  * @brief  💡 双 ADC 注入同步采集完成中断回调函数 (由 TIM1_TRGO 硬件高频触发, 20kHz)
+  * @brief  Dual-ADC injected conversion complete callback (triggered by TIM1_TRGO @ 20kHz).
+  *         Handles current offset calibration, phase current computation, encoder update,
+  *         and closed-loop FOC current control.
   */
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 {

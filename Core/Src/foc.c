@@ -160,7 +160,10 @@ void Motor_Current_Calibration(void)
 
 void UART2_SendString(const char *str)
 {
-    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), HAL_MAX_DELAY);
+    /* Wait for previous DMA transfer to complete (DMA_NORMAL mode:
+     * TC ISR restores gState to READY) */
+    while (huart2.gState != HAL_UART_STATE_READY) {}
+    HAL_UART_Transmit_DMA(&huart2, (uint8_t *)str, strlen(str));
 }
 
 /* ========================================================================== */
@@ -188,6 +191,8 @@ void motor_control_parm_init(void)
     motor_control.id_set     = 0.0f;
     motor_control.iq_meas    = 0.0f;
     motor_control.id_meas    = 0.0f;
+    motor_control.id_target  = 0.0f;
+    motor_control.status_flag = 0;
     motor_control.id_filter_state = 0.0f;
     motor_control.iq_filter_state = 0.0f;
 }
@@ -342,32 +347,37 @@ void foc_current_loop(void)
     float I_q_raw = I_beta  * c - I_alpha * s;
 
     /* ── 3. Low-pass filter both axes (instance-based, no static clash) ── */
-    motor_control.id_meas = lowPassFilter(I_d_raw, 0.01f, &motor_control.id_filter_state);
-    motor_control.iq_meas = lowPassFilter(I_q_raw, 0.01f, &motor_control.iq_filter_state);
+    motor_control.id_meas = lowPassFilter(I_d_raw, 0.05f, &motor_control.id_filter_state);
+    motor_control.iq_meas = lowPassFilter(I_q_raw, 0.05f, &motor_control.iq_filter_state);
 
     /* ── 4. Cross-coupling + back-EMF feedforward ── */
     /*     Vd = Rs·Id + Ld·dId/dt - ω·Lq·Iq   →   Vd_ff = -ω·Lq·Iq            */
     /*     Vq = Rs·Iq + Lq·dIq/dt + ω·(Ld·Id+ψm) → Vq_ff = +ω·(Ld·Id+ψm)      */
-    float Vd_ff = -elec_vel * MOTOR_Lq * motor_control.iq_meas;
-    float Vq_ff =  elec_vel * (MOTOR_Ld * motor_control.id_meas + MOTOR_FLUX);
+    /* ── 4. 移除或修正前馈：低速/静止时关闭前馈，或对前馈电流进行强滤波 ── */
+    float Vd_ff = 0.0f;
+    float Vq_ff = 0.0f;
+    
+    // 只有当速度大于一定门槛时才开启前馈补偿，静止时彻底关闭
+    if (fabsf(elec_vel) > 1.0f) { 
+        Vd_ff = -elec_vel * MOTOR_Lq * motor_control.iq_meas;
+        Vq_ff =  elec_vel * (MOTOR_Ld * motor_control.id_meas + MOTOR_FLUX);
+    }
 
-	//float Vd_ff = 0.0f;
-	//float Vq_ff = 0.0f;
-
-    /* ── 5. Iq error — direct torque/current command ── */
+    /* ── 5. Iq error — source depends on control mode ── */
     float error_q = motor_control.set_torque - motor_control.iq_meas;
 
-    /* ── 6. Id error — always regulate to 0 for SPM motors ── */
-    float error_d = 0.0f - motor_control.id_meas;
+    /* ── 6. Id error — regulate to id_target (default 0 for SPM motors) ── */
+    float error_d = motor_control.id_target - motor_control.id_meas;
 
     /* ── 7. Dead-band (Iq only — Id needs continuous regulation) ── */
-    if (fabsf(error_q) <= 0.01f) {
+    if (fabsf(error_q) <= 0.04f) {
         error_q = 0.0f;
     }
-    if (fabsf(error_d) <= 0.01f) {
+    /*
+    if (fabsf(error_d) <= 0.00f) {
         error_d = 0.0f;
     }
-
+    */
     /* ── 8. PI controllers ── */
     float Vd_pi = PIDController_Update(&id_current_loop, error_d);
     float Vq_pi = PIDController_Update(&current_loop,    error_q);

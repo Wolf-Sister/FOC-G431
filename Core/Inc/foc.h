@@ -110,8 +110,12 @@ typedef struct {
     float id_set;             /* PID output → Ud command (V)                   */
     float iq_meas;            /* Measured Iq (filtered)                        */
     float id_meas;            /* Measured Id (filtered)                        */
+    float id_target;          /* D-axis current target (A), default 0 for SPM   */
     float mod_q;              /* Normalized q-axis modulation                  */
     float mod_d;              /* Normalized d-axis modulation                  */
+
+    /* Step-sync flag: set by command parser, cleared after telemetry TX        */
+    uint8_t status_flag;
 
     /* Current filter state (instance-based, avoids static clash)             */
     float iq_filter_state;

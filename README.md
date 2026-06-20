@@ -6,260 +6,41 @@
 [![Language](https://img.shields.io/badge/Language-C99-orange)](#)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-> English | [中文](#foc_v1---stm32g431-磁场定向控制-foc-电机控制器)
-
-## Overview
-
-**FOC_v1** is an embedded BLDC motor Field Oriented Control (FOC) project based on the STM32G431CBT6 microcontroller. It implements precision motor control using a 14-bit AS5047P magnetic rotary encoder for position feedback and dual ADC for phase current sensing.
-
-The project is currently in the **sensor validation phase** — verifying AS5047P encoder communication via SPI+DMA with low-pass filtered angle output over UART.
-
-### Key Features
-
-- **MCU**: STM32G431CBT6 (ARM Cortex-M4, 170 MHz, FPU, 128 KB Flash, 32 KB RAM)
-- **Position Sensor**: AS5047P 14-bit magnetic rotary encoder (SPI1 + DMA)
-- **Current Sensing**: Dual ADC (ADC1 + ADC2) for phase currents
-- **Motor Driver**: 3-phase PWM (TIM1), DRV8313-compatible interface
-- **Protections**: Overcurrent comparator (NCOMPO), fault/sleep/reset control
-- **Debug Output**: USART2 @ 115200 baud, angle data streaming at 10 Hz
-- **Libraries**: STM32G4xx HAL, CMSIS DSP, SimpleFOC port (in progress)
-
----
-
-## Hardware
-
-| Component              | Pin / Peripheral       | Description                    |
-|------------------------|------------------------|--------------------------------|
-| **Encoder SPI**        | SPI1 (PA4-PA7)         | AS5047P 14-bit magnetic encoder|
-| **Debug UART**         | USART2 (PA2-PA3)       | 115200 baud angle output       |
-| **Motor PWM**          | TIM1 (PA8-PA11, PB0/PB1)| 6-channel complementary PWM   |
-| **Driver Enable**      | PB13, PB14, PB15       | EN1 / EN2 / EN3                |
-| **Driver Control**     | PB2, PB8, PB12         | NFAULT / NSLEEP / NRESET       |
-| **Overcurrent**        | PB9 (NCOMPO)           | Comparator input               |
-| **Current Sense ADC**  | ADC1 / ADC2            | Phase current measurement      |
-
-### Pinout Quick Reference
-
-```
-                STM32G431CBTx (LQFP-48)
-         ┌─────────────────────────────────┐
-         │                                 │
-  PA2 TX ┤                                 ├─ PA3 RX (UART Debug)
-  PA4 CS ┤                                 ├─ PA5 SCK
-  PA6 SO ┤    SPI1 (AS5047P Encoder)       ├─ PA7 SI
-  PA8 CH1┤                                 ├─ PA9 CH2
- PA10 CH3┤        TIM1 (3-Phase PWM)       ├─ PA11 CH4
-  PB0 CH5┤                                 ├─ PB1 CH6
- PB13 EN1┤                                 ├─ PB14 EN2
- PB15 EN3┤                                 ├─ PB2  NFAULT
-  PB8 NSLP├                                ├─ PB12 NRESET
-  PB9 CMP┤                                 ├─ ...
-         │                                 │
-         └─────────────────────────────────┘
-```
-
----
-
-## Directory Structure
-
-```
-FOC_v1/
-├── Core/
-│   ├── Inc/                  # Application headers
-│   │   ├── main.h            # Main application config
-│   │   ├── as5047p.h         # AS5047P encoder driver
-│   │   ├── dma.h             # DMA configuration
-│   │   ├── spi.h             # SPI configuration
-│   │   ├── adc.h             # ADC configuration
-│   │   ├── tim.h             # Timer/PWM configuration
-│   │   ├── gpio.h            # GPIO pin definitions
-│   │   ├── usart.h           # UART debug interface
-│   │   └── stm32g4xx_hal_conf.h  # HAL module configuration
-│   └── Src/                  # Application sources
-│       ├── main.c            # Main loop + FOC routines
-│       ├── as5047p.c         # AS5047P SPI+DMA driver
-│       ├── dma.c             # DMA init & callbacks
-│       ├── spi.c             # SPI init
-│       ├── adc.c             # ADC init
-│       ├── tim.c             # Timer/PWM init
-│       ├── gpio.c            # GPIO init
-│       ├── usart.c           # UART init
-│       ├── system_stm32g4xx.c # System clock init (170 MHz)
-│       ├── stm32g4xx_hal_msp.c # HAL MSP (peripheral init)
-│       └── stm32g4xx_it.c    # Interrupt handlers
-├── Drivers/
-│   ├── CMSIS/                # ARM CMSIS Core + Device
-│   └── STM32G4xx_HAL_Driver/ # STM32G4 HAL Library
-├── MDK-ARM/
-│   ├── FOC_v1.uvprojx        # Keil uVision project file
-│   ├── FOC_v1.uvoptx         # Keil project options
-│   └── startup_stm32g431xx.s # Startup assembly (vector table)
-├── MCU_Develop-main/         # Reference: STM32 tutorial collection
-├── 参考/                     # Reference: SimpleFOC & AS5047P drivers
-├── .gitignore
-└── README.md
-```
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- **Keil MDK-ARM v5** (v5.38 or later recommended)
-- **Device Pack**: `Keil.STM32G4xx_DFP.2.2.0` (install via Pack Installer)
-- **ST-Link** debug probe (or compatible)
-- **Hardware**: STM32G431 + AS5047P encoder + DRV8313 motor driver
-
-### Build & Flash
-
-1. **Open the project** in Keil uVision:
-   ```
-   MDK-ARM/FOC_v1.uvprojx
-   ```
-
-2. **Select target**: `FOC_v1` (default)
-
-3. **Build**: Press `F7` or click `Project → Build Target`
-
-4. **Flash & Debug**: Press `Ctrl+F5` or click `Debug → Start/Stop Debug Session`
-
-### Serial Monitor
-
-Connect to USART2 (PA2/PA3) at **115200 baud** to view angle data:
-
-```
-Angle: 12345  Smooth: 12340  Raw: 12345  Count: 1001
-```
-
-Data format: raw 14-bit angle (0-16383), low-pass filtered angle, zero-crossing corrected value.
-
----
-
-## Development Status
-
-### Completed
-- [x] System clock: HSE bypass → PLL @ 170 MHz
-- [x] USART2 debug serial output (115200)
-- [x] SPI1 DMA for AS5047P (non-blocking read)
-- [x] AS5047P driver: parity check, angle extraction
-- [x] Low-pass filter with zero-crossing handling
-- [x] 10 Hz angle streaming over UART
-
-### In Progress
-- [ ] FOC current loop (ADC phase current reading → Clarke/Park → PI → SVPWM)
-- [ ] 3-phase PWM output (TIM1 complementary channels with dead-time)
-- [ ] SimpleFOC library port to STM32G4 (C++)
-- [ ] Motor calibration & alignment routines
-- [ ] Velocity & position closed-loop control
-
----
-
-## Key Code Reference
-
-### Angle Reading Pipeline (`Core/Src/main.c`)
-
-```c
-// Main loop: read AS5047P via SPI DMA
-while (1) {
-    AS5047P_TriggerRead();       // Start SPI DMA transfer
-    // ... wait for DMA complete callback ...
-    if (data_ready) {
-        raw_angle = AS5047P_ReadAngle();    // Extract 14-bit angle
-        smooth_angle = FOC_GetSmoothAngle(raw_angle);  // LPF
-        // Output over UART at 10 Hz
-    }
-}
-```
-
-### FOC Parameters (in `Core/Inc/main.h`)
-
-```c
-#define FOC_LPF_ALPHA   0.15f        // Low-pass filter coefficient
-#define FOC_ANGLE_MAX   16383.0f     // 14-bit encoder resolution
-#define FOC_PWM_FREQ    20000        // PWM frequency (Hz)
-```
-
----
-
-## Dependencies
-
-All dependencies are vendored in the project tree — no external package manager required:
-
-| Library | Path | License |
-|---------|------|---------|
-| STM32G4xx HAL | `Drivers/STM32G4xx_HAL_Driver/` | ST SLA (BSD-like) |
-| CMSIS Core | `Drivers/CMSIS/` | Apache 2.0 |
-| SimpleFOC (reference) | `参考/Arduino-FOC-master/` | MIT |
-| AS5047P Driver (reference) | `参考/AS5047P-Driver-master/` | Open Source |
-
----
-
-## Reference Projects
-
-The `MCU_Develop-main/` directory contains 21 incremental SimpleFOC projects from STM32F103 to STM32F405, plus bootloader tutorials and HAL/LL library examples. These are included for learning reference.
-
-The `参考/` directory contains the original Arduino SimpleFOC library and AS5047P driver that this project ports to bare-metal STM32.
-
----
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/your-feature`)
-3. Commit your changes (`git commit -m 'Add some feature'`)
-4. Push to the branch (`git push origin feature/your-feature`)
-5. Open a Pull Request
-
----
-
-## License
-
-This project is licensed under the **MIT License** — see [LICENSE](LICENSE) for details.
-
-Note: The STM32 HAL/CMSIS libraries in `Drivers/` are distributed under STMicroelectronics' own license terms (see `Drivers/CMSIS/LICENSE.txt` and `Drivers/STM32G4xx_HAL_Driver/LICENSE.txt`).
-
----
-
-## Acknowledgments
-
-- [SimpleFOC](https://github.com/simplefoc/Arduino-FOC) — Open-source FOC library by Antun Skuric et al.
-- [STMicroelectronics](https://www.st.com/) — STM32G4 HAL & CMSIS libraries
-- [ams-OSRAM](https://ams.com/) — AS5047P magnetic rotary encoder
-
----
-
-# FOC_v1 - STM32G431 磁场定向控制 (FOC) 电机控制器
-
 ## 项目简介
 
-**FOC_v1** 是一个基于 STM32G431CBT6 微控制器的嵌入式无刷直流电机磁场定向控制 (FOC) 项目。使用 14 位 AS5047P 磁旋转编码器进行位置反馈，双 ADC 进行相电流采样，实现精密电机控制。
+**FOC_v1** 是一个基于 STM32G431CBT6 微控制器的嵌入式无刷直流电机磁场定向控制 (FOC) 项目。使用 14 位 AS5047P 磁旋转编码器进行位置反馈，双 ADC 进行相电流采样，实现完整电流闭环 FOC 控制，同时通过 USART2 DMA 与上位机 VOFA+ 进行实时数据交互。
 
-项目当前处于 **传感器验证阶段** —— 通过 SPI+DMA 验证 AS5047P 编码器通信，经过低通滤波后通过串口输出角度数据。
+项目移植并融合了 TinyFoc 的核心算法，在此基础上加入了去耦前馈补偿、VOFA+ 协议通信、Python 上位机调参等实用功能。
 
 ### 主要特性
 
-- **主控**: STM32G431CBT6 (ARM Cortex-M4, 170 MHz, FPU, 128 KB Flash, 32 KB RAM)
-- **位置传感器**: AS5047P 14 位磁旋转编码器 (SPI1 + DMA 非阻塞读取)
-- **电流采样**: 双 ADC (ADC1 + ADC2) 相电流检测
-- **电机驱动**: 3 相 PWM (TIM1)，兼容 DRV8313 驱动芯片接口
-- **保护功能**: 过流比较器 (NCOMPO)、故障/休眠/复位控制
-- **调试输出**: USART2 @ 115200 bps，10 Hz 角度数据流
-- **软件库**: STM32G4xx HAL、CMSIS DSP、SimpleFOC 移植（进行中）
+- **主控**: STM32G431CBT6 (ARM Cortex-M4, 170 MHz, FPU)
+- **位置传感器**: AS5047P 14 位磁旋转编码器 (SPI1 + DMA，非阻塞流水线读取)
+- **电流采样**: 双 ADC (ADC1 + ADC2) 同步注入采样，自动零点校准
+- **控制算法**:
+  - Clarke + Park 变换，SVPWM 空间矢量调制
+  - Iq/Id 双轴 PI 闭环控制（Tustin 离散化 + 抗饱和 + 输出斜率限制）
+  - 交叉解耦 + 反电动势前馈补偿
+  - 12 扇区 SVM 线性调制
+- **电机驱动**: TIM1 3 相互补 PWM，兼容 DRV8313 驱动芯片
+- **传感器对准**: 自动零电角度校准流程
+- **上位机通信**: VOFA+ JustFloat 协议发送遥测数据，文本命令接收控制参数
+- **环路频率**: PWM / 电流环 20 kHz，遥测 10 Hz
+- **Python 工具**: `foc_auto_tuner.py` 自动扫参 / 阶跃响应分析 / PID 调优
 
 ---
 
 ## 硬件连接
 
-| 功能           | 引脚 / 外设           | 说明                          |
-|----------------|-----------------------|-------------------------------|
-| **编码器 SPI** | SPI1 (PA4-PA7)        | AS5047P 14 位磁编码器         |
-| **调试串口**   | USART2 (PA2-PA3)      | 115200 bps 角度输出           |
-| **电机 PWM**   | TIM1 (PA8-PA11, PB0/PB1)| 6 路互补 PWM                |
-| **驱动使能**   | PB13, PB14, PB15      | EN1 / EN2 / EN3               |
-| **驱动控制**   | PB2, PB8, PB12        | NFAULT / NSLEEP / NRESET      |
-| **过流检测**   | PB9 (NCOMPO)          | 比较器输入                     |
-| **电流采样**   | ADC1 / ADC2           | 相电流测量                     |
+功能           | 引脚 / 外设              | 说明
+---------------|--------------------------|-----------------------------
+**编码器 SPI** | SPI1 (PA4-PA7)           | AS5047P 14 位磁编码器
+**UART2 遥测** | USART2 (PA15 RX, PB3 TX) | 115200 bps，VOFA+ 协议
+**电机 PWM**   | TIM1 (PA8-PA11, PB0-PB1) | 6 路互补 PWM
+**驱动使能**   | PB13, PB14, PB15         | EN1 / EN2 / EN3
+**驱动控制**   | PB2, PB8, PB12           | NFAULT / NSLEEP / NRESET
+**过流检测**   | PB9 (NCOMPO)             | 比较器输入
+**电流采样**   | ADC1 / ADC2              | 双 ADC 注入同步采样
 
 ---
 
@@ -268,37 +49,46 @@ Note: The STM32 HAL/CMSIS libraries in `Drivers/` are distributed under STMicroe
 ```
 FOC_v1/
 ├── Core/
-│   ├── Inc/                  # 应用层头文件
-│   │   ├── main.h            # 主程序配置
-│   │   ├── as5047p.h         # AS5047P 编码器驱动
-│   │   ├── dma.h             # DMA 配置
-│   │   ├── spi.h             # SPI 配置
-│   │   ├── adc.h             # ADC 配置
-│   │   ├── tim.h             # 定时器/PWM 配置
-│   │   ├── gpio.h            # GPIO 引脚定义
-│   │   ├── usart.h           # 串口调试接口
-│   │   └── stm32g4xx_hal_conf.h  # HAL 模块配置
-│   └── Src/                  # 应用层源码
-│       ├── main.c            # 主循环 + FOC 算法
-│       ├── as5047p.c         # AS5047P SPI+DMA 驱动
-│       ├── dma.c             # DMA 初始化与回调
-│       ├── spi.c             # SPI 初始化
-│       ├── adc.c             # ADC 初始化
-│       ├── tim.c             # 定时器/PWM 初始化
-│       ├── gpio.c            # GPIO 初始化
-│       ├── usart.c           # 串口初始化
-│       ├── system_stm32g4xx.c # 系统时钟初始化 (170 MHz)
-│       ├── stm32g4xx_hal_msp.c # HAL MSP 层
-│       └── stm32g4xx_it.c    # 中断服务函数
+│   ├── Inc/                       # 应用层头文件
+│   │   ├── main.h                 # 主程序配置
+│   │   ├── foc.h                  # FOC 核心 — SVPWM、电流环、传感器对准
+│   │   ├── pid.h                  # PID 控制器 — Tustin 积分器 + 输出限幅
+│   │   ├── vofa.h                 # VOFA+ JustFloat 遥测 + 命令接收
+│   │   ├── utils.h                # 工具函数 — DWT 微秒计时、LPF、角度归一化
+│   │   ├── as5047p.h              # AS5047P 编码器 SPI+DMA 底层驱动
+│   │   ├── as5047p_ext.h          # AS5047P 高层接口 (角度/速度/多圈累计)
+│   │   ├── adc.h                  # ADC 配置
+│   │   ├── dma.h                  # DMA 配置
+│   │   ├── spi.h                  # SPI 配置
+│   │   ├── tim.h                  # 定时器/PWM 配置
+│   │   ├── usart.h                # 串口配置
+│   │   ├── gpio.h                 # GPIO 引脚定义
+│   │   └── stm32g4xx_hal_conf.h   # HAL 模块配置
+│   └── Src/                       # 应用层源码
+│       ├── main.c                 # 主循环 + 状态机 + ADC 中断回调
+│       ├── foc.c                  # FOC 算法：Clarke/Park、PI、前馈、SVPWM
+│       ├── pid.c                  # PID 控制器实现
+│       ├── vofa.c                 # VOFA+ 协议：遥测发送 + 命令解析
+│       ├── utils.c                # 工具函数实现
+│       ├── as5047p.c              # AS5047P SPI+DMA 驱动
+│       ├── as5047p_ext.c          # AS5047P 高层接口实现
+│       ├── adc.c                  # ADC 初始化
+│       ├── dma.c                  # DMA 初始化与回调
+│       ├── spi.c                  # SPI 初始化
+│       ├── tim.c                  # 定时器/PWM 初始化
+│       ├── usart.c                # 串口初始化
+│       ├── gpio.c                 # GPIO 初始化
+│       ├── system_stm32g4xx.c     # 系统时钟初始化 (170 MHz)
+│       ├── stm32g4xx_hal_msp.c    # HAL MSP 层
+│       └── stm32g4xx_it.c         # 中断服务函数
 ├── Drivers/
-│   ├── CMSIS/                # ARM CMSIS 核心 + 设备支持
-│   └── STM32G4xx_HAL_Driver/ # STM32G4 HAL 驱动库
+│   ├── CMSIS/                     # ARM CMSIS 核心 + 设备支持
+│   └── STM32G4xx_HAL_Driver/      # STM32G4 HAL 驱动库
 ├── MDK-ARM/
-│   ├── FOC_v1.uvprojx        # Keil uVision 工程文件
-│   ├── FOC_v1.uvoptx         # Keil 工程选项
-│   └── startup_stm32g431xx.s # 启动汇编文件 (向量表)
-├── MCU_Develop-main/         # 参考：STM32 教程合集
-├── 参考/                     # 参考：SimpleFOC 原始库 & AS5047P 驱动
+│   ├── FOC_v1.uvprojx             # Keil uVision 工程文件
+│   ├── FOC_v1.uvoptx              # Keil 工程选项
+│   └── startup_stm32g431xx.s      # 启动汇编文件 (向量表)
+├── TinyFoc-main/                  # 参考：TinyFoc 原始实现 (STM32F401)
 ├── .gitignore
 └── README.md
 ```
@@ -327,60 +117,157 @@ FOC_v1/
 
 4. **烧录与调试**: 按 `Ctrl+F5` 或点击 `Debug → Start/Stop Debug Session`
 
-### 串口监视
+### VOFA+ 上位机连接
 
-连接到 USART2 (PA2/PA3)，波特率 **115200**，查看角度数据:
+连接 USART2 (PA15 RX, PB3 TX)，波特率 **115200**：
+
+- **遥测接收**: 打开 VOFA+，选择 JustFloat 协议，添加 8 通道数据显示
+- **命令发送**: 在 VOFA+ 终端输入文本命令，格式为逗号分隔的键值对
+
+支持的遥测通道:
+
+通道 | 变量         | 说明
+------|-------------|------------------
+[0]   | id_target   | D 轴目标电流 (A)
+[1]   | id_meas     | D 轴实测电流 (A)
+[2]   | iq_target   | Q 轴目标电流 (A)
+[3]   | iq_meas     | Q 轴实测电流 (A)
+[4]   | vd_cmd      | D 轴电压指令 (V)
+[5]   | vq_cmd      | Q 轴电压指令 (V)
+[6]   | vbus        | 母线电压 (V)
+[7]   | status_flag | 步进同步标志
+
+支持的命令:
+
+命令 | 说明            | 示例
+-----|----------------|--------
+T=V  | 扭矩/电流指令 (A) | `T=0.5`
+D=V  | D 轴电流目标 (A)  | `D=0.0`
+P=V  | Q 轴 P 增益      | `P=1.5`
+I=V  | Q 轴 I 增益      | `I=200`
+DP=V | D 轴 P 增益      | `DP=1.5`
+DI=V | D 轴 I 增益      | `DI=200`
+
+---
+
+## 控制架构
 
 ```
-Angle: 12345  Smooth: 12340  Raw: 12345  Count: 1001
+                    ┌─────────────────────────────────────────┐
+                    │           foc_current_loop() @ 20kHz     │
+                    │                                          │
+  set_torque ──►[+]──►[ PI Iq ]──►[+]──►[ 饱和 ]──┐          │
+                 ▲                  ▲                │          │
+                 │ iq_meas          │ Vq_ff          │          │
+                 │                  │                │          │
+  id_target  ──►[+]──►[ PI Id ]──►[+]──►[ 饱和 ]──┐│          │
+                 ▲                  ▲              ││          │
+                 │ id_meas          │ Vd_ff        ││          │
+                 │                  │              ││          │
+            ┌────┴────┐      ┌──────┴──────┐      ││          │
+            │ 低通滤波  │      │ 前馈补偿     │      ││          │
+            │ α=0.05   │      │ -ωLq·Iq     │      ││          │
+            │          │      │ +ω(Ld·Id+ψ) │      ││          │
+            └────▲─────┘      └──────▲──────┘      ││          │
+                 │                    │             ││          │
+            ┌────┴────┐        ┌─────┴─────┐       ││          │
+            │ Park    │        │ 电角速度   │       ││          │
+            │ Iα,Iβ→dq│        │ _elecVel()│       ││          │
+            └────▲─────┘        └─────▲─────┘       ││          │
+                 │                     │             ││          │
+            ┌────┴────┐         ┌──────┴──────┐     ││          │
+            │ Clarke  │         │ 编码器       │     ││          │
+            │ Ib,Ic→αβ│         │ AS5047P     │     ││          │
+            └────▲─────┘         └────────────┘     ││          │
+                 │                                   ││          │
+            ┌────┴────┐                              ││          │
+            │ 双ADC    │                              ││          │
+            │ A,B,C相 │                              ││          │
+            └─────────┘                              ││          │
+                                                     ▼▼          │
+                                               ┌──────────┐     │
+                                               │ 反Park   │◄────┘
+                                               │ Vd,Vq→αβ │
+                                               └────┬─────┘
+                                                    │
+                                               ┌────┴─────┐
+                                               │  SVM     │
+                                               │  αβ→占空比│
+                                               └────┬─────┘
+                                                    │
+                                               ┌────┴─────┐
+                                               │ TIM1 PWM │
+                                               │ 3相输出   │
+                                               └──────────┘
 ```
-
-数据格式: 原始 14 位角度 (0-16383)、低通滤波角度、过零修正值。
 
 ---
 
 ## 开发状态
 
 ### 已完成
-- [x] 系统时钟: HSE 旁路 → PLL @ 170 MHz
-- [x] USART2 调试串口 (115200)
-- [x] SPI1 DMA 驱动 AS5047P (非阻塞读取)
-- [x] AS5047P 驱动: 奇偶校验、角度提取
-- [x] 低通滤波器 + 过零处理
-- [x] 10 Hz 串口角度数据流
 
-### 进行中
-- [ ] FOC 电流环 (ADC 相电流 → Clarke/Park 变换 → PI → SVPWM)
-- [ ] 3 相 PWM 输出 (TIM1 互补通道 + 死区)
-- [ ] SimpleFOC 库 C++ 移植到 STM32G4
-- [ ] 电机校准与对齐程序
-- [ ] 速度 & 位置闭环控制
+- [x] 系统时钟: HSE 旁路 → PLL @ 170 MHz
+- [x] AS5047P 编码器 SPI+DMA 流水线驱动
+- [x] 编码器高层接口: 角度/速度/多圈累计
+- [x] 双 ADC 注入同步采样 + 自动零点校准 (2000 样本)
+- [x] 3 相互补 PWM 输出 (TIM1)
+- [x] Clarke + Park 变换，12 扇区 SVPWM
+- [x] Iq/Id 双轴 PI 电流闭环 (Tustin 离散化 + 抗饱和 + 斜率限制)
+- [x] 交叉解耦 + 反电动势前馈补偿
+- [x] 传感器自动对准 (零电角度校准)
+- [x] VOFA+ JustFloat 遥测数据发送
+- [x] VOFA+ 文本命令接收与解析 (PID 在线调参)
+- [x] DWT 微秒级计时
+
+### 计划中
+
+- [ ] 速度闭环 (PI 速度环外环)
+- [ ] 位置闭环
+- [ ] Python 自动扫参 / 阶跃响应分析脚本
+- [ ] 参数自动保存到 Flash
+- [ ] 过流 / 过压 / 欠压保护
 
 ---
 
 ## 关键代码参考
 
-### 角度读取流程 (`Core/Src/main.c`)
+### 电流环主流程 (`Core/Src/foc.c`)
 
 ```c
-// 主循环: 通过 SPI DMA 读取 AS5047P
-while (1) {
-    AS5047P_TriggerRead();       // 启动 SPI DMA 传输
-    // ... 等待 DMA 完成回调 ...
-    if (data_ready) {
-        raw_angle = AS5047P_ReadAngle();    // 提取 14 位角度
-        smooth_angle = FOC_GetSmoothAngle(raw_angle);  // 低通滤波
-        // 通过串口以 10 Hz 频率输出
-    }
+void foc_current_loop(void)
+{
+    // 1. 读取电角度 & 电角速度 (仅一次)
+    float angle_el = _electricalAngle();
+    float elec_vel = _electricalVelocity();
+
+    // 2. Clarke + Park: B,C 相电流 → Id, Iq
+    // 3. 低通滤波 (α=0.05)
+    // 4. 交叉解耦 + 反电动势前馈 (仅速度 > 1 rad/s 时开启)
+    // 5. Iq / Id PI 控制 (死区 0.04A)
+    // 6. 电压饱和限制 (SVM 内切圆)
+    // 7. 计算延迟角度补偿
+    // 8. 反 Park + SVM → PWM 占空比输出
 }
 ```
 
-### FOC 参数 (在 `Core/Inc/main.h` 中定义)
+### PID 控制器 (`Core/Src/pid.c`)
 
 ```c
-#define FOC_LPF_ALPHA   0.15f        // 低通滤波器系数
-#define FOC_ANGLE_MAX   16383.0f     // 14 位编码器分辨率
-#define FOC_PWM_FREQ    20000        // PWM 频率 (Hz)
+float PIDController_Update(struct PIDController *pid, float error)
+{
+    // Tustin 梯形积分器
+    // 积分抗饱和 (clamp to ±limit)
+    // 输出斜率限制 (output ramp)
+    // 返回限幅后的控制量
+}
+```
+
+### 主循环状态机 (`Core/Src/main.c`)
+
+```c
+// Phase 0: 等待 ADC 电流零点校准完成 → 传感器对准 → 闭环启动
+// Phase 2: 电流闭环运行 → 10 Hz VOFA+ 遥测 + 命令处理
 ```
 
 ---
@@ -391,28 +278,22 @@ while (1) {
 
 | 库 | 路径 | 许可证 |
 |-----|------|--------|
-| STM32G4xx HAL | `Drivers/STM32G4xx_HAL_Driver/` | ST SLA (类 BSD) |
+| STM32G4xx HAL | `Drivers/STM32G4xx_HAL_Driver/` | ST SLA |
 | CMSIS Core | `Drivers/CMSIS/` | Apache 2.0 |
-| SimpleFOC (参考) | `参考/Arduino-FOC-master/` | MIT |
-| AS5047P 驱动 (参考) | `参考/AS5047P-Driver-master/` | 开源 |
+| CMSIS DSP | `Middlewares/ST/ARM/DSP/` | Apache 2.0 |
+| TinyFoc (参考) | `TinyFoc-main/` | MIT |
 
 ---
 
 ## 参考工程
 
-`MCU_Develop-main/` 目录包含 21 个从 STM32F103 到 STM32F405 逐步递进的 SimpleFOC 工程，以及 Bootloader 教程和 HAL/LL 库示例，供学习参考。
+`TinyFoc-main/` 是 TinyFoc 在 STM32F401 上的原始实现，本项目将其核心算法移植到 STM32G431 平台并做了以下改进：
 
-`参考/` 目录包含 Arduino SimpleFOC 原始库和 AS5047P 驱动，本工程将其移植到裸机 STM32。
-
----
-
-## 参与贡献
-
-1. Fork 本仓库
-2. 创建特性分支 (`git checkout -b feature/新功能`)
-3. 提交修改 (`git commit -m '添加新功能'`)
-4. 推送到分支 (`git push origin feature/新功能`)
-5. 创建 Pull Request
+- 将 C++ 类重写为 C 结构体 + 函数，适配 Keil C99 编译环境
+- 加入电流低通滤波，消除高频噪声
+- 加入交叉解耦 + 反电动势前馈，提升动态响应
+- 引入 VOFA+ 协议，实现无需额外硬件的在线调参
+- PID 改用 Tustin 离散化，消除采样频率变化对积分项的影响
 
 ---
 
@@ -426,6 +307,8 @@ while (1) {
 
 ## 致谢
 
+- [TinyFoc](https://github.com/JiuXu01/TinyFoc) — 简洁高效的 FOC 参考实现
 - [SimpleFOC](https://github.com/simplefoc/Arduino-FOC) — Antun Skuric 等人开发的开源 FOC 库
+- [VOFA+](https://www.vofa.plus/) — 伏特加电子，优秀的串口数据可视化工具
 - [STMicroelectronics](https://www.st.com/) — STM32G4 HAL & CMSIS 库
 - [ams-OSRAM](https://ams.com/) — AS5047P 磁旋转编码器
