@@ -23,6 +23,7 @@ extern "C" {
 #define _1_SQRT3     0.57735026919f
 #define _2_SQRT3     1.15470053838f
 #define SQRT3_BY_2   0.86602540378f
+#define RAD_TO_DEG   57.295779513f   /* 180.0 / PI — for ARM DSP sin_cos (takes degrees) */
 
 #define _constrain(amt, low, high) ((amt)<(low)?(low):((amt)>(high)?(high):(amt)))
 

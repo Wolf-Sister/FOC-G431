@@ -273,16 +273,16 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
             motor_current.I_C = current_diff_c * CURRENT_FACTOR;
             motor_current.I_B = -(motor_current.I_A + motor_current.I_C);
 
-			// 1. 更新编码器，获取最新角度
-			AS5047P_Sensor_Update(&AngleSensor);
+			      // 1. 更新编码器，获取最新角度
+			      AS5047P_Sensor_Update(&AngleSensor);
 
-			// 2. 同步电流数据
-			foc_sync_phase_currents();
+			      // 2. 同步电流数据
+			      foc_sync_phase_currents();
 
-			// 3. 执行电流环 @ 20kHz
-			if (current_loop_enable) {
-				foc_current_loop();
-			}
+			      // 3. 执行电流环 @ 20kHz
+			      if (current_loop_enable) {
+				      foc_current_loop();
+			      }
         }
     }
 }

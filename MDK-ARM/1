@@ -1,182 +1,184 @@
+/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file    vofa.c
-  * @brief   VOFA+ serial telemetry & command interface — DMA-backed UART2
+  * @file    cordic.c
+  * @brief   This file provides code for the configuration
+  *          of the CORDIC instances.
+  ******************************************************************************
+  * @attention
   *
-  *          Output format:   "channels: 1.386578,0.977929,...,-0.942729\n"
-  *          Input commands:  torque <f>, iqpid <p> <i>, idpid <p> <i>,
-  *                           enable <0|1>, limit <f>, status
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
   ******************************************************************************
   */
-
+/* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
-#include "vofa.h"
-#include "foc.h"
-#include "pid.h"
-#include "as5047p_ext.h"
-#include "usart.h"
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
+#include "cordic.h"
 
-/* Private buffers -----------------------------------------------------------*/
-static char    tx_buf[VOFA_TX_BUF_SIZE];
-static uint8_t rx_buf[VOFA_RX_BUF_SIZE];        /* DMA circular buffer          */
-static uint8_t rx_line[VOFA_RX_BUF_SIZE];       /* null-terminated command line */
-static volatile uint8_t rx_flag = 0;            /* 1 = new command ready        */
+/* USER CODE BEGIN 0 */
+#include "utils.h"
+#include <math.h>
 
-/* ========================================================================== */
-/*  Initialisation                                                             */
-/* ========================================================================== */
+/* Q1.31 fixed-point conversion constants */
+#define CORDIC_Q31_SCALE      2147483648.0f    /* 2^31                           */
+#define CORDIC_Q31_SCALE_INV  4.656612873e-10f /* 1 / 2^31                       */
 
-/**
-  * @brief  Start DMA-based UART2 reception (idle-line detection).
-  * @note   Requires CubeMX DMA config: USART2_RX → DMA1 Circular,
-  *         USART2_TX → DMA1 Normal. Call once after peripherals are up.
-  */
-void VOFA_Init(void)
+/*
+ * Pre-computed CORDIC CSR register values for each mode.
+ * Direct register write avoids HAL_CORDIC_Calculate() bug:
+ *   HAL skips RRDY wait when NbCalc=1, reading garbage before CORDIC finishes.
+ */
+#define CORDIC_CSR_COS  (CORDIC_FUNCTION_COSINE                     \
+                         | CORDIC_PRECISION_6CYCLES                 \
+                         | CORDIC_SCALE_0                           \
+                         | CORDIC_INSIZE_32BITS                     \
+                         | CORDIC_OUTSIZE_32BITS                    \
+                         | CORDIC_NBWRITE_1      /* NARGS=0: 1 in  */ \
+                         | CORDIC_NBREAD_2)      /* NRES =1: 2 out */
+
+#define CORDIC_CSR_MOD  (CORDIC_FUNCTION_MODULUS                    \
+                         | CORDIC_PRECISION_6CYCLES                 \
+                         | CORDIC_SCALE_0                           \
+                         | CORDIC_INSIZE_32BITS                     \
+                         | CORDIC_OUTSIZE_32BITS                    \
+                         | CORDIC_NBWRITE_2      /* NARGS=1: 2 in  */ \
+                         | CORDIC_NBREAD_1)      /* NRES =0: 1 out */
+
+/* Track current CORDIC mode to avoid redundant CSR writes */
+static uint32_t cordic_current_mode = 0xFF; /* 0=Cos, 1=Modulus, 0xFF=uninit */
+
+/* USER CODE END 0 */
+
+CORDIC_HandleTypeDef hcordic;
+
+/* CORDIC init function */
+void MX_CORDIC_Init(void)
 {
-    /* Start DMA RX + manually enable IDLE-line interrupt */
-    HAL_UART_Receive_DMA(&huart2, rx_buf, VOFA_RX_BUF_SIZE);
-    __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
-    __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
+
+  /* USER CODE BEGIN CORDIC_Init 0 */
+
+  /* USER CODE END CORDIC_Init 0 */
+
+  /* USER CODE BEGIN CORDIC_Init 1 */
+
+  /* USER CODE END CORDIC_Init 1 */
+  hcordic.Instance = CORDIC;
+  if (HAL_CORDIC_Init(&hcordic) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CORDIC_Init 2 */
+
+  /* USER CODE END CORDIC_Init 2 */
+
 }
 
-/* ========================================================================== */
-/*  Telemetry output (called from ADC ISR @ 20 kHz, self-divided to 100 Hz)    */
-/* ========================================================================== */
-
-/**
-  * @brief  Send one telemetry frame via DMA TX (non-blocking).
-  *         Rate controlled by TIM16 @ 100 Hz — no internal divider.
-  *
-  *  Channels:
-  *   0  id_meas       d-axis measured current (A)
-  *   1  iq_meas       q-axis measured current (A)
-  *   2  set_torque    torque / current reference (A)
-  *   3  Vd_cmd        d-axis voltage command (V)  — stored in id_set
-  *   4  Vq_cmd        q-axis voltage command (V)  — stored in iq_set
-  *   5  elec_vel      electrical angular velocity (rad/s)
-  *   6  IphA          phase-A current (A)
-  *   7  IphB          phase-B current (A)
-  *   8  IphC          phase-C current (A)
-  *   9  mod_q         q-axis modulation index (0..1)
-  *  10  Iq_integral   Iq PI integrator state (V·s)
-  */
-void VOFA_SendFrame(void)
+void HAL_CORDIC_MspInit(CORDIC_HandleTypeDef* cordicHandle)
 {
-    /* Skip if previous DMA TX is still in progress */
-    if (huart2.gState != HAL_UART_STATE_READY) return;
 
-    /* Gather channel data */
-    float ch[VOFA_CHAN_COUNT];
-    ch[0]  = motor_control.id_meas;
-    ch[1]  = motor_control.iq_meas;
-    ch[2]  = motor_control.set_torque;
-    ch[3]  = motor_control.id_set;             /* = Vd command (V)              */
-    ch[4]  = motor_control.iq_set;             /* = Vq command (V)              */
-    ch[5]  = motor_control.elec_vel;
-    ch[6]  = motor_control.IphA;
-    ch[7]  = motor_control.IphB;
-    ch[8]  = motor_control.IphC;
-    ch[9]  = motor_control.mod_q;
-    ch[10] = current_loop.integral_prev;
+  if(cordicHandle->Instance==CORDIC)
+  {
+  /* USER CODE BEGIN CORDIC_MspInit 0 */
 
-    /* Format: "channels: %f,%f,...,%f\n" */
-    int pos = 0;
-    pos += sprintf(tx_buf + pos, "channels: ");
-    for (int i = 0; i < VOFA_CHAN_COUNT; i++) {
-        pos += sprintf(tx_buf + pos, "%.6f", (double)ch[i]);
-        if (i < VOFA_CHAN_COUNT - 1) {
-            tx_buf[pos++] = ',';
-        }
-    }
-    tx_buf[pos++] = '\n';
-    tx_buf[pos]   = '\0';
+  /* USER CODE END CORDIC_MspInit 0 */
+    /* CORDIC clock enable */
+    __HAL_RCC_CORDIC_CLK_ENABLE();
+  /* USER CODE BEGIN CORDIC_MspInit 1 */
 
-    /* Non-blocking DMA transmit */
-    HAL_UART_Transmit_DMA(&huart2, (uint8_t *)tx_buf, pos);
+  /* USER CODE END CORDIC_MspInit 1 */
+  }
 }
 
-/* ========================================================================== */
-/*  Command parser (call from main loop)                                       */
-/* ========================================================================== */
-
-/**
-  * @brief  Parse one received command line and apply settings.
-  *         Supported commands:
-  *           torque <f>       set motor_control.set_torque
-  *           iqpid  <p> <i>   set Iq (torque) current-loop PI gains
-  *           idpid  <p> <i>   set Id (flux)   current-loop PI gains
-  *           enable <0|1>     enable / disable current loop
-  *           limit  <v>       set PI output saturation limit (V)
-  *           status           echo current configuration
-  */
-void VOFA_PollCommands(void)
+void HAL_CORDIC_MspDeInit(CORDIC_HandleTypeDef* cordicHandle)
 {
-    if (!rx_flag) return;
-    rx_flag = 0;
 
-    float v1, v2;
+  if(cordicHandle->Instance==CORDIC)
+  {
+  /* USER CODE BEGIN CORDIC_MspDeInit 0 */
 
-    if (sscanf((char *)rx_line, "torque %f", &v1) == 1) {
-        motor_control.set_torque = v1;
-    }
-    else if (sscanf((char *)rx_line, "iqpid %f %f", &v1, &v2) == 2) {
-        foc_set_current_pid(v1, v2, 0.0f, 0.0f);
-        motor_config.iq_p_gain = v1;
-        motor_config.iq_i_gain = v2;
-    }
-    else if (sscanf((char *)rx_line, "idpid %f %f", &v1, &v2) == 2) {
-        foc_set_id_current_pid(v1, v2, 0.0f, 0.0f);
-        motor_config.id_p_gain = v1;
-        motor_config.id_i_gain = v2;
-    }
-    else if (sscanf((char *)rx_line, "enable %f", &v1) == 1) {
-        current_loop_enable = (v1 != 0.0f) ? 1 : 0;
-    }
-    else if (sscanf((char *)rx_line, "limit %f", &v1) == 1) {
-        current_loop.limit    = v1;
-        id_current_loop.limit = v1;
-    }
-    else if (strncmp((char *)rx_line, "status", 6) == 0) {
-        /* Blocking TX is fine — main loop, low frequency */
-        char sbuf[128];
-        int n = sprintf(sbuf,
-            "[VOFA] torque=%.3f iqP=%.2f iqI=%.2f idP=%.2f idI=%.2f "
-            "limit=%.2f enable=%d\r\n",
-            (double)motor_control.set_torque,
-            (double)motor_config.iq_p_gain, (double)motor_config.iq_i_gain,
-            (double)motor_config.id_p_gain, (double)motor_config.id_i_gain,
-            (double)current_loop.limit, current_loop_enable);
-        HAL_UART_Transmit(&huart2, (uint8_t *)sbuf, n, 100);
-    }
+  /* USER CODE END CORDIC_MspDeInit 0 */
+    /* Peripheral clock disable */
+    __HAL_RCC_CORDIC_CLK_DISABLE();
+  /* USER CODE BEGIN CORDIC_MspDeInit 1 */
+
+  /* USER CODE END CORDIC_MspDeInit 1 */
+  }
 }
 
-/* ========================================================================== */
-/*  DMA RX idle callback                                                       */
-/* ========================================================================== */
+/* USER CODE BEGIN 1 */
 
 /**
-  * @brief  Handle UART2 DMA RX idle-line event.
-  *         Copies received data into rx_line, sets rx_flag for main loop.
-  *         Call from HAL_UARTEx_RxEventCallback() in stm32g4xx_it.c.
+  * @brief  Compute sine & cosine via CORDIC hardware (Cosine mode, Q1.31)
+  * @note   Uses direct register access — avoids HAL_CORDIC_Calculate()
+  *         NbCalc=1 bug (missing RRDY poll for single-shot).
+  * @param  angle_rad  Input angle in radians, auto-normalized to [-PI, PI)
+  * @param  pSin       Pointer to output sine value
+  * @param  pCos       Pointer to output cosine value
   */
-void VOFA_RxIdleCallback(void)
+void CORDIC_SinCos(float angle_rad, float *pSin, float *pCos)
 {
-    HAL_UART_Transmit(&huart2, (uint8_t *)"RX\n", 3, 100);
-
-    uint16_t pos = VOFA_RX_BUF_SIZE - __HAL_DMA_GET_COUNTER(huart2.hdmarx);
-
-    if (pos > 0 && pos < VOFA_RX_BUF_SIZE) {
-        memcpy(rx_line, rx_buf, pos);
-        rx_line[pos] = '\0';
-        rx_flag = 1;
+    /* 1. Switch CORDIC to Cosine mode if not already configured */
+    if (cordic_current_mode != 0) {
+        CORDIC->CSR = CORDIC_CSR_COS;
+        cordic_current_mode = 0;
     }
 
-    /* Restart DMA RX with manual IDLE enable */
-    HAL_UART_DMAStop(&huart2);
-    HAL_UART_Receive_DMA(&huart2, rx_buf, VOFA_RX_BUF_SIZE);
-    __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
-    __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
+    /* 2. Normalize angle to [-PI, PI) for Q1.31 representation */
+    float a = angle_rad;
+    while (a >= PI)  a -= _2PI;
+    while (a < -PI)  a += _2PI;
+
+    /* 3. Write angle in Q1.31 — starts computation */
+    CORDIC->WDATA = (int32_t)((a / PI) * CORDIC_Q31_SCALE);
+
+    /* 4. Wait for result ready */
+    while (!(CORDIC->CSR & CORDIC_CSR_RRDY));
+
+    /* 5. Read cos (first), sin (second) in Q1.31 */
+    *pCos = (float)(int32_t)CORDIC->RDATA * CORDIC_Q31_SCALE_INV;
+    *pSin = (float)(int32_t)CORDIC->RDATA * CORDIC_Q31_SCALE_INV;
 }
+
+/**
+  * @brief  Compute sqrt(x^2 + y^2) via CORDIC hardware (Modulus mode, Q1.31)
+  * @note   Uses direct register access — avoids HAL_CORDIC_Calculate()
+  *         NbCalc=1 bug (missing RRDY poll for single-shot).
+  * @param  x  First value
+  * @param  y  Second value
+  * @return    sqrt(x^2 + y^2)
+  */
+float CORDIC_Modulus(float x, float y)
+{
+    /* 1. Switch CORDIC to Modulus mode if not already configured */
+    if (cordic_current_mode != 1) {
+        CORDIC->CSR = CORDIC_CSR_MOD;
+        cordic_current_mode = 1;
+    }
+
+    /* 2. Scale inputs to fit Q1.31 range [-1, 1) */
+    float abs_x = fabsf(x);
+    float abs_y = fabsf(y);
+    float max_val = (abs_x > abs_y) ? abs_x : abs_y;
+    if (max_val < 1e-12f) return 0.0f;
+
+    float x_norm = x / max_val;
+    float y_norm = y / max_val;
+
+    /* 3. Write x, y in Q1.31 — second write starts computation */
+    CORDIC->WDATA = (int32_t)(x_norm * CORDIC_Q31_SCALE);
+    CORDIC->WDATA = (int32_t)(y_norm * CORDIC_Q31_SCALE);
+
+    /* 4. Wait for result ready */
+    while (!(CORDIC->CSR & CORDIC_CSR_RRDY));
+
+    /* 5. Read modulus in Q1.31 and restore scale */
+    float result = (float)(int32_t)CORDIC->RDATA * CORDIC_Q31_SCALE_INV;
+    return result * max_val;
+}
+
+/* USER CODE END 1 */

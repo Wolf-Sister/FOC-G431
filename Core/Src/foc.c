@@ -14,6 +14,7 @@
 #include "as5047p.h"
 #include "pid.h"
 #include <math.h>
+#include "arm_math.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -76,8 +77,8 @@ motor_control_t motor_control = {
   */
 void SVPWM_Update(float Ud, float Uq, float angle, uint32_t period)
 {
-    float cos_angle = cosf(angle);
-    float sin_angle = sinf(angle);
+    float sin_angle, cos_angle;
+    arm_sin_cos_f32(angle * RAD_TO_DEG, &sin_angle, &cos_angle);
     float Ualpha = Ud * cos_angle - Uq * sin_angle;
     float Ubeta  = Ud * sin_angle + Uq * cos_angle;
 
@@ -250,7 +251,9 @@ float cal_Iq_Id(float cur_b, float cur_c, float angle_el)
     float I_beta  = _1_SQRT3 * (cur_b - cur_c);
 
     /* Park transform */
-    float I_q = I_beta * cosf(angle_el) - I_alpha * sinf(angle_el);
+    float s, c;
+    arm_sin_cos_f32(angle_el * RAD_TO_DEG, &s, &c);
+    float I_q = I_beta * c - I_alpha * s;
     return I_q;
 }
 
@@ -333,8 +336,10 @@ void foc_current_loop(void)
     /* ── 2. Clarke + Park: compute Id & Iq from B,C phase currents ── */
     float I_alpha = -(motor_control.IphB + motor_control.IphC);
     float I_beta  = _1_SQRT3 * (motor_control.IphB - motor_control.IphC);
-    float I_d_raw = I_alpha * cosf(angle_el) + I_beta * sinf(angle_el);
-    float I_q_raw = I_beta  * cosf(angle_el) - I_alpha * sinf(angle_el);
+    float s, c;
+    arm_sin_cos_f32(angle_el * RAD_TO_DEG, &s, &c);
+    float I_d_raw = I_alpha * c + I_beta * s;
+    float I_q_raw = I_beta  * c - I_alpha * s;
 
     /* ── 3. Low-pass filter both axes (instance-based, no static clash) ── */
     motor_control.id_meas = lowPassFilter(I_d_raw, 0.01f, &motor_control.id_filter_state);
@@ -529,8 +534,10 @@ void foc_forward(float d, float q, float angle_el)
     }
 
     /* Inverse Park transform */
-    float mod_alpha = mod_d * cosf(angle_el) - mod_q * sinf(angle_el);
-    float mod_beta  = mod_d * sinf(angle_el) + mod_q * cosf(angle_el);
+    float s, c;
+    arm_sin_cos_f32(angle_el * RAD_TO_DEG, &s, &c);
+    float mod_alpha = mod_d * c - mod_q * s;
+    float mod_beta  = mod_d * s + mod_q * c;
 
     /* SVM → duty cycles */
     SVM(mod_alpha, mod_beta, &d_u, &d_v, &d_w);

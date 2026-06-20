@@ -8,6 +8,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "utils.h"
 #include <math.h>
+#include "arm_math.h"
 
 /* Private variables ---------------------------------------------------------*/
 static uint32_t cpu_freq_mhz = 0;
