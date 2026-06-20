@@ -32,17 +32,13 @@ struct PIDController {
 /* Global PID instances -----------------------------------------------------*/
 extern struct PIDController current_loop;     /* Iq current loop              */
 extern struct PIDController id_current_loop;  /* Id current loop              */
-extern struct PIDController vel_loop;
-extern struct PIDController angle_loop;
 
 /* API ----------------------------------------------------------------------*/
 float PIDController_Update(struct PIDController *pid, float error);
 
-void  motor_pid_init(float tor_p, float tor_i, float vel_p, float vel_i, float pos_p);
+void  motor_pid_init(float iq_p, float iq_i, float id_p, float id_i);
 void  foc_set_current_pid(float P, float I, float D, float ramp);
 void  foc_set_id_current_pid(float P, float I, float D, float ramp);
-void  foc_set_vel_pid(float P, float I, float D, float ramp, float limit, float alpha);
-void  foc_set_angle_pid(float P, float I, float D, float ramp, float limit);
 
 #ifdef __cplusplus
 }

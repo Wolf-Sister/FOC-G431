@@ -1,0 +1,182 @@
+/**
+  ******************************************************************************
+  * @file    vofa.c
+  * @brief   VOFA+ serial telemetry & command interface — DMA-backed UART2
+  *
+  *          Output format:   "channels: 1.386578,0.977929,...,-0.942729\n"
+  *          Input commands:  torque <f>, iqpid <p> <i>, idpid <p> <i>,
+  *                           enable <0|1>, limit <f>, status
+  ******************************************************************************
+  */
+
+/* Includes ------------------------------------------------------------------*/
+#include "vofa.h"
+#include "foc.h"
+#include "pid.h"
+#include "as5047p_ext.h"
+#include "usart.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+/* Private buffers -----------------------------------------------------------*/
+static char    tx_buf[VOFA_TX_BUF_SIZE];
+static uint8_t rx_buf[VOFA_RX_BUF_SIZE];        /* DMA circular buffer          */
+static uint8_t rx_line[VOFA_RX_BUF_SIZE];       /* null-terminated command line */
+static volatile uint8_t rx_flag = 0;            /* 1 = new command ready        */
+
+/* ========================================================================== */
+/*  Initialisation                                                             */
+/* ========================================================================== */
+
+/**
+  * @brief  Start DMA-based UART2 reception (idle-line detection).
+  * @note   Requires CubeMX DMA config: USART2_RX → DMA1 Circular,
+  *         USART2_TX → DMA1 Normal. Call once after peripherals are up.
+  */
+void VOFA_Init(void)
+{
+    /* Start DMA RX + manually enable IDLE-line interrupt */
+    HAL_UART_Receive_DMA(&huart2, rx_buf, VOFA_RX_BUF_SIZE);
+    __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
+    __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
+}
+
+/* ========================================================================== */
+/*  Telemetry output (called from ADC ISR @ 20 kHz, self-divided to 100 Hz)    */
+/* ========================================================================== */
+
+/**
+  * @brief  Send one telemetry frame via DMA TX (non-blocking).
+  *         Rate controlled by TIM16 @ 100 Hz — no internal divider.
+  *
+  *  Channels:
+  *   0  id_meas       d-axis measured current (A)
+  *   1  iq_meas       q-axis measured current (A)
+  *   2  set_torque    torque / current reference (A)
+  *   3  Vd_cmd        d-axis voltage command (V)  — stored in id_set
+  *   4  Vq_cmd        q-axis voltage command (V)  — stored in iq_set
+  *   5  elec_vel      electrical angular velocity (rad/s)
+  *   6  IphA          phase-A current (A)
+  *   7  IphB          phase-B current (A)
+  *   8  IphC          phase-C current (A)
+  *   9  mod_q         q-axis modulation index (0..1)
+  *  10  Iq_integral   Iq PI integrator state (V·s)
+  */
+void VOFA_SendFrame(void)
+{
+    /* Skip if previous DMA TX is still in progress */
+    if (huart2.gState != HAL_UART_STATE_READY) return;
+
+    /* Gather channel data */
+    float ch[VOFA_CHAN_COUNT];
+    ch[0]  = motor_control.id_meas;
+    ch[1]  = motor_control.iq_meas;
+    ch[2]  = motor_control.set_torque;
+    ch[3]  = motor_control.id_set;             /* = Vd command (V)              */
+    ch[4]  = motor_control.iq_set;             /* = Vq command (V)              */
+    ch[5]  = motor_control.elec_vel;
+    ch[6]  = motor_control.IphA;
+    ch[7]  = motor_control.IphB;
+    ch[8]  = motor_control.IphC;
+    ch[9]  = motor_control.mod_q;
+    ch[10] = current_loop.integral_prev;
+
+    /* Format: "channels: %f,%f,...,%f\n" */
+    int pos = 0;
+    pos += sprintf(tx_buf + pos, "channels: ");
+    for (int i = 0; i < VOFA_CHAN_COUNT; i++) {
+        pos += sprintf(tx_buf + pos, "%.6f", (double)ch[i]);
+        if (i < VOFA_CHAN_COUNT - 1) {
+            tx_buf[pos++] = ',';
+        }
+    }
+    tx_buf[pos++] = '\n';
+    tx_buf[pos]   = '\0';
+
+    /* Non-blocking DMA transmit */
+    HAL_UART_Transmit_DMA(&huart2, (uint8_t *)tx_buf, pos);
+}
+
+/* ========================================================================== */
+/*  Command parser (call from main loop)                                       */
+/* ========================================================================== */
+
+/**
+  * @brief  Parse one received command line and apply settings.
+  *         Supported commands:
+  *           torque <f>       set motor_control.set_torque
+  *           iqpid  <p> <i>   set Iq (torque) current-loop PI gains
+  *           idpid  <p> <i>   set Id (flux)   current-loop PI gains
+  *           enable <0|1>     enable / disable current loop
+  *           limit  <v>       set PI output saturation limit (V)
+  *           status           echo current configuration
+  */
+void VOFA_PollCommands(void)
+{
+    if (!rx_flag) return;
+    rx_flag = 0;
+
+    float v1, v2;
+
+    if (sscanf((char *)rx_line, "torque %f", &v1) == 1) {
+        motor_control.set_torque = v1;
+    }
+    else if (sscanf((char *)rx_line, "iqpid %f %f", &v1, &v2) == 2) {
+        foc_set_current_pid(v1, v2, 0.0f, 0.0f);
+        motor_config.iq_p_gain = v1;
+        motor_config.iq_i_gain = v2;
+    }
+    else if (sscanf((char *)rx_line, "idpid %f %f", &v1, &v2) == 2) {
+        foc_set_id_current_pid(v1, v2, 0.0f, 0.0f);
+        motor_config.id_p_gain = v1;
+        motor_config.id_i_gain = v2;
+    }
+    else if (sscanf((char *)rx_line, "enable %f", &v1) == 1) {
+        current_loop_enable = (v1 != 0.0f) ? 1 : 0;
+    }
+    else if (sscanf((char *)rx_line, "limit %f", &v1) == 1) {
+        current_loop.limit    = v1;
+        id_current_loop.limit = v1;
+    }
+    else if (strncmp((char *)rx_line, "status", 6) == 0) {
+        /* Blocking TX is fine — main loop, low frequency */
+        char sbuf[128];
+        int n = sprintf(sbuf,
+            "[VOFA] torque=%.3f iqP=%.2f iqI=%.2f idP=%.2f idI=%.2f "
+            "limit=%.2f enable=%d\r\n",
+            (double)motor_control.set_torque,
+            (double)motor_config.iq_p_gain, (double)motor_config.iq_i_gain,
+            (double)motor_config.id_p_gain, (double)motor_config.id_i_gain,
+            (double)current_loop.limit, current_loop_enable);
+        HAL_UART_Transmit(&huart2, (uint8_t *)sbuf, n, 100);
+    }
+}
+
+/* ========================================================================== */
+/*  DMA RX idle callback                                                       */
+/* ========================================================================== */
+
+/**
+  * @brief  Handle UART2 DMA RX idle-line event.
+  *         Copies received data into rx_line, sets rx_flag for main loop.
+  *         Call from HAL_UARTEx_RxEventCallback() in stm32g4xx_it.c.
+  */
+void VOFA_RxIdleCallback(void)
+{
+    HAL_UART_Transmit(&huart2, (uint8_t *)"RX\n", 3, 100);
+
+    uint16_t pos = VOFA_RX_BUF_SIZE - __HAL_DMA_GET_COUNTER(huart2.hdmarx);
+
+    if (pos > 0 && pos < VOFA_RX_BUF_SIZE) {
+        memcpy(rx_line, rx_buf, pos);
+        rx_line[pos] = '\0';
+        rx_flag = 1;
+    }
+
+    /* Restart DMA RX with manual IDLE enable */
+    HAL_UART_DMAStop(&huart2);
+    HAL_UART_Receive_DMA(&huart2, rx_buf, VOFA_RX_BUF_SIZE);
+    __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
+    __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
+}

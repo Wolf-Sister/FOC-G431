@@ -45,27 +45,11 @@ extern "C" {
 /* Motor power ---------------------------------------------------------------*/
 #define MOTOR_VBUS      12       /* Motor supply voltage (V)                  */
 #define LIMIT_CURRENT   10.0f    /* Max phase current (A)                     */
-#define VEL_ALPHA       0.05f    /* Velocity low-pass filter coefficient      */
-#define KV_FF           0.002f   /* Velocity feed-forward gain                */
-#define VEL_DEADBAND    1.0f     /* Velocity dead-zone threshold              */
 
 /* Motor electrical parameters — TUNE THESE for your motor! ------------------*/
 #define MOTOR_Lq        0.0005f  /* q-axis inductance (H) — 0.5 mH typical    */
 #define MOTOR_Ld        0.0005f  /* d-axis inductance (H) — same for SPM      */
 #define MOTOR_FLUX      0.005f   /* PM flux linkage (Wb) — Ke=V·s/rad         */
-
-/* ========================================================================== */
-/*  Open-loop control (kept from existing G431 code)                          */
-/* ========================================================================== */
-typedef struct {
-    float Uq;
-    float Ud;
-    float Angle;
-    float Speed;
-    uint32_t Period;
-} OpenLoop_Ctrl_t;
-
-extern OpenLoop_Ctrl_t motor_ctrl;
 
 /* ========================================================================== */
 /*  Phase current data (dual-ADC captured, calibration state)                 */
@@ -87,8 +71,6 @@ extern volatile Phase_Current_t motor_current;
 /*  Motor mode                                                                */
 /* ========================================================================== */
 typedef enum {
-    MOTOR_POSITION,        /* Position closed loop                            */
-    MOTOR_SPEED,           /* Speed closed loop                               */
     MOTOR_TORQUE,          /* Torque / current closed loop                    */
 } Motor_Mode_e;
 
@@ -99,11 +81,10 @@ typedef struct {
     float voltage_supply;       /* Max bus voltage                             */
     int   dir;                  /* Motor direction (+1 or -1)                   */
     int   pairs;                /* Pole pairs                                   */
-    float pos_gain;             /* Position-loop P gain                        */
-    float vel_gain;             /* Velocity-loop P gain                        */
-    float vel_integrator_gain;  /* Velocity-loop I gain                        */
-    float torque_gain;          /* Current-loop P gain                         */
-    float torque_integrator_gain; /* Current-loop I gain                       */
+    float iq_p_gain;            /* Q-axis (torque) current-loop P gain         */
+    float iq_i_gain;            /* Q-axis (torque) current-loop I gain         */
+    float id_p_gain;            /* D-axis (flux)   current-loop P gain         */
+    float id_i_gain;            /* D-axis (flux)   current-loop I gain         */
 } motor_config_t;
 
 typedef struct {
@@ -116,19 +97,13 @@ typedef struct {
     uint32_t IphC_offset;
 
     /* Setpoints */
-    float set_pos;
-    float set_vel;
     float set_torque;
-    float Iq_target;
-    float pos_target;
-    float vel_target;
 
     /* Mode & calibration */
     uint8_t mode;
     float   zero_elec_angle;
     bool    pre_calibrated;
     bool    encoder_updated;
-    int32_t pos_abs;
 
     /* dq-axis */
     float iq_set;             /* PID output → Uq command (V)                   */
@@ -144,9 +119,6 @@ typedef struct {
 
     /* PWM duty (0~1) */
     float du, dv, dw;
-
-    /* Velocity filter alpha */
-    float vel_lowpass_alpha;
 
     /* Raw ADC snapshots (debug) */
     uint32_t latest_ib_raw;
@@ -169,12 +141,10 @@ extern volatile uint8_t alignment_in_progress;
 /* --- Existing (kept) -------------------------------------------------------*/
 void  SVPWM_Update(float Ud, float Uq, float angle, uint32_t period);
 void  Motor_Current_Calibration(void);
-float FOC_GetSmoothAngle(void);
 void  UART2_SendString(const char *str);
 
 /* --- Motor control ---------------------------------------------------------*/
 void  motor_control_parm_init(void);
-void  set_motor_mode(Motor_Mode_e mode);
 
 /* --- Clarke + Park transform -----------------------------------------------*/
 float cal_Iq_Id(float cur_b, float cur_c, float angle_el);
@@ -184,8 +154,6 @@ void  foc_alignSensor(float q_voltage);
 
 /* --- Closed-loop control ---------------------------------------------------*/
 void  foc_current_loop(void);
-void  foc_velocity_loop(void);
-void  foc_position_loop(void);
 
 /* --- SVPWM forward path (d,q → PWM) ----------------------------------------*/
 void  foc_forward(float d, float q, float angle_el);

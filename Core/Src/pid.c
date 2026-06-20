@@ -12,41 +12,11 @@
 #include "foc.h"
 
 /* PID limits ----------------------------------------------------------------*/
-#define MAX_ANGLE_SPEED     100.0f           /* Max angular speed output    */
-#define MAX_IQ_CURRENT      LIMIT_CURRENT    /* Max Iq current (A)           */
 #define MAX_MODULATION      12 * 0.9f        /* Max modulation voltage       */
 
 /* Global PID instance definitions -------------------------------------------*/
-struct PIDController angle_loop      = {.P = 2.0f, .I = 0.0f,  .limit = MAX_ANGLE_SPEED};
-struct PIDController vel_loop        = {.P = 2.0f, .I = 20.0f, .limit = MAX_IQ_CURRENT};
 struct PIDController current_loop    = {.P = 1.0f, .I = 10.0f, .limit = MAX_MODULATION};
 struct PIDController id_current_loop = {.P = 1.0f, .I = 10.0f, .limit = MAX_MODULATION};
-
-/* --------------------------------------------------------------------------*/
-/**
-  * @brief  Set angle-loop PID parameters
-  */
-void foc_set_angle_pid(float P, float I, float D, float ramp, float limit)
-{
-    angle_loop.P           = P;
-    angle_loop.I           = I;
-    angle_loop.D           = D;
-    angle_loop.output_ramp = ramp;
-    angle_loop.limit       = limit;
-}
-
-/**
-  * @brief  Set velocity-loop PID parameters
-  */
-void foc_set_vel_pid(float P, float I, float D, float ramp, float limit, float alpha)
-{
-    vel_loop.P           = P;
-    vel_loop.I           = I;
-    vel_loop.D           = D;
-    vel_loop.output_ramp = ramp;
-    vel_loop.limit       = limit;
-    motor_control.vel_lowpass_alpha = alpha;
-}
 
 /**
   * @brief  Set current-loop PID parameters
@@ -121,21 +91,15 @@ float PIDController_Update(struct PIDController *pid, float error)
 }
 
 /**
-  * @brief  One-shot init of all three PID loops from high-level gains
+  * @brief  One-shot init of current-loop PI controllers
   */
-void motor_pid_init(float tor_p, float tor_i, float vel_p, float vel_i, float pos_p)
+void motor_pid_init(float iq_p, float iq_i, float id_p, float id_i)
 {
-    motor_config.torque_gain            = tor_p;
-    motor_config.torque_integrator_gain = tor_i;
-    motor_config.vel_gain               = vel_p;
-    motor_config.vel_integrator_gain    = vel_i;
-    motor_config.pos_gain               = pos_p;
+    motor_config.iq_p_gain = iq_p;
+    motor_config.iq_i_gain = iq_i;
+    motor_config.id_p_gain = id_p;
+    motor_config.id_i_gain = id_i;
 
-    foc_set_angle_pid(motor_config.pos_gain, 0.0f, 0.0f, 100000.0f, LIMIT_CURRENT);
-    foc_set_vel_pid(motor_config.vel_gain, motor_config.vel_integrator_gain,
-                    0.0f, 100000.0f, LIMIT_CURRENT, VEL_ALPHA);
-    foc_set_current_pid(motor_config.torque_gain,
-                        motor_config.torque_integrator_gain, 0.0f, 0.0f);
-    foc_set_id_current_pid(motor_config.torque_gain,
-                           motor_config.torque_integrator_gain, 0.0f, 0.0f);
+    foc_set_current_pid(iq_p, iq_i, 0.0f, 0.0f);
+    foc_set_id_current_pid(id_p, id_i, 0.0f, 0.0f);
 }

@@ -457,6 +457,21 @@
               </FileOption>
             </File>
             <File>
+              <FileName>as5047p_ext.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\as5047p_ext.c</FilePath>
+            </File>
+            <File>
+              <FileName>pid.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\pid.c</FilePath>
+            </File>
+            <File>
+              <FileName>utils.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\utils.c</FilePath>
+            </File>
+            <File>
               <FileName>main.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/main.c</FilePath>
@@ -806,21 +821,6 @@
               <FileName>stm32g4xx_hal_msp.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32g4xx_hal_msp.c</FilePath>
-            </File>
-            <File>
-              <FileName>as5047p_ext.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\as5047p_ext.c</FilePath>
-            </File>
-            <File>
-              <FileName>pid.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\pid.c</FilePath>
-            </File>
-            <File>
-              <FileName>utils.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\utils.c</FilePath>
             </File>
           </Files>
         </Group>

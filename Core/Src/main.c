@@ -33,8 +33,6 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define TEST_MODE_OPENLOOP  0   /* 0=closed-loop torque, 1=open-loop vector test */
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -46,11 +44,8 @@
 
 /* USER CODE BEGIN PV */
 
-/* Open-loop test globals — accessible from TIM callback */
-uint8_t  test_phase  = 0;   /* 0=wait cal, 1=openloop test, 2=closed loop */
-float    test_Uq     = 0.5f;
-float    test_angle  = 0.0f;
-float    test_speed  = 0.003f;   /* angle step per 20kHz ISR */
+/* Control state globals — accessible from TIM/ADC callbacks */
+uint8_t  test_phase  = 0;   /* 0=wait cal, 1=openloop, 2=closed loop */
 
 /* USER CODE END PV */
 
@@ -141,7 +136,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* --- Phase 0: calibration done → choose path based on TEST_MODE_OPENLOOP --- */
+    /* --- Phase 0: calibration done → sensor alignment → closed loop --- */
     if (motor_current.Calibrated == 1 && test_phase == 0)
     {
       /* Log calibration result */
@@ -151,41 +146,20 @@ int main(void)
               motor_current.Offset_A, motor_current.Offset_C);
       UART2_SendString(log_buf);
 
-#if TEST_MODE_OPENLOOP
-      test_phase = 1;
-      UART2_SendString("[FOC] Open-loop vector test running...\r\n");
-#else
       /* Sensor alignment */
       foc_alignSensor(4.0f);  /* stronger alignment to overcome cogging */
 
       /* Init motor state & PID */
       motor_control_parm_init();
-      //             tor_p   tor_i   vel_p   vel_i   pos_p
-motor_pid_init(0.05f,  5.0f,   0.0f,   0.0f,   0.0f);
-      set_motor_mode(MOTOR_TORQUE);
-      motor_control.set_torque = 0.1f;
+      motor_pid_init(2.5f, 150.0f,   /* Iq: P=2.5, I=150.0 */
+					 2.5f, 160.0f);  /* Id: P=2.5, I=150.0 */
+
+      motor_control.set_torque = 0.2f;
 
       /* current_loop_enable already set inside foc_alignSensor() */
       test_phase = 2;
 
       UART2_SendString("[FOC] Current Loop ACTIVE - Torque Mode\r\n");
-#endif
-    }
-
-    /* --- Phase 1: open-loop test (set TEST_MODE_OPENLOOP=1 to use) --- */
-    if (test_phase == 1)
-    {
-      if (HAL_GetTick() - last_print_time >= 100)
-      {
-        last_print_time = HAL_GetTick();
-        float elec_deg = test_angle * 57.29578f;
-        sprintf(buf,
-          "Elec:%5.1f | Ia:%+.3f Ib:%+.3f Ic:%+.3f | Sum:%.3f\r\n",
-          elec_deg,
-          motor_control.IphA, motor_control.IphB, motor_control.IphC,
-          motor_control.IphA + motor_control.IphB + motor_control.IphC);
-        UART2_SendString(buf);
-      }
     }
 
     /* --- Phase 2: closed-loop telemetry --- */
@@ -194,13 +168,9 @@ motor_pid_init(0.05f,  5.0f,   0.0f,   0.0f,   0.0f);
       if (HAL_GetTick() - last_print_time >= 100)
       {
         last_print_time = HAL_GetTick();
-        float mech_deg = AS5047P_GetAngle(&AngleSensor) * 57.29578f;
-        float elec_deg = _normalizeAngle(11.0f * AS5047P_GetAngle(&AngleSensor)
-                                         - motor_control.zero_elec_angle) * 57.29578f;
         sprintf(buf,
-          "Mech:%5.1f Elec:%5.1f | Ia:%+.3f Ib:%+.3f Ic:%+.3f | "
+          "Ia:%+.3f Ib:%+.3f Ic:%+.3f | "
           "Id:%.3f Iq:%.3f Ref:%.3f | Vd:%.2f Vq:%.2fV\r\n",
-          mech_deg, elec_deg,
           motor_control.IphA, motor_control.IphB, motor_control.IphC,
           motor_control.id_meas, motor_control.iq_meas, motor_control.set_torque,
           motor_control.id_set, motor_control.iq_set);
@@ -270,8 +240,6 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
     static uint32_t calib_sum_a = 0;
     static uint32_t calib_sum_c = 0;
     static uint16_t calib_cnt    = 0;
-    static uint8_t  cl_divider   = 0;  /* software divider for 20kHz→5kHz */
-
     if (hadc->Instance == ADC1)
     {
         /* 1. Read dual-ADC synchronized raw values */
@@ -305,58 +273,30 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
             motor_current.I_C = current_diff_c * CURRENT_FACTOR;
             motor_current.I_B = -(motor_current.I_A + motor_current.I_C);
 
-            /* 4. Sync to motor_control & run current loop at 5 kHz */
-            foc_sync_phase_currents();
+			// 1. 更新编码器，获取最新角度
+			AS5047P_Sensor_Update(&AngleSensor);
 
-            cl_divider++;
-			if (cl_divider >= 4) // 20kHz / 4 = 5kHz
-			{
-				cl_divider = 0;
-    
-				// 1. 先更新编码器，获取最新角度
-				AS5047P_Sensor_Update(&AngleSensor);
-    
-				// 2. 同步电流数据
-				foc_sync_phase_currents();
-    
-				// 3. 执行电流环
-				if (current_loop_enable) {
-					foc_current_loop();
-				}
+			// 2. 同步电流数据
+			foc_sync_phase_currents();
+
+			// 3. 执行电流环 @ 20kHz
+			if (current_loop_enable) {
+				foc_current_loop();
 			}
         }
     }
 }
 
 /**
-  * @brief  💡 TIM1 溢出/更新中断回调函数 (20kHz)
-  *         Phase 1: open-loop rotating voltage vector test
-  *         Phase 2: closed-loop current control (via ADC callback)
+  * @brief  TIM1 period elapsed callback (20 kHz)
+  *         PWM is driven by current-loop in ADC ISR; this is a safety no-op.
   */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM1)
   {
-    /* During sensor alignment, do NOT overwrite PWM with rotating vector */
+    /* During sensor alignment, do NOT overwrite PWM */
     if (alignment_in_progress) return;
-
-    if (motor_current.Calibrated == 1 && current_loop_enable == 0)
-    {
-      if (test_phase == 1)
-      {
-        /* Open-loop rotating voltage vector — 20kHz angle update */
-        test_angle += test_speed;
-        if (test_angle > _2PI) test_angle -= _2PI;
-        foc_forward(0.0f, test_Uq, test_angle);
-      }
-      else
-      {
-        /* Legacy open-loop SVPWM debug */
-        motor_ctrl.Angle += motor_ctrl.Speed;
-        if (motor_ctrl.Angle > _2PI) motor_ctrl.Angle -= _2PI;
-        SVPWM_Update(motor_ctrl.Ud, motor_ctrl.Uq, motor_ctrl.Angle, motor_ctrl.Period);
-      }
-    }
   }
 }
 /* USER CODE END 4 */

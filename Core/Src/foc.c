@@ -21,15 +21,6 @@
 /*  Global variables                                                          */
 /* ========================================================================== */
 
-/* Open-loop (kept from existing G431 code) */
-OpenLoop_Ctrl_t motor_ctrl = {
-    .Uq     = 0.3f,
-    .Ud     = 0.0f,
-    .Angle  = 0.0f,
-    .Speed  = 0.0015f,
-    .Period = 4250
-};
-
 /* Phase currents (dual-ADC captured) */
 volatile Phase_Current_t motor_current = {0};
 
@@ -40,18 +31,17 @@ volatile uint8_t current_loop_enable = 0;
 volatile uint8_t alignment_in_progress = 0;
 
 /* Current-loop execution period (s) */
-static const float current_meas_period = (1.0f / 5000.0f);  /* 5 kHz */
+static const float current_meas_period = (1.0f / 20000.0f);  /* 20 kHz */
 
 /* Motor config (from TinyFoc) */
 motor_config_t motor_config = {
     .voltage_supply         = MOTOR_VBUS,
     .dir                    = -1,
     .pairs                  = 11,
-    .pos_gain               = 0,
-    .vel_gain               = 0,
-    .vel_integrator_gain    = 0,
-    .torque_gain            = 0,
-    .torque_integrator_gain = 0,
+    .iq_p_gain              = 0,
+    .iq_i_gain              = 0,
+    .id_p_gain              = 0,
+    .id_i_gain              = 0,
 };
 
 /* Motor control state (from TinyFoc) */
@@ -62,25 +52,18 @@ motor_control_t motor_control = {
     .IphA_offset       = 0,
     .IphB_offset       = 0,
     .IphC_offset       = 0,
-    .set_pos           = 0.0f,
-    .set_vel           = 0.0f,
     .set_torque        = 0.0f,
     .mode              = MOTOR_TORQUE,
     .zero_elec_angle   = 0.0f,
     .pre_calibrated    = false,
     .encoder_updated   = false,
-    .pos_abs           = 0,
     .iq_set            = 0.0f,
     .iq_meas           = 0.0f,
-    .Iq_target         = 0.0f,
-    .pos_target        = 0.0f,
-    .vel_target        = 0.0f,
     .du                = 0.0f,
     .dv                = 0.0f,
     .dw                = 0.0f,
     .latest_ib_raw     = 0,
     .latest_ic_raw     = 0,
-    .vel_lowpass_alpha = 0.0f,
     .mod_q             = 0.0f,
 };
 
@@ -174,35 +157,6 @@ void Motor_Current_Calibration(void)
     motor_current.Calibrated = 0;
 }
 
-float FOC_GetSmoothAngle(void)
-{
-    static float filtered_angle = 0.0f;
-    static uint8_t is_first = 1;
-
-    uint16_t dma_raw = AS5047P_DMA_GetAngleCallback();
-
-    if (dma_raw == 0xFFFFU) return filtered_angle;
-
-    float current_angle = (float)dma_raw * (360.0f / 16384.0f);
-
-    if (is_first) {
-        filtered_angle = current_angle;
-        is_first = 0;
-        return filtered_angle;
-    }
-
-    float diff = current_angle - filtered_angle;
-    if (diff >  180.0f) diff -= 360.0f;
-    if (diff < -180.0f) diff += 360.0f;
-
-    filtered_angle += FOC_LPF_ALPHA * diff;
-
-    if (filtered_angle >= 360.0f) filtered_angle -= 360.0f;
-    if (filtered_angle <  0.0f)   filtered_angle += 360.0f;
-
-    return filtered_angle;
-}
-
 void UART2_SendString(const char *str)
 {
     HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), HAL_MAX_DELAY);
@@ -231,20 +185,10 @@ void motor_control_parm_init(void)
 {
     motor_control.iq_set     = 0.0f;
     motor_control.id_set     = 0.0f;
-    motor_control.Iq_target  = 0.0f;
     motor_control.iq_meas    = 0.0f;
     motor_control.id_meas    = 0.0f;
-    motor_control.set_pos    = AS5047P_GetAngle(&AngleSensor);
-    motor_control.set_vel    = 0.0f;
-    motor_control.pos_target = 0.0f;
-    motor_control.vel_target = 0.0f;
     motor_control.id_filter_state = 0.0f;
     motor_control.iq_filter_state = 0.0f;
-}
-
-void set_motor_mode(Motor_Mode_e mode)
-{
-    motor_control.mode = mode;
 }
 
 /* ========================================================================== */
@@ -367,45 +311,11 @@ void foc_alignSensor(float q_voltage)
 }
 
 /* ========================================================================== */
-/*  Closed-loop: position / velocity / current (from TinyFoc motor.c)          */
+/*  Closed-loop: current control                                               */
 /* ========================================================================== */
 
-void foc_position_loop(void)
-{
-    float pos_error = motor_control.set_pos
-                      - AS5047P_GetAccumulateAngle(&AngleSensor);
-
-    /* Dead-band */
-    if (fabsf(pos_error) < 0.01f) {
-        motor_control.Iq_target = 0.0f;
-    } else {
-        motor_control.Iq_target = PIDController_Update(&angle_loop, pos_error);
-    }
-}
-
-void foc_velocity_loop(void)
-{
-    float vel = AS5047P_GetVelocity(&AngleSensor);
-
-    if (motor_control.mode == MOTOR_SPEED) {
-        float error = motor_control.set_vel - vel;
-
-        /* Dead-band with integrator clear */
-        if (fabsf(motor_control.set_vel) < VEL_DEADBAND
-            && fabsf(error) < VEL_DEADBAND) {
-            motor_control.Iq_target      = 0.0f;
-            vel_loop.integral_prev       = 0.0f;
-            return;
-        }
-
-        motor_control.Iq_target  = PIDController_Update(&vel_loop, error);
-        float ff_out             = KV_FF * motor_control.set_vel;
-        motor_control.Iq_target += ff_out;
-    }
-}
-
 /**
-  * @brief  Current (torque) loop — 5 kHz execution in ADC injection callback
+  * @brief  Current (torque) loop — 20 kHz execution in ADC injection callback
   *
   *          Features:
   *            - Iq PI control (torque / speed / position outer loop)
@@ -427,8 +337,8 @@ void foc_current_loop(void)
     float I_q_raw = I_beta  * cosf(angle_el) - I_alpha * sinf(angle_el);
 
     /* ── 3. Low-pass filter both axes (instance-based, no static clash) ── */
-    motor_control.id_meas = lowPassFilter(I_d_raw, 0.1f, &motor_control.id_filter_state);
-    motor_control.iq_meas = lowPassFilter(I_q_raw, 0.1f, &motor_control.iq_filter_state);
+    motor_control.id_meas = lowPassFilter(I_d_raw, 0.01f, &motor_control.id_filter_state);
+    motor_control.iq_meas = lowPassFilter(I_q_raw, 0.01f, &motor_control.iq_filter_state);
 
     /* ── 4. Cross-coupling + back-EMF feedforward ── */
     /*     Vd = Rs·Id + Ld·dId/dt - ω·Lq·Iq   →   Vd_ff = -ω·Lq·Iq            */
@@ -436,24 +346,20 @@ void foc_current_loop(void)
     float Vd_ff = -elec_vel * MOTOR_Lq * motor_control.iq_meas;
     float Vq_ff =  elec_vel * (MOTOR_Ld * motor_control.id_meas + MOTOR_FLUX);
 
-    /* ── 5. Iq error (torque / speed / position) ── */
-    float error_q;
-    if (motor_control.mode == MOTOR_SPEED
-        || motor_control.mode == MOTOR_POSITION) {
-        error_q = motor_control.Iq_target - motor_control.iq_meas;
-    } else {
-        /* MOTOR_TORQUE: direct torque/current command */
-        error_q = motor_control.set_torque - motor_control.iq_meas;
-    }
+	//float Vd_ff = 0.0f;
+	//float Vq_ff = 0.0f;
+
+    /* ── 5. Iq error — direct torque/current command ── */
+    float error_q = motor_control.set_torque - motor_control.iq_meas;
 
     /* ── 6. Id error — always regulate to 0 for SPM motors ── */
     float error_d = 0.0f - motor_control.id_meas;
 
     /* ── 7. Dead-band (Iq only — Id needs continuous regulation) ── */
-    if (fabsf(error_q) <= 0.001f) {
+    if (fabsf(error_q) <= 0.01f) {
         error_q = 0.0f;
     }
-    if (fabsf(error_d) <= 0.001f) {
+    if (fabsf(error_d) <= 0.01f) {
         error_d = 0.0f;
     }
 
