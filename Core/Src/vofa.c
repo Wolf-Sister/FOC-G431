@@ -112,11 +112,13 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 static void vofa_parse_cmd(const char *line)
 {
     const char *p = line;
-    uint8_t iq_dirty = 0, id_dirty = 0, vel_dirty = 0;
+    uint8_t iq_dirty = 0, id_dirty = 0, spd_dirty = 0;
     float iq_p = motor_config.iq_p_gain;  /* start from current value, */
     float iq_i = motor_config.iq_i_gain;  /* only overwrite what's sent */
     float id_p = motor_config.id_p_gain;
     float id_i = motor_config.id_i_gain;
+    float spd_p = motor_config.spd_p_gain;
+    float spd_i = motor_config.spd_i_gain;
 
     while (*p) {
         /* Skip whitespace / commas */
@@ -145,6 +147,19 @@ static void vofa_parse_cmd(const char *line)
         else if (strcmp(key, "I")  == 0) { iq_i = val; iq_dirty = 1; }
         else if (strcmp(key, "DP") == 0) { id_p = val; id_dirty = 1; }
         else if (strcmp(key, "DI") == 0) { id_i = val; id_dirty = 1; }
+        else if (strcmp(key, "S")  == 0) { motor_control.set_speed = val; }
+        else if (strcmp(key, "SP") == 0) { spd_p = val; spd_dirty = 1; }
+        else if (strcmp(key, "SI") == 0) { spd_i = val; spd_dirty = 1; }
+        else if (strcmp(key, "M")  == 0) {
+            uint8_t new_mode = (uint8_t)val;
+            if (new_mode <= 1) {
+                motor_control.mode = new_mode;
+                if (new_mode == MOTOR_SPEED) {
+                    motor_control.vel_filter_state = 0.0f;
+                    motor_control.vel_meas = 0.0f;
+                }
+            }
+        }
 
         /* unknown key → silently ignored */
     }
@@ -164,6 +179,12 @@ static void vofa_parse_cmd(const char *line)
         motor_config.id_i_gain = id_i;
         foc_set_id_current_pid(id_p, id_i,
                                id_current_loop.D, id_current_loop.output_ramp);
+    }
+    if (spd_dirty) {
+        motor_config.spd_p_gain = spd_p;
+        motor_config.spd_i_gain = spd_i;
+        speed_loop.P = spd_p;
+        speed_loop.I = spd_i;
     }
 }
 

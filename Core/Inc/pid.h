@@ -32,11 +32,13 @@ struct PIDController {
 /* Global PID instances -----------------------------------------------------*/
 extern struct PIDController current_loop;     /* Iq current loop              */
 extern struct PIDController id_current_loop;  /* Id current loop              */
+extern struct PIDController speed_loop;       /* Speed outer loop             */
 
 /* API ----------------------------------------------------------------------*/
 float PIDController_Update(struct PIDController *pid, float error);
 
 void  motor_pid_init(float iq_p, float iq_i, float id_p, float id_i);
+void  speed_pid_init(float spd_p, float spd_i);
 void  foc_set_current_pid(float P, float I, float D, float ramp);
 void  foc_set_id_current_pid(float P, float I, float D, float ramp);
 

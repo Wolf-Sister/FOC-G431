@@ -168,8 +168,9 @@ int main(void)
               motor_pid_init(1.4850f, 371.25f,   /* Iq: P, I */
                              1.4850f, 371.25f   /* Id: P, I */
                             );
+              speed_pid_init(0.005f, 0.02f);        /* Speed: P, I */
 
-      motor_control.set_torque = 0.1f;
+      motor_control.set_torque = 0.0f;
 
       /* current_loop_enable already set inside foc_alignSensor() */
       test_phase = 2;
@@ -179,43 +180,35 @@ int main(void)
     /* --- Phase 2: closed-loop telemetry via VOFA+ JustFloat --- */
     if (test_phase == 2)
     {
-      if (HAL_GetTick() - last_print_time >= 100)
+      if (HAL_GetTick() - last_print_time >= 10)
       {
         last_print_time = HAL_GetTick();
 
         /* Channel layout for VOFA+ / Python tuning script:
-         *   [0] id_target   - D-axis target current (A)
-         *   [1] id_meas     - D-axis actual current (A)
-         *   [2] iq_target   - Q-axis target current (A)
-         *   [3] iq_meas     - Q-axis actual current (A)
-         *   [4] vd_cmd      - D-axis voltage command (V)
-         *   [5] vq_cmd      - Q-axis voltage command (V)
-         *   [6] velocity    - Mechanical angular velocity (rad/s)
-         *   [7] status_flag - Step-sync flag (1=cmd received)
+         *   [0] id_target      - D-axis target current (A)
+         *   [1] id_meas        - D-axis actual current (A)
+         *   [2] iq_target      - Q-axis target current (A) = set_torque
+         *   [3] iq_meas        - Q-axis actual current (A)
+         *   [4] vd_cmd         - D-axis voltage command (V)
+         *   [5] vq_cmd         - Q-axis voltage command (V)
+         *   [6] velocity       - Filtered mechanical velocity (rad/s)
+         *   [7] status_flag    - Step-sync flag (1=cmd received)
+         *   [8] speed_setpoint - Speed setpoint (rad/s)
+         *   [9] mode           - Control mode (0=torque, 1=speed)
          */
-        /* Velocity: clamp → 1st-order LPF */
-        float vel_raw = encoder_cache.velocity_rad_s;
-        static float vel_filtered = 0.0f;
-        float vel_diff = vel_raw - vel_filtered;
-        // 根据你的控制周期（如 1ms）和电机惯量来设定，比如设为 10.0f 或 15.0f
-        if (vel_diff > 10.0f) {
-            vel_raw = vel_filtered + 10.0f;
-        } else if (vel_diff < -10.0f) {
-            vel_raw = vel_filtered - 10.0f;
-        }
-        vel_filtered += VEL_LPF_ALPHA * (vel_raw - vel_filtered);
-
-        float vofa_data[8] = {
+        float vofa_data[10] = {
             motor_control.id_target,
             motor_control.id_meas,
             motor_control.set_torque,
             motor_control.iq_meas,
             motor_control.id_set,
             motor_control.iq_set,
-            vel_filtered,
-            (float)motor_control.status_flag
+            motor_control.vel_meas,
+            (float)motor_control.status_flag,
+            motor_control.set_speed,
+            (float)motor_control.mode
         };
-        VOFA_SendData(vofa_data, 8);
+        VOFA_SendData(vofa_data, 10);
         motor_control.status_flag = 0;  /* clear after TX */
       }
     }

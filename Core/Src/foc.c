@@ -40,6 +40,8 @@ motor_config_t motor_config = {
     .iq_i_gain              = 0,
     .id_p_gain              = 0,
     .id_i_gain              = 0,
+    .spd_p_gain             = 0.05f,
+    .spd_i_gain             = 2.0f,
 };
 
 /* Motor control state (from TinyFoc) */
@@ -56,13 +58,21 @@ motor_control_t motor_control = {
     .pre_calibrated    = false,
     .encoder_updated   = false,
     .iq_set            = 0.0f,
+    .id_set            = 0.0f,
     .iq_meas           = 0.0f,
+    .id_meas           = 0.0f,
+    .id_target         = 0.0f,
+    .set_speed         = 0.0f,
+    .vel_meas          = 0.0f,
+    .vel_raw           = 0.0f,
+    .vel_filter_state  = 0.0f,
+    .mod_q             = 0.0f,
+    .mod_d             = 0.0f,
     .du                = 0.0f,
     .dv                = 0.0f,
     .dw                = 0.0f,
     .latest_ib_raw     = 0,
     .latest_ic_raw     = 0,
-    .mod_q             = 0.0f,
 };
 
 /* CORDIC sin/cos cache — written by CORDIC ISR, read by foc_current_loop()    */
@@ -196,6 +206,10 @@ void motor_control_parm_init(void)
     motor_control.status_flag = 0;
     motor_control.id_filter_state = 0.0f;
     motor_control.iq_filter_state = 0.0f;
+    motor_control.set_speed        = 0.0f;
+    motor_control.vel_meas         = 0.0f;
+    motor_control.vel_raw          = 0.0f;
+    motor_control.vel_filter_state = 0.0f;
 }
 
 /* ========================================================================== */
@@ -311,6 +325,11 @@ void foc_alignSensor(float q_voltage)
     id_current_loop.error_prev      = 0.0f;
     id_current_loop.timestamp_prev  = dwt_get_micros();
 
+    speed_loop.integral_prev   = 0.0f;
+    speed_loop.output_prev     = 0.0f;
+    speed_loop.error_prev      = 0.0f;
+    speed_loop.timestamp_prev  = dwt_get_micros();
+
     /* Reset filter states so they don't carry stale values */
     motor_control.id_filter_state = 0.0f;
     motor_control.iq_filter_state = 0.0f;
@@ -334,8 +353,59 @@ void foc_alignSensor(float q_voltage)
 
 /* Forward declarations for static helpers (defined after foc_current_loop)     */
 static void foc_forward_cordic(float d, float q, float s_ff, float c_ff);
+static void foc_speed_loop(void);
 static void set_pwm_duty(float d_u, float d_v, float d_w);
 static int  SVM(float alpha, float beta, float *tA, float *tB, float *tC);
+
+/**
+  * @brief  Speed (velocity) outer loop — 2 kHz, cascaded above current loop.
+  *         Computes mechanical velocity from multi-turn total angle delta,
+  *         applies LPF, runs PI controller, sets motor_control.set_torque.
+  *
+  *         Called from foc_current_loop() every 10th ADC ISR (SPEED_DECIMATION).
+  */
+static void foc_speed_loop(void)
+{
+    static float  prev_total_angle = 0.0f;
+    static bool   initialized      = false;
+
+    /* 1. Read current multi-turn total angle (volatile, atomic on M4) */
+    float curr_total_angle = encoder_cache.total_angle_rad;
+
+    /* 2. First-run / mode-switch: save angle, skip control this cycle */
+    if (!initialized) {
+        prev_total_angle = curr_total_angle;
+        motor_control.vel_raw  = 0.0f;
+        motor_control.vel_meas = 0.0f;
+        initialized = true;
+        return;
+    }
+
+    /* 3. Compute velocity from delta angle (mechanical rad/s) */
+    float delta   = curr_total_angle - prev_total_angle;
+    prev_total_angle = curr_total_angle;
+    float vel_raw = delta / SPEED_Ts;  /* SPEED_Ts = 0.0005s */
+
+    /* 4. Low-pass filter velocity */
+    float vel_filt = lowPassFilter(vel_raw, SPEED_LPF_ALPHA,
+                                   &motor_control.vel_filter_state);
+
+    /* Store for telemetry */
+    motor_control.vel_raw  = vel_raw;
+    motor_control.vel_meas = vel_filt;
+
+    /* 5. PI control: error = setpoint - measured, corrected for dir */
+    float error   = (float)motor_config.dir * (motor_control.set_speed - vel_filt);
+    float iq_ref  = PIDController_Update(&speed_loop, error);
+
+    /* 6. Clamp Iq reference to motor current limit.
+     *    PIDController_Update already clamps to speed_loop.limit,
+     *    but double-clamp is defense-in-depth. */
+    if (iq_ref >  LIMIT_CURRENT) iq_ref =  LIMIT_CURRENT;
+    if (iq_ref < -LIMIT_CURRENT) iq_ref = -LIMIT_CURRENT;
+
+    motor_control.set_torque = iq_ref;
+}
 
 /**
   * @brief  Current (torque) loop — 20 kHz execution in ADC injection callback
@@ -349,6 +419,20 @@ static int  SVM(float alpha, float beta, float *tA, float *tB, float *tC);
   */
 void foc_current_loop(void)
 {
+    /* ── 0. Speed loop decimation: run @ 2 kHz (every 10th ADC ISR) ── */
+    {
+        static uint8_t speed_cnt = 0;
+        if (motor_control.mode == MOTOR_SPEED) {
+            speed_cnt++;
+            if (speed_cnt >= SPEED_DECIMATION) {
+                speed_cnt = 0;
+                foc_speed_loop();
+            }
+        } else {
+            speed_cnt = 0;  /* hold at 0 in torque mode for clean transition */
+        }
+    }
+
     /* ── 1. Read angle with linear extrapolation between 10 kHz encoder updates ── */
     static uint32_t last_enc_update = 0;
     float angle_mech = encoder_cache.angle_raw;

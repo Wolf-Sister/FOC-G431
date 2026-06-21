@@ -46,6 +46,11 @@ extern "C" {
 #define MOTOR_VBUS      12       /* Motor supply voltage (V)                  */
 #define LIMIT_CURRENT   10.0f    /* Max phase current (A)                     */
 
+/* Speed loop -----------------------------------------------------------------*/
+#define SPEED_DECIMATION   10         /* 20kHz / 10 = 2kHz speed loop          */
+#define SPEED_LPF_ALPHA    0.2f       /* Velocity LPF alpha @ 2kHz             */
+#define SPEED_Ts           0.0005f    /* Speed loop period (s)                 */
+
 /* Motor electrical parameters — TUNE THESE for your motor! ------------------*/
 #define MOTOR_Lq        0.0005f  /* q-axis inductance (H) — 0.5 mH typical    */
 #define MOTOR_Ld        0.0005f  /* d-axis inductance (H) — same for SPM      */
@@ -72,6 +77,7 @@ extern volatile Phase_Current_t motor_current;
 /* ========================================================================== */
 typedef enum {
     MOTOR_TORQUE,          /* Torque / current closed loop                    */
+    MOTOR_SPEED            /* Speed (velocity) closed loop                     */
 } Motor_Mode_e;
 
 /* ========================================================================== */
@@ -85,6 +91,8 @@ typedef struct {
     float iq_i_gain;            /* Q-axis (torque) current-loop I gain         */
     float id_p_gain;            /* D-axis (flux)   current-loop P gain         */
     float id_i_gain;            /* D-axis (flux)   current-loop I gain         */
+    float spd_p_gain;           /* Speed-loop P gain                           */
+    float spd_i_gain;           /* Speed-loop I gain                           */
 } motor_config_t;
 
 typedef struct {
@@ -111,6 +119,10 @@ typedef struct {
     float iq_meas;            /* Measured Iq (filtered)                        */
     float id_meas;            /* Measured Id (filtered)                        */
     float id_target;          /* D-axis current target (A), default 0 for SPM   */
+    float set_speed;           /* Speed setpoint (mechanical rad/s)             */
+    float vel_meas;            /* Measured velocity, filtered (rad/s)           */
+    float vel_raw;             /* Raw velocity before LPF (rad/s)               */
+    float vel_filter_state;    /* Velocity LPF state variable                   */
     float mod_q;              /* Normalized q-axis modulation                  */
     float mod_d;              /* Normalized d-axis modulation                  */
 

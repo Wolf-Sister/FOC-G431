@@ -17,6 +17,7 @@
 /* Global PID instance definitions -------------------------------------------*/
 struct PIDController current_loop    = {.P = 1.0f, .I = 10.0f, .limit = MAX_MODULATION};
 struct PIDController id_current_loop = {.P = 1.0f, .I = 10.0f, .limit = MAX_MODULATION};
+struct PIDController speed_loop      = {.P = 0.05f, .I = 2.0f, .limit = LIMIT_CURRENT};
 
 /**
   * @brief  Set current-loop PID parameters
@@ -102,4 +103,25 @@ void motor_pid_init(float iq_p, float iq_i, float id_p, float id_i)
 
     foc_set_current_pid(iq_p, iq_i, 0.0f, 0.0f);
     foc_set_id_current_pid(id_p, id_i, 0.0f, 0.0f);
+}
+
+/**
+  * @brief  Initialize speed-loop PI controller gains
+  */
+void speed_pid_init(float spd_p, float spd_i)
+{
+    motor_config.spd_p_gain = spd_p;
+    motor_config.spd_i_gain = spd_i;
+
+    speed_loop.P           = spd_p;
+    speed_loop.I           = spd_i;
+    speed_loop.D           = 0.0f;
+    speed_loop.output_ramp = 0.0f;
+    speed_loop.limit       = LIMIT_CURRENT;
+
+    /* Reset PID state for clean startup */
+    speed_loop.integral_prev   = 0.0f;
+    speed_loop.output_prev     = 0.0f;
+    speed_loop.error_prev      = 0.0f;
+    speed_loop.timestamp_prev  = dwt_get_micros();
 }
