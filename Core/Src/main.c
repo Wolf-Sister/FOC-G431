@@ -168,7 +168,7 @@ int main(void)
               motor_pid_init(1.4850f, 371.25f,   /* Iq: P, I */
                              1.4850f, 371.25f   /* Id: P, I */
                             );
-              speed_pid_init(0.005f, 0.02f);        /* Speed: P, I */
+              speed_pid_init(0.0120f, 0.0050f);        /* Speed: P, I */
 
       motor_control.set_torque = 0.0f;
 
