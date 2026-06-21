@@ -19,14 +19,11 @@ extern "C" {
 
 /* AS5047P sensor handle -----------------------------------------------------*/
 typedef struct {
-    /* --- State --- */
-    float        prev_angle_raw;      /* Previous raw angle (0–2π)             */
-    unsigned long prev_update_ts;     /* Timestamp of last update (us)          */
-
-    /* --- Outputs --- */
-    float        rotation_offset;     /* Accumulated full-rotation offset (rad) */
-    float        total_angle_rad;     /* Multi-turn total angle (rad)           */
-    float        velocity_rad_s;      /* Angular velocity (rad/s)               */
+    float    prev_angle;      /* Previous raw angle (0–2π)                   */
+    int32_t  turn_count;      /* Integer full-turn counter (no float drift)  */
+    float    total_angle;     /* Multi-turn total angle (rad)                */
+    float    velocity_rad_s;  /* Angular velocity (rad/s)                    */
+    uint32_t prev_ts;         /* Timestamp of last update (us)               */
 } AS5047P_Sensor_T;
 
 extern AS5047P_Sensor_T AngleSensor;

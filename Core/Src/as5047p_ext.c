@@ -31,11 +31,11 @@ volatile encoder_cache_t encoder_cache = {0};
   */
 void AS5047P_Sensor_Init(AS5047P_Sensor_T *s)
 {
-    s->prev_angle_raw   = 0.0f;
-    s->prev_update_ts   = 0;
-    s->rotation_offset  = 0.0f;
-    s->total_angle_rad  = 0.0f;
-    s->velocity_rad_s   = 0.0f;
+    s->prev_angle     = 0.0f;
+    s->turn_count     = 0;
+    s->total_angle    = 0.0f;
+    s->velocity_rad_s = 0.0f;
+    s->prev_ts        = 0;
 }
 
 /**
@@ -47,43 +47,47 @@ void AS5047P_Sensor_Init(AS5047P_Sensor_T *s)
   */
 void AS5047P_Sensor_Update(AS5047P_Sensor_T *s)
 {
-    /* Read latest DMA result (14-bit raw) */
     uint16_t raw = AS5047P_DMA_GetAngleCallback();
-    if (raw == 0xFFFFU) return;   /* Invalid read, skip this cycle */
+    if (raw == 0xFFFFU) return;
 
-    float current_angle = (float)raw * AS5047P_RAD_SCALE;
+    float angle = (float)raw * AS5047P_RAD_SCALE;
+    uint32_t now = dwt_get_micros();
 
-    /* First valid reading — initialize state */
-    if (s->prev_update_ts == 0) {
-        s->prev_angle_raw  = current_angle;
-        s->total_angle_rad = current_angle;
-        s->prev_update_ts  = dwt_get_micros();
+    /* first init */
+    if (s->prev_ts == 0) {
+        s->prev_angle  = angle;
+        s->total_angle = angle;
+        s->turn_count  = 0;
+        s->prev_ts     = now;
         return;
     }
 
-    /* Detect full-rotation wrap */
-    float delta = current_angle - s->prev_angle_raw;
+    float delta = angle - s->prev_angle;
+
+    /* ================================
+       INTEGER WRAP DETECTION CORE
+       ================================ */
     if (delta > PI) {
-        /* Wrapped from near-2π to near-0 (forward rotation) */
-        s->rotation_offset -= _2PI;
-    } else if (delta < -PI) {
-        /* Wrapped from near-0 to near-2π (reverse rotation) */
-        s->rotation_offset += _2PI;
+        s->turn_count--;            /* reverse cross: 0 → 2π */
+        delta -= _2PI;
+    }
+    else if (delta < -PI) {
+        s->turn_count++;            /* forward cross: 2π → 0  */
+        delta += _2PI;
     }
 
-    s->total_angle_rad = current_angle + s->rotation_offset;
+    /* total angle = integer turns + fractional */
+    s->total_angle = (float)s->turn_count * _2PI + angle;
 
-    /* Velocity from delta-angle / delta-time */
-    unsigned long now = dwt_get_micros();
-    float dt = (float)(now - s->prev_update_ts) * 1e-6f;
-    if (dt > 0.0f && dt < 1.0f) {
+    /* velocity (delta already corrected for wrap) */
+    float dt = (float)(now - s->prev_ts) * 1e-6f;
+    if (dt > 0.0f && dt < 0.1f) {
         s->velocity_rad_s = delta / dt;
     }
 
-    s->prev_angle_raw  = current_angle;
-    s->prev_update_ts  = now;
+    s->prev_angle = angle;
+    s->prev_ts    = now;
 
-    /* Queue next DMA read for the next Update() call */
     AS5047P_DMA_StartRequest();
 }
 
@@ -92,7 +96,7 @@ void AS5047P_Sensor_Update(AS5047P_Sensor_T *s)
   */
 float AS5047P_GetAngle(const AS5047P_Sensor_T *s)
 {
-    return s->prev_angle_raw;
+    return s->prev_angle;
 }
 
 /**
@@ -108,7 +112,7 @@ float AS5047P_GetVelocity(const AS5047P_Sensor_T *s)
   */
 float AS5047P_GetAccumulateAngle(const AS5047P_Sensor_T *s)
 {
-    return s->total_angle_rad;
+    return s->total_angle;
 }
 
 /**
@@ -117,6 +121,6 @@ float AS5047P_GetAccumulateAngle(const AS5047P_Sensor_T *s)
 float AS5047P_GetOnceAngle(const AS5047P_Sensor_T *s)
 {
     uint16_t raw = AS5047P_DMA_GetAngleCallback();
-    if (raw == 0xFFFFU) return s->prev_angle_raw;
+    if (raw == 0xFFFFU) return s->prev_angle;
     return (float)raw * AS5047P_RAD_SCALE;
 }

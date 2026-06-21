@@ -34,7 +34,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define VEL_LIMIT      600.0f   /* Velocity clamp ±600 rad/s (~5700 RPM)       */
+#define VEL_LPF_ALPHA  0.3f     /* 1st-order LPF coefficient (fc≈2.5Hz @100Hz) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -189,9 +190,21 @@ int main(void)
          *   [3] iq_meas     - Q-axis actual current (A)
          *   [4] vd_cmd      - D-axis voltage command (V)
          *   [5] vq_cmd      - Q-axis voltage command (V)
-         *   [6] vbus        - DC bus voltage (V)
+         *   [6] velocity    - Mechanical angular velocity (rad/s)
          *   [7] status_flag - Step-sync flag (1=cmd received)
          */
+        /* Velocity: clamp → 1st-order LPF */
+        float vel_raw = encoder_cache.velocity_rad_s;
+        static float vel_filtered = 0.0f;
+        float vel_diff = vel_raw - vel_filtered;
+        // 根据你的控制周期（如 1ms）和电机惯量来设定，比如设为 10.0f 或 15.0f
+        if (vel_diff > 10.0f) {
+            vel_raw = vel_filtered + 10.0f;
+        } else if (vel_diff < -10.0f) {
+            vel_raw = vel_filtered - 10.0f;
+        }
+        vel_filtered += VEL_LPF_ALPHA * (vel_raw - vel_filtered);
+
         float vofa_data[8] = {
             motor_control.id_target,
             motor_control.id_meas,
@@ -199,7 +212,7 @@ int main(void)
             motor_control.iq_meas,
             motor_control.id_set,
             motor_control.iq_set,
-            motor_config.voltage_supply,
+            vel_filtered,
             (float)motor_control.status_flag
         };
         VOFA_SendData(vofa_data, 8);
@@ -336,9 +349,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     AS5047P_Sensor_Update(&AngleSensor);
 
     /* ② Publish results to volatile cache for FOC current loop (read-only) */
-    encoder_cache.angle_raw       = AngleSensor.prev_angle_raw;
+    encoder_cache.angle_raw       = AngleSensor.prev_angle;
     encoder_cache.velocity_rad_s  = AngleSensor.velocity_rad_s;
-    encoder_cache.total_angle_rad = AngleSensor.total_angle_rad;
+    encoder_cache.total_angle_rad = AngleSensor.total_angle;
     encoder_cache.update_count++;
     encoder_cache.data_valid      = 1;
   }
