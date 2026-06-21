@@ -22,6 +22,7 @@
 #include "stm32g4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "foc.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,10 +58,12 @@
 /* External variables --------------------------------------------------------*/
 extern ADC_HandleTypeDef hadc1;
 extern ADC_HandleTypeDef hadc2;
+extern CORDIC_HandleTypeDef hcordic;
 extern DMA_HandleTypeDef hdma_spi1_rx;
 extern DMA_HandleTypeDef hdma_spi1_tx;
 extern SPI_HandleTypeDef hspi1;
 extern TIM_HandleTypeDef htim1;
+extern TIM_HandleTypeDef htim2;
 extern DMA_HandleTypeDef hdma_usart2_tx;
 extern DMA_HandleTypeDef hdma_usart2_rx;
 extern UART_HandleTypeDef huart2;
@@ -292,6 +295,20 @@ void TIM1_UP_TIM16_IRQHandler(void)
 }
 
 /**
+  * @brief This function handles TIM2 global interrupt.
+  */
+void TIM2_IRQHandler(void)
+{
+  /* USER CODE BEGIN TIM2_IRQn 0 */
+
+  /* USER CODE END TIM2_IRQn 0 */
+  HAL_TIM_IRQHandler(&htim2);
+  /* USER CODE BEGIN TIM2_IRQn 1 */
+
+  /* USER CODE END TIM2_IRQn 1 */
+}
+
+/**
   * @brief This function handles SPI1 global interrupt.
   */
 void SPI1_IRQHandler(void)
@@ -317,6 +334,27 @@ void USART2_IRQHandler(void)
   /* USER CODE BEGIN USART2_IRQn 1 */
 
   /* USER CODE END USART2_IRQn 1 */
+}
+
+/**
+  * @brief This function handles CORDIC interrupt.
+  */
+void CORDIC_IRQHandler(void)
+{
+  /* USER CODE BEGIN CORDIC_IRQn 0 */
+
+  /* CORDIC result ready — read cos then sin (NRES=2 → two RDATA reads).
+   * RRDY auto-clears after 2nd read. No HAL, no flags, instant exit. */
+  int32_t cos_q31 = (int32_t)CORDIC->RDATA;   /* 1st read = cosine */
+  int32_t sin_q31 = (int32_t)CORDIC->RDATA;   /* 2nd read = sine   */
+  cordic_cos_cache = (float)cos_q31 / 2147483648.0f;  /* Q31 → float */
+  cordic_sin_cache = (float)sin_q31 / 2147483648.0f;
+
+  /* USER CODE END CORDIC_IRQn 0 */
+  HAL_CORDIC_IRQHandler(&hcordic);
+  /* USER CODE BEGIN CORDIC_IRQn 1 */
+
+  /* USER CODE END CORDIC_IRQn 1 */
 }
 
 /* USER CODE BEGIN 1 */

@@ -9,6 +9,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "adc.h"
+#include "cordic.h"
 #include "dma.h"
 #include "spi.h"
 #include "tim.h"
@@ -96,6 +97,8 @@ int main(void)
   MX_ADC2_Init();
   MX_SPI1_Init();
   MX_TIM1_Init();
+  MX_TIM2_Init();
+  MX_CORDIC_Init();
   /* USER CODE BEGIN 2 */
   uint32_t last_print_time = 0;
 
@@ -109,7 +112,8 @@ int main(void)
   /* 2. Init encoder sensor state */
   AS5047P_Sensor_Init(&AngleSensor);
 
-  /* 3. Kick off first DMA encoder read (pipelined: each Update reads previous result) */
+  /* 3. Kick off first DMA encoder read (pipelined: each Update reads previous result).
+   *    TIM2 encoder ISR @ 10kHz is started later by foc_alignSensor(). */
   AS5047P_DMA_StartRequest();
 
   /* 4. Current-sensor offset calibration (runs asynchronously in ADC ISR) */
@@ -152,8 +156,11 @@ int main(void)
               motor_current.Offset_A, motor_current.Offset_C);
       UART2_SendString(log_buf);
 
-      /* Sensor alignment */
+      /* Sensor alignment (starts TIM2 encoder ISR internally) */
       foc_alignSensor(4.0f);  /* stronger alignment to overcome cogging */
+
+      /* Wait for encoder cache to be populated (at least 2 TIM2 updates ≈ 200 us) */
+      while (encoder_cache.update_count < 2) { /* spin */ }
 
       /* Init motor state & PID */
       motor_control_parm_init();
@@ -297,8 +304,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
             motor_current.I_C = current_diff_c * CURRENT_FACTOR;
             motor_current.I_B = -(motor_current.I_A + motor_current.I_C);
 
-			      // 1. 更新编码器，获取最新角度
-			      AS5047P_Sensor_Update(&AngleSensor);
+			      /* 1. Encoder updated by TIM2 ISR @ 10kHz — FOC reads from cache */
 
 			      // 2. 同步电流数据
 			      foc_sync_phase_currents();
@@ -312,8 +318,9 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 }
 
 /**
-  * @brief  TIM1 period elapsed callback (20 kHz)
-  *         PWM is driven by current-loop in ADC ISR; this is a safety no-op.
+  * @brief  TIM period elapsed callback
+  *         - TIM1 (20 kHz): PWM safety no-op (FOC runs in ADC ISR)
+  *         - TIM2 (10 kHz): AS5047P encoder SPI read + angle/velocity → cache
   */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
@@ -321,6 +328,19 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   {
     /* During sensor alignment, do NOT overwrite PWM */
     if (alignment_in_progress) return;
+  }
+  else if (htim->Instance == TIM2)
+  {
+    /* ── 10 kHz encoder update ── */
+    /* ① SPI read raw angle → parity check → angle unwrap → velocity */
+    AS5047P_Sensor_Update(&AngleSensor);
+
+    /* ② Publish results to volatile cache for FOC current loop (read-only) */
+    encoder_cache.angle_raw       = AngleSensor.prev_angle_raw;
+    encoder_cache.velocity_rad_s  = AngleSensor.velocity_rad_s;
+    encoder_cache.total_angle_rad = AngleSensor.total_angle_rad;
+    encoder_cache.update_count++;
+    encoder_cache.data_valid      = 1;
   }
 }
 /* USER CODE END 4 */

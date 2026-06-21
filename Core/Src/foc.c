@@ -31,9 +31,6 @@ volatile uint8_t current_loop_enable = 0;
 /* Sensor alignment in progress — TIM callback must not overwrite PWM */
 volatile uint8_t alignment_in_progress = 0;
 
-/* Current-loop execution period (s) */
-static const float current_meas_period = (1.0f / 20000.0f);  /* 20 kHz */
-
 /* Motor config (from TinyFoc) */
 motor_config_t motor_config = {
     .voltage_supply         = MOTOR_VBUS,
@@ -67,6 +64,10 @@ motor_control_t motor_control = {
     .latest_ic_raw     = 0,
     .mod_q             = 0.0f,
 };
+
+/* CORDIC sin/cos cache — written by CORDIC ISR, read by foc_current_loop()    */
+volatile float cordic_sin_cache = 0.0f;
+volatile float cordic_cos_cache = 1.0f;  /* cos(0)=1 safe initial value         */
 
 /* ========================================================================== */
 /*  Existing SVPWM (kept for backward compat / open-loop testing)             */
@@ -223,8 +224,9 @@ float _calculate_zero_electric_angle(void)
   */
 float _electricalAngle(void)
 {
+    float mech_angle = encoder_cache.angle_raw;  /* volatile read from TIM2 ISR cache */
     float elec_angle = (float)(motor_config.dir * motor_config.pairs)
-                       * AS5047P_GetAngle(&AngleSensor)
+                       * mech_angle
                        - motor_control.zero_elec_angle;
     return _normalizeAngle(elec_angle);
 }
@@ -234,8 +236,8 @@ float _electricalAngle(void)
   */
 float _electricalVelocity(void)
 {
-    return (float)(motor_config.dir * motor_config.pairs)
-           * AS5047P_GetVelocity(&AngleSensor);
+    float mech_vel = encoder_cache.velocity_rad_s;  /* volatile read from TIM2 ISR cache */
+    return (float)(motor_config.dir * motor_config.pairs) * mech_vel;
 }
 
 /* ========================================================================== */
@@ -282,6 +284,9 @@ void foc_alignSensor(float q_voltage)
     foc_forward(q_voltage, 0.0f, 0.0f);
     HAL_Delay(1000);
 
+    /* ── Stop TIM2 encoder ISR: main thread takes exclusive encoder access ── */
+    HAL_TIM_Base_Stop_IT(&htim2);
+
     /* Read encoder multiple times to let rotor settle */
     AS5047P_Sensor_Update(&AngleSensor); HAL_Delay(10);
     AS5047P_Sensor_Update(&AngleSensor); HAL_Delay(10);
@@ -289,6 +294,11 @@ void foc_alignSensor(float q_voltage)
 
     /* Compute zero-electric-angle via averaged readings */
     motor_control.zero_elec_angle = _calculate_zero_electric_angle();
+
+    /* ── Prime DMA pipeline and restart TIM2 encoder ISR ── */
+    AS5047P_DMA_StartRequest();
+    __HAL_TIM_CLEAR_IT(&htim2, TIM_IT_UPDATE);
+    HAL_TIM_Base_Start_IT(&htim2);
 
     /* Reset both current-loop PIDs so they start from 0V smoothly */
     current_loop.integral_prev   = 0.0f;
@@ -322,6 +332,11 @@ void foc_alignSensor(float q_voltage)
 /*  Closed-loop: current control                                               */
 /* ========================================================================== */
 
+/* Forward declarations for static helpers (defined after foc_current_loop)     */
+static void foc_forward_cordic(float d, float q, float s_ff, float c_ff);
+static void set_pwm_duty(float d_u, float d_v, float d_w);
+static int  SVM(float alpha, float beta, float *tA, float *tB, float *tC);
+
 /**
   * @brief  Current (torque) loop — 20 kHz execution in ADC injection callback
   *
@@ -334,15 +349,33 @@ void foc_alignSensor(float q_voltage)
   */
 void foc_current_loop(void)
 {
-    /* ── 1. Read electrical angle & velocity ONCE ── */
-    float angle_el = _electricalAngle();
-    float elec_vel = _electricalVelocity();
+    /* ── 1. Read angle with linear extrapolation between 10 kHz encoder updates ── */
+    static uint32_t last_enc_update = 0;
+    float angle_mech = encoder_cache.angle_raw;
+    if (encoder_cache.update_count == last_enc_update) {
+        /* Same encoder sample as last frame — extrapolate 50 µs (one 20 kHz period) */
+        angle_mech += encoder_cache.velocity_rad_s * 10e-6f;
+    }
+    last_enc_update = encoder_cache.update_count;
+
+    float angle_el = (float)(motor_config.dir * motor_config.pairs)
+                     * angle_mech
+                     - motor_control.zero_elec_angle;
+    angle_el = _normalizeAngle(angle_el);
+    float elec_vel = _electricalVelocity();  /* velocity still from TIM2 ISR cache */
+
+    /* ── 0. Kick CORDIC: write angle_el Q31 → hw starts sin/cos for NEXT frame ── */
+    {
+        float a = angle_el;
+        if (a >= PI) { a -= _2PI; }   /* [0,2π) → [-π,+π) for CORDIC */
+        CORDIC->WDATA = (uint32_t)(int32_t)(a * CORDIC_Q31_PER_RAD);
+    }
 
     /* ── 2. Clarke + Park: compute Id & Iq from B,C phase currents ── */
     float I_alpha = -(motor_control.IphB + motor_control.IphC);
     float I_beta  = _1_SQRT3 * (motor_control.IphB - motor_control.IphC);
-    float s, c;
-    arm_sin_cos_f32(angle_el * RAD_TO_DEG, &s, &c);
+    float s = cordic_sin_cache;   /* from previous-frame CORDIC */
+    float c = cordic_cos_cache;
     float I_d_raw = I_alpha * c + I_beta * s;
     float I_q_raw = I_beta  * c - I_alpha * s;
 
@@ -357,11 +390,7 @@ void foc_current_loop(void)
     float Vd_ff = 0.0f;
     float Vq_ff = 0.0f;
     
-    // 只有当速度大于一定门槛时才开启前馈补偿，静止时彻底关闭
-    if (fabsf(elec_vel) > 1.0f) { 
-        Vd_ff = -elec_vel * MOTOR_Lq * motor_control.iq_meas;
-        Vq_ff =  elec_vel * (MOTOR_Ld * motor_control.id_meas + MOTOR_FLUX);
-    }
+
 
     /* ── 5. Iq error — source depends on control mode ── */
     float error_q = motor_control.set_torque - motor_control.iq_meas;
@@ -399,12 +428,36 @@ void foc_current_loop(void)
     motor_control.id_set = Vd;   /* for debug telemetry                      */
     motor_control.iq_set = Vq;   /* for debug telemetry                      */
 
-    /* ── 11. Feed-forward angle compensation for computational delay ── */
-    float t_delay   = 1.6f * current_meas_period;
-    float angle_ff  = angle_el + elec_vel * t_delay;
+    /* ── 11. Inverse Park with cached sin/cos (same prev-frame angle).
+     *        No feed-forward compensation — 50 µs pipeline delay dominates
+     *        the 1.6·Ts intra-frame computational delay. PI compensates.  ── */
+    foc_forward_cordic(Vd, Vq, cordic_sin_cache, cordic_cos_cache);
+}
 
-    /* ── 12. SVPWM output ── */
-    foc_forward(Vd, Vq, angle_ff);
+/* ========================================================================== */
+/*  CORDIC-accelerated forward path — pre-computed sin/cos → SVM → PWM        */
+/*  Replaces foc_forward() on the closed-loop hot path.                        */
+/* ========================================================================== */
+static void foc_forward_cordic(float d, float q, float s_ff, float c_ff)
+{
+    float d_u = 0.0f, d_v = 0.0f, d_w = 0.0f;
+
+    /* Scale voltage commands to modulation index */
+    float mod_to_V  = (2.0f / 3.0f) * motor_config.voltage_supply;
+    float V_to_mod  = 1.0f / mod_to_V;
+    float mod_d     = V_to_mod * d;
+    float mod_q     = V_to_mod * q;
+    motor_control.mod_q = mod_q;
+
+    /* Inverse Park — use caller-supplied sin/cos */
+    float mod_alpha = mod_d * c_ff - mod_q * s_ff;
+    float mod_beta  = mod_d * s_ff + mod_q * c_ff;
+
+    /* SVM → duty cycles */
+    SVM(mod_alpha, mod_beta, &d_u, &d_v, &d_w);
+
+    /* Write to PWM registers */
+    set_pwm_duty(d_u, d_v, d_w);
 }
 
 /* ========================================================================== */
@@ -424,11 +477,9 @@ static void set_pwm_duty(float d_u, float d_v, float d_w)
     motor_control.dv = d_v;
     motor_control.dw = d_w;
 
-    __disable_irq();
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, d_u * htim1.Instance->ARR);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, d_v * htim1.Instance->ARR);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, d_w * htim1.Instance->ARR);
-    __enable_irq();
 }
 
 /**
@@ -528,20 +579,14 @@ void foc_forward(float d, float q, float angle_el)
 {
     float d_u = 0.0f, d_v = 0.0f, d_w = 0.0f;
 
-    /* Scale voltage commands to modulation index */
+    /* Scale voltage commands to modulation index.
+     * Saturation already done in foc_current_loop() — single-point limit,
+     * no redundant clamp here. */
     float mod_to_V  = (2.0f / 3.0f) * motor_config.voltage_supply;
     float V_to_mod  = 1.0f / mod_to_V;
     float mod_d     = V_to_mod * d;
     float mod_q     = V_to_mod * q;
     motor_control.mod_q = mod_q;
-
-    /* Over-modulation clamping — keep inside SVM linear hexagon */
-    float mod_scale = SQRT3_BY_2
-                      * 1.0f / sqrtf(mod_d * mod_d + mod_q * mod_q);
-    if (mod_scale < 1.0f) {
-        mod_d *= mod_scale;
-        mod_q *= mod_scale;
-    }
 
     /* Inverse Park transform */
     float s, c;

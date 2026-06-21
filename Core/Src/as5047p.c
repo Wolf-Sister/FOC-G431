@@ -15,7 +15,7 @@ extern SPI_HandleTypeDef hspi1;
 
 /* DMA 传输缓冲区（必须使用 16 位宽，确保存储对齐） -----------------------------*/
 static uint16_t spi_tx_buf = 0x7FFEU; /* 固定的 ANGLEUNC 流水线读命令 */
-static uint16_t spi_rx_buf = 0x0000U; /* 接收缓冲区 */
+static volatile uint16_t spi_rx_buf = 0x0000U; /* 接收缓冲区 */
 static volatile uint8_t dma_transfer_busy = 0;
 
 /* CS macro ------------------------------------------------------------------*/
@@ -114,13 +114,26 @@ uint16_t AS5047P_ReadRegister(uint16_t reg_addr)
   */
 void AS5047P_DMA_StartRequest(void)
 {
-  if (dma_transfer_busy) return; /* 上一次传输未结束，保护 */
+  /* Critical section: mask IRQs at priority >= 1 (TIM2, DMA_CH1/CH2, SPI1),
+   * but keep priority 0 (TIM1_UP, ADC1_2) unmasked so FOC is never blocked.
+   *
+   * NVIC priority 1 → BASEPRI[7:4]=0x1 → register value 0x10.
+   * BASEPRI masks all IRQs with priority value >= 1 (larger number = lower priority).
+   * Priority 0 (smallest number = highest priority) remains unmasked. */
+  uint32_t basepri = __get_BASEPRI();
+  __set_BASEPRI(0x10U);
 
-  dma_transfer_busy = 1;
-  CS_LOW();
-  
-  /* 启动 DMA 传输，长度为 1 个 Half-Word (16bit) */
-  HAL_SPI_TransmitReceive_DMA(&hspi1, (uint8_t *)&spi_tx_buf, (uint8_t *)&spi_rx_buf, 1);
+  if (!dma_transfer_busy) {
+    dma_transfer_busy = 1;
+    CS_LOW();
+
+    /* Start DMA transfer — DMA CH1 complete ISR at priority 1 is masked,
+     * so it cannot clear dma_transfer_busy until BASEPRI is restored. */
+    HAL_SPI_TransmitReceive_DMA(&hspi1, (uint8_t *)&spi_tx_buf,
+                                (uint8_t *)&spi_rx_buf, 1);
+  }
+
+  __set_BASEPRI(basepri);  /* Restore previous BASEPRI */
 }
 
 /**

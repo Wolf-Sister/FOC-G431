@@ -22,6 +22,9 @@
 /* Global sensor instance ----------------------------------------------------*/
 AS5047P_Sensor_T AngleSensor = {0};
 
+/* Encoder cache — populated by TIM2 ISR @10kHz, consumed by FOC @20kHz */
+volatile encoder_cache_t encoder_cache = {0};
+
 /* --------------------------------------------------------------------------*/
 /**
   * @brief  Initialize sensor state

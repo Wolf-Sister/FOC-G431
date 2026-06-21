@@ -138,6 +138,11 @@ extern volatile uint8_t current_loop_enable;
 /* Sensor alignment in progress — TIM callback must not overwrite PWM          */
 extern volatile uint8_t alignment_in_progress;
 
+/* CORDIC sin/cos cache — CORDIC ISR writes, TIM1 ISR reads                     */
+extern volatile float cordic_sin_cache;
+extern volatile float cordic_cos_cache;
+#define CORDIC_Q31_PER_RAD  683565275.0f   /* 2^31 / PI                         */
+
 /* ========================================================================== */
 /*  Function prototypes                                                       */
 /* ========================================================================== */
