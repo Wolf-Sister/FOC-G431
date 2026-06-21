@@ -48,7 +48,7 @@ extern "C" {
 
 /* Speed loop -----------------------------------------------------------------*/
 #define SPEED_DECIMATION   10         /* 20kHz / 10 = 2kHz speed loop          */
-#define SPEED_LPF_ALPHA    0.2f       /* Velocity LPF alpha @ 2kHz             */
+#define SPEED_LPF_ALPHA    0.1f       /* Velocity LPF alpha @ 2kHz             */
 #define SPEED_Ts           0.0005f    /* Speed loop period (s)                 */
 
 /* Motor electrical parameters — TUNE THESE for your motor! ------------------*/
