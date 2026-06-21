@@ -57,19 +57,38 @@ float PIDController_Update(struct PIDController *pid, float error)
     /* Proportional term */
     float proportional = pid->P * error;
 
-    /* Integral term — trapezoidal (Tustin) integration */
-    float integral = pid->integral_prev
-                     + pid->I * Ts * 0.5f * (error + pid->error_prev);
-    if (integral >  pid->limit) integral =  pid->limit;
-    if (integral < -pid->limit) integral = -pid->limit;
+    /* Integral term — trapezoidal (Tustin) integration (candidate)   */
+    float integral_next = pid->integral_prev
+                          + pid->I * Ts * 0.5f * (error + pid->error_prev);
+    /* Soft-clamp to limit as defense-in-depth                         */
+    if (integral_next >  pid->limit) integral_next =  pid->limit;
+    if (integral_next < -pid->limit) integral_next = -pid->limit;
 
     /* Derivative term */
     float derivative = pid->D * (error - pid->error_prev) / Ts;
 
-    /* Sum */
-    float output = proportional + integral + derivative;
+    /* Pre-clamp sum — used for saturation direction check              */
+    float output_next = proportional + integral_next + derivative;
 
-    /* Output saturation */
+    /* ── Bidirectional saturation check (conditional integration) ──
+     * If output is beyond the limit AND the error is STILL pushing it
+     * in the same direction (error * output_next > 0), the system is
+     * deeply saturated / stalled.  Freeze the integrator to prevent
+     * windup.  Otherwise allow the integrator to update normally so
+     * it can recover the instant error reverses.                        */
+    if ((output_next >  pid->limit && error * output_next > 0.0f) ||
+        (output_next < -pid->limit && error * output_next > 0.0f))
+    {
+        /* Deep saturation + same-direction push → freeze integral      */
+    }
+    else
+    {
+        /* Normal regulation or recovering from saturation              */
+        pid->integral_prev = integral_next;
+    }
+
+    /* Clamp output to final limit */
+    float output = output_next;
     if (output >  pid->limit) output =  pid->limit;
     if (output < -pid->limit) output = -pid->limit;
 
@@ -83,7 +102,6 @@ float PIDController_Update(struct PIDController *pid, float error)
     }
 
     /* Store state for next iteration */
-    pid->integral_prev   = integral;
     pid->output_prev     = output;
     pid->error_prev      = error;
     pid->timestamp_prev  = timestamp_now;

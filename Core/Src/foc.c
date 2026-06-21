@@ -210,6 +210,8 @@ void motor_control_parm_init(void)
     motor_control.vel_meas         = 0.0f;
     motor_control.vel_raw          = 0.0f;
     motor_control.vel_filter_state = 0.0f;
+    motor_control.spd_prev_angle   = encoder_cache.total_angle_rad;
+    motor_control.spd_needs_init   = 1;
 }
 
 /* ========================================================================== */
@@ -366,24 +368,22 @@ static int  SVM(float alpha, float beta, float *tA, float *tB, float *tC);
   */
 static void foc_speed_loop(void)
 {
-    static float  prev_total_angle = 0.0f;
-    static bool   initialized      = false;
-
     /* 1. Read current multi-turn total angle (volatile, atomic on M4) */
     float curr_total_angle = encoder_cache.total_angle_rad;
 
-    /* 2. First-run / mode-switch: save angle, skip control this cycle */
-    if (!initialized) {
-        prev_total_angle = curr_total_angle;
-        motor_control.vel_raw  = 0.0f;
-        motor_control.vel_meas = 0.0f;
-        initialized = true;
+    /* 2. Re-init guard: capture angle, skip control this cycle.
+     *    Triggered by motor_control_parm_init() or VOFA M=1.           */
+    if (motor_control.spd_needs_init) {
+        motor_control.spd_prev_angle = curr_total_angle;
+        motor_control.vel_raw        = 0.0f;
+        motor_control.vel_meas       = 0.0f;
+        motor_control.spd_needs_init = 0;
         return;
     }
 
     /* 3. Compute velocity from delta angle (mechanical rad/s) */
-    float delta   = curr_total_angle - prev_total_angle;
-    prev_total_angle = curr_total_angle;
+    float delta   = curr_total_angle - motor_control.spd_prev_angle;
+    motor_control.spd_prev_angle = curr_total_angle;
     float vel_raw = delta / SPEED_Ts;  /* SPEED_Ts = 0.0005s */
 
     /* 4. Low-pass filter velocity */

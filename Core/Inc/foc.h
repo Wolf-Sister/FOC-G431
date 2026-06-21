@@ -123,6 +123,8 @@ typedef struct {
     float vel_meas;            /* Measured velocity, filtered (rad/s)           */
     float vel_raw;             /* Raw velocity before LPF (rad/s)               */
     float vel_filter_state;    /* Velocity LPF state variable                   */
+    float spd_prev_angle;      /* Previous total_angle for speed delta          */
+    uint8_t spd_needs_init;    /* 1 = re-capture angle on next speed loop       */
     float mod_q;              /* Normalized q-axis modulation                  */
     float mod_d;              /* Normalized d-axis modulation                  */
 

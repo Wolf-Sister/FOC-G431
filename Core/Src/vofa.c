@@ -156,7 +156,8 @@ static void vofa_parse_cmd(const char *line)
                 motor_control.mode = new_mode;
                 if (new_mode == MOTOR_SPEED) {
                     motor_control.vel_filter_state = 0.0f;
-                    motor_control.vel_meas = 0.0f;
+                    motor_control.vel_meas         = 0.0f;
+                    motor_control.spd_needs_init   = 1;
                 }
             }
         }
