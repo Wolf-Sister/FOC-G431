@@ -98,6 +98,13 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
   *   I=V      set Iq-loop I gain
   *   DP=V     set Id-loop P gain
   *   DI=V     set Id-loop I gain
+  *   S=V      set speed setpoint (mechanical rad/s)
+  *   SP=V     set speed-loop P gain
+  *   SI=V     set speed-loop I gain
+  *   PS=V     set position setpoint (multi-turn rad)
+  *   PP=V     set position-loop P gain (rad/s per rad)
+  *   PL=V     set position-loop speed limit (rad/s)
+  *   M=V      set control mode (0=torque, 1=speed, 2=position)
   *
   * Any received command sets status_flag=1 for step-sync in Python.
   *
@@ -106,26 +113,28 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 "
   *   "P=3.0,I=200
 "
-  *   "D=0.0,DP=1.5,DI=100
+  *   "M=2,PP=5,PL=100,PS=6.28
 "
   */
 static void vofa_parse_cmd(const char *line)
 {
     const char *p = line;
-    uint8_t iq_dirty = 0, id_dirty = 0, spd_dirty = 0;
+    uint8_t iq_dirty = 0, id_dirty = 0, spd_dirty = 0, pos_dirty = 0;
     float iq_p = motor_config.iq_p_gain;  /* start from current value, */
     float iq_i = motor_config.iq_i_gain;  /* only overwrite what's sent */
     float id_p = motor_config.id_p_gain;
     float id_i = motor_config.id_i_gain;
     float spd_p = motor_config.spd_p_gain;
     float spd_i = motor_config.spd_i_gain;
+    float pos_p = motor_config.pos_p_gain;
+    float pos_limit = motor_config.pos_speed_limit;
 
     while (*p) {
         /* Skip whitespace / commas */
         while (*p == ' ' || *p == ',') p++;
         if (*p == '\0' || *p == '\n' || *p == '\r') break;
 
-        /* Read key: T, V, D, P, I, DP, DI, VP, VI, M */
+        /* Read key: T, D, P, I, DP, DI, S, SP, SI, PS, PP, PL, M */
         char key[4] = {0};
         int ki = 0;
         while (*p && *p != '=' && *p != ',' && *p != ' ' && *p != '\n' && *p != '\r' && ki < 3) {
@@ -150,14 +159,28 @@ static void vofa_parse_cmd(const char *line)
         else if (strcmp(key, "S")  == 0) { motor_control.set_speed = val; }
         else if (strcmp(key, "SP") == 0) { spd_p = val; spd_dirty = 1; }
         else if (strcmp(key, "SI") == 0) { spd_i = val; spd_dirty = 1; }
+        else if (strcmp(key, "PS") == 0) { motor_control.set_position = val; }
+        else if (strcmp(key, "PP") == 0) { pos_p = val; pos_dirty = 1; }
+        else if (strcmp(key, "PL") == 0) { pos_limit = val; pos_dirty = 1; }
         else if (strcmp(key, "M")  == 0) {
             uint8_t new_mode = (uint8_t)val;
-            if (new_mode <= 1) {
+            if (new_mode <= 2) {
                 motor_control.mode = new_mode;
                 if (new_mode == MOTOR_SPEED) {
+                    motor_control.set_speed         = 0.0f;
+                    motor_control.vel_filter_state  = 0.0f;
+                    motor_control.vel_meas          = 0.0f;
+                    motor_control.spd_needs_init    = 1;
+                } else if (new_mode == MOTOR_POSITION) {
+                    motor_control.set_position   = encoder_cache.total_angle_rad;
+                    motor_control.pos_meas       = encoder_cache.total_angle_rad;
+                    motor_control.set_speed       = 0.0f;
                     motor_control.vel_filter_state = 0.0f;
                     motor_control.vel_meas         = 0.0f;
                     motor_control.spd_needs_init   = 1;
+                } else { /* MOTOR_TORQUE */
+                    motor_control.set_speed  = 0.0f;
+                    motor_control.set_torque = 0.0f;
                 }
             }
         }
@@ -186,6 +209,10 @@ static void vofa_parse_cmd(const char *line)
         motor_config.spd_i_gain = spd_i;
         speed_loop.P = spd_p;
         speed_loop.I = spd_i;
+    }
+    if (pos_dirty) {
+        motor_config.pos_p_gain      = pos_p;
+        motor_config.pos_speed_limit = pos_limit;
     }
 }
 

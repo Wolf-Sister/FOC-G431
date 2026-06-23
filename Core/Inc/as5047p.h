@@ -68,6 +68,7 @@ uint8_t  AS5047P_ReadErrorFlags(void);
 /* 高性能 DMA 接口原型 -------------------------------------------------------*/
 void     AS5047P_DMA_StartRequest(void);
 uint16_t AS5047P_DMA_GetAngleCallback(void);
+void     AS5047P_ConfigUVWPolePairs(uint8_t pp);
 
 #ifdef __cplusplus
 }

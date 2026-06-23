@@ -42,6 +42,8 @@ motor_config_t motor_config = {
     .id_i_gain              = 0,
     .spd_p_gain             = 0.05f,
     .spd_i_gain             = 2.0f,
+    .pos_p_gain             = 5.0f,
+    .pos_speed_limit        = POS_SPEED_LIMIT_DEFAULT,
 };
 
 /* Motor control state (from TinyFoc) */
@@ -63,6 +65,8 @@ motor_control_t motor_control = {
     .id_meas           = 0.0f,
     .id_target         = 0.0f,
     .set_speed         = 0.0f,
+    .set_position      = 0.0f,
+    .pos_meas          = 0.0f,
     .vel_meas          = 0.0f,
     .vel_raw           = 0.0f,
     .vel_filter_state  = 0.0f,
@@ -212,6 +216,8 @@ void motor_control_parm_init(void)
     motor_control.vel_filter_state = 0.0f;
     motor_control.spd_prev_angle   = encoder_cache.total_angle_rad;
     motor_control.spd_needs_init   = 1;
+    motor_control.set_position     = encoder_cache.total_angle_rad;
+    motor_control.pos_meas         = encoder_cache.total_angle_rad;
 }
 
 /* ========================================================================== */
@@ -360,6 +366,37 @@ static void set_pwm_duty(float d_u, float d_v, float d_w);
 static int  SVM(float alpha, float beta, float *tA, float *tB, float *tC);
 
 /**
+  * @brief  Position outer loop — 1 kHz, called from TIM3 ISR.
+  *         Pure P control: speed_cmd = pos_error * pos_p_gain.
+  *         Output is hard-clamped to +/- pos_speed_limit, then written
+  *         to motor_control.set_speed for the 2 kHz speed loop.
+  *
+  *         Reads encoder_cache.total_angle_rad (TIM2 ISR, P=1).
+  *         Writes motor_control.set_speed (ADC ISR reader, P=0).
+  *         Returns immediately if mode != MOTOR_POSITION.
+  */
+void foc_position_loop(void)
+{
+    if (motor_control.mode != MOTOR_POSITION) return;
+
+    /* 1. Read current multi-turn position */
+    float curr_pos  = encoder_cache.total_angle_rad;
+
+    /* 2. Compute position error & pure-P speed command */
+    float pos_error = motor_control.set_position - curr_pos;
+    float speed_cmd = pos_error * motor_config.pos_p_gain;
+
+    /* 3. Hard speed-limit clamp — prevents runaway on large step */
+    float limit = motor_config.pos_speed_limit;
+    if (speed_cmd >  limit) speed_cmd =  limit;
+    if (speed_cmd < -limit) speed_cmd = -limit;
+
+    /* 4. Feed into speed loop */
+    motor_control.set_speed = speed_cmd;
+    motor_control.pos_meas  = curr_pos;
+}
+
+/**
   * @brief  Speed (velocity) outer loop — 2 kHz, cascaded above current loop.
   *         Computes mechanical velocity from multi-turn total angle delta,
   *         applies LPF, runs PI controller, sets motor_control.set_torque.
@@ -422,7 +459,7 @@ void foc_current_loop(void)
     /* ── 0. Speed loop decimation: run @ 2 kHz (every 10th ADC ISR) ── */
     {
         static uint8_t speed_cnt = 0;
-        if (motor_control.mode == MOTOR_SPEED) {
+        if (motor_control.mode == MOTOR_SPEED || motor_control.mode == MOTOR_POSITION) {
             speed_cnt++;
             if (speed_cnt >= SPEED_DECIMATION) {
                 speed_cnt = 0;

@@ -100,6 +100,7 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_CORDIC_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   uint32_t last_print_time = 0;
 
@@ -112,12 +113,13 @@ int main(void)
 
   /* 2. Init encoder sensor state */
   AS5047P_Sensor_Init(&AngleSensor);
-
+AS5047P_Init();
   /* 3. Kick off first DMA encoder read (pipelined: each Update reads previous result).
    *    TIM2 encoder ISR @ 10kHz is started later by foc_alignSensor(). */
   AS5047P_DMA_StartRequest();
 
-  /* 4. Current-sensor offset calibration (runs asynchronously in ADC ISR) */
+  /* 4. Disable DRV8813 (NSLEEP=LOW), then calibrate current offsets */
+  HAL_GPIO_WritePin(NSLEEP_GPIO_Port, NSLEEP_Pin, GPIO_PIN_RESET);
   Motor_Current_Calibration();
 
   /* 5. Start TIM1 3-phase PWM */
@@ -157,7 +159,8 @@ int main(void)
               motor_current.Offset_A, motor_current.Offset_C);
       UART2_SendString(log_buf);
 
-      /* Sensor alignment (starts TIM2 encoder ISR internally) */
+      /* Re-enable DRV8813 (NSLEEP=HIGH), then sensor alignment */
+      HAL_GPIO_WritePin(NSLEEP_GPIO_Port, NSLEEP_Pin, GPIO_PIN_SET);
       foc_alignSensor(4.0f);  /* stronger alignment to overcome cogging */
 
       /* Wait for encoder cache to be populated (at least 2 TIM2 updates ≈ 200 us) */
@@ -168,12 +171,16 @@ int main(void)
               motor_pid_init(1.4850f, 371.25f,   /* Iq: P, I */
                              1.4850f, 371.25f   /* Id: P, I */
                             );
-              speed_pid_init(0.0120f, 0.0050f);        /* Speed: P, I */
+              speed_pid_init(0.0140f, 0.0164f);        /* Speed: P, I */
 
       motor_control.set_torque = 0.0f;
 
       /* current_loop_enable already set inside foc_alignSensor() */
       test_phase = 2;
+
+      /* Start TIM3 position-loop timer (1 kHz). ISR returns immediately
+       * unless mode == MOTOR_POSITION. */
+      HAL_TIM_Base_Start_IT(&htim3);
 
     }
 
@@ -185,18 +192,22 @@ int main(void)
         last_print_time = HAL_GetTick();
 
         /* Channel layout for VOFA+ / Python tuning script:
-         *   [0] id_target      - D-axis target current (A)
-         *   [1] id_meas        - D-axis actual current (A)
-         *   [2] iq_target      - Q-axis target current (A) = set_torque
-         *   [3] iq_meas        - Q-axis actual current (A)
-         *   [4] vd_cmd         - D-axis voltage command (V)
-         *   [5] vq_cmd         - Q-axis voltage command (V)
-         *   [6] velocity       - Filtered mechanical velocity (rad/s)
-         *   [7] status_flag    - Step-sync flag (1=cmd received)
-         *   [8] speed_setpoint - Speed setpoint (rad/s)
-         *   [9] mode           - Control mode (0=torque, 1=speed)
+         *   [0]  id_target       - D-axis target current (A)
+         *   [1]  id_meas         - D-axis actual current (A)
+         *   [2]  iq_target       - Q-axis target current (A) = set_torque
+         *   [3]  iq_meas         - Q-axis actual current (A)
+         *   [4]  vd_cmd          - D-axis voltage command (V)
+         *   [5]  vq_cmd          - Q-axis voltage command (V)
+         *   [6]  velocity        - Filtered mechanical velocity (rad/s)
+         *   [7]  status_flag     - Step-sync flag (1=cmd received)
+         *   [8]  speed_setpoint  - Speed setpoint (rad/s)
+         *   [9]  mode            - Control mode (0=torque, 1=speed, 2=pos)
+         *   [10] position_sp     - Position setpoint (rad)
+         *   [11] pos_meas        - Measured position (rad)
+         *   [12] raw_adc_a       - ADC1 raw value (phase A current)
+         *   [13] raw_adc_c       - ADC2 raw value (phase C current)
          */
-        float vofa_data[10] = {
+        float vofa_data[14] = {
             motor_control.id_target,
             motor_control.id_meas,
             motor_control.set_torque,
@@ -206,9 +217,13 @@ int main(void)
             motor_control.vel_meas,
             (float)motor_control.status_flag,
             motor_control.set_speed,
-            (float)motor_control.mode
+            (float)motor_control.mode,
+            motor_control.set_position,
+            motor_control.pos_meas,
+            (float)motor_current.Raw_A,
+            (float)motor_current.Raw_C
         };
-        VOFA_SendData(vofa_data, 10);
+        VOFA_SendData(vofa_data, 14);
         motor_control.status_flag = 0;  /* clear after TX */
       }
     }
@@ -341,12 +356,16 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     /* ① SPI read raw angle → parity check → angle unwrap → velocity */
     AS5047P_Sensor_Update(&AngleSensor);
 
-    /* ② Publish results to volatile cache for FOC current loop (read-only) */
     encoder_cache.angle_raw       = AngleSensor.prev_angle;
     encoder_cache.velocity_rad_s  = AngleSensor.velocity_rad_s;
     encoder_cache.total_angle_rad = AngleSensor.total_angle;
     encoder_cache.update_count++;
     encoder_cache.data_valid      = 1;
+  }
+  else if (htim->Instance == TIM3)
+  {
+    /* ── 1 kHz Position loop ── */
+    foc_position_loop();
   }
 }
 /* USER CODE END 4 */

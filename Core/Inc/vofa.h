@@ -17,8 +17,8 @@ extern "C" {
 #include <stdint.h>
 
 /* Defines -------------------------------------------------------------------*/
-#define VOFA_MAX_CHANNELS   10u
-#define VOFA_TX_BUF_SIZE    256u
+#define VOFA_MAX_CHANNELS   14u
+#define VOFA_TX_BUF_SIZE    384u
 #define VOFA_RX_BUF_SIZE    256u
 
 /* ── TX: Send telemetry data ────────────────────────────────────────────── */

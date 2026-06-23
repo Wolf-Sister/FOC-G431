@@ -51,6 +51,9 @@ extern "C" {
 #define SPEED_LPF_ALPHA    0.1f       /* Velocity LPF alpha @ 2kHz             */
 #define SPEED_Ts           0.0005f    /* Speed loop period (s)                 */
 
+/* Position loop ---------------------------------------------------------------*/
+#define POS_SPEED_LIMIT_DEFAULT 120.0f  /* Default position-loop speed clamp   */
+
 /* Motor electrical parameters — TUNE THESE for your motor! ------------------*/
 #define MOTOR_Lq        0.0005f  /* q-axis inductance (H) — 0.5 mH typical    */
 #define MOTOR_Ld        0.0005f  /* d-axis inductance (H) — same for SPM      */
@@ -77,7 +80,8 @@ extern volatile Phase_Current_t motor_current;
 /* ========================================================================== */
 typedef enum {
     MOTOR_TORQUE,          /* Torque / current closed loop                    */
-    MOTOR_SPEED            /* Speed (velocity) closed loop                     */
+    MOTOR_SPEED,           /* Speed (velocity) closed loop                     */
+    MOTOR_POSITION         /* Position closed loop                             */
 } Motor_Mode_e;
 
 /* ========================================================================== */
@@ -93,6 +97,8 @@ typedef struct {
     float id_i_gain;            /* D-axis (flux)   current-loop I gain         */
     float spd_p_gain;           /* Speed-loop P gain                           */
     float spd_i_gain;           /* Speed-loop I gain                           */
+    float pos_p_gain;           /* Position-loop P gain (rad/s per rad)        */
+    float pos_speed_limit;      /* Position-loop speed clamp (rad/s)           */
 } motor_config_t;
 
 typedef struct {
@@ -120,6 +126,8 @@ typedef struct {
     float id_meas;            /* Measured Id (filtered)                        */
     float id_target;          /* D-axis current target (A), default 0 for SPM   */
     float set_speed;           /* Speed setpoint (mechanical rad/s)             */
+    float set_position;        /* Position setpoint (multi-turn rad)            */
+    float pos_meas;            /* Measured multi-turn position (rad)            */
     float vel_meas;            /* Measured velocity, filtered (rad/s)           */
     float vel_raw;             /* Raw velocity before LPF (rad/s)               */
     float vel_filter_state;    /* Velocity LPF state variable                   */
@@ -177,6 +185,9 @@ void  foc_alignSensor(float q_voltage);
 
 /* --- Closed-loop control ---------------------------------------------------*/
 void  foc_current_loop(void);
+
+/* --- Position outer loop (1 kHz, TIM3 ISR) ---------------------------------*/
+void  foc_position_loop(void);
 
 /* --- SVPWM forward path (d,q → PWM) ----------------------------------------*/
 void  foc_forward(float d, float q, float angle_el);

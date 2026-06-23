@@ -9,12 +9,13 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "as5047p.h"
+#include "cmsis_compiler.h"               /* __get_BASEPRI / __set_BASEPRI */
 
 /* External SPI handle -------------------------------------------------------*/
 extern SPI_HandleTypeDef hspi1;
 
 /* DMA 传输缓冲区（必须使用 16 位宽，确保存储对齐） -----------------------------*/
-static uint16_t spi_tx_buf = 0x7FFEU; /* 固定的 ANGLEUNC 流水线读命令 */
+static uint16_t spi_tx_buf = 0x7FFEU; /* 固定的 ANGLECOM 流水线读命令 */
 static volatile uint16_t spi_rx_buf = 0x0000U; /* 接收缓冲区 */
 static volatile uint8_t dma_transfer_busy = 0;
 
@@ -42,8 +43,49 @@ static uint16_t AS5047P_BuildReadCmd(uint16_t reg_addr)
   {
     cmd |= 0x8000U;   
   }
-  cmd |= 0x4000U;     
+  cmd |= 0x4000U;
   return cmd;
+}
+
+/**
+  * @brief  写 AS5047P 寄存器（仅 volatile 写入，不触发 OTP 烧录）
+  * @param  reg_addr  14-bit 寄存器地址
+  * @param  data      14-bit 待写入数据
+  * @retval HAL status
+  */
+static HAL_StatusTypeDef AS5047P_WriteRegister(uint16_t reg_addr, uint16_t data)
+{
+  if (dma_transfer_busy) return HAL_BUSY;
+
+  /* 构建写命令帧：R/W=0, bit14 清 0 */
+  uint16_t cmd = reg_addr & 0x3FFFU;
+  if (AS5047P_CalcEvenParity(cmd) == 0U) {
+    cmd |= 0x8000U;
+  }
+
+  /* 构建数据帧 */
+  uint16_t tx = data & 0x3FFFU;
+  if (AS5047P_CalcEvenParity(tx) == 0U) {
+    tx |= 0x8000U;
+  }
+
+  uint16_t rx;
+  HAL_StatusTypeDef status;
+
+  CS_LOW();
+  for (volatile uint8_t i = 0; i < 15; i++);
+
+  /* 帧 1: 写命令 (16-bit × 1) */
+  status = HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&cmd, (uint8_t *)&rx, 1, 10);
+  if (status != HAL_OK) { CS_HIGH(); return status; }
+
+  /* 帧 2: 数据 (16-bit × 1) */
+  status = HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&tx, (uint8_t *)&rx, 1, 10);
+
+  for (volatile uint8_t i = 0; i < 5; i++);
+  CS_HIGH();
+  for (volatile uint8_t i = 0; i < 15; i++);
+  return status;
 }
 
 /**
@@ -79,7 +121,10 @@ void AS5047P_Init(void)
   AS5047P_SPI_FrameTransfer(0x0000U, &rx);
   AS5047P_SPI_FrameTransfer(0x0000U, &rx);
   AS5047P_SPI_FrameTransfer(0x0000U, &rx);
-  
+
+  /* 配置 UVW 极对数为 1（匹配 2 极辅助磁铁） */
+  AS5047P_ConfigUVWPolePairs(1);
+
   dma_transfer_busy = 0;
 }
 
@@ -91,18 +136,62 @@ uint8_t AS5047P_CheckParity(uint16_t data)
 uint16_t AS5047P_ReadRegister(uint16_t reg_addr)
 {
   if (dma_transfer_busy) return 0xFFFFU; /* 如果DMA正在占用SPI，拒绝离散读取 */
-  
+
   uint16_t cmd = AS5047P_BuildReadCmd(reg_addr);
   uint16_t rx;
+  HAL_StatusTypeDef status;
 
-  AS5047P_SPI_FrameTransfer(cmd, &rx);
-  AS5047P_SPI_FrameTransfer(0x0000U, &rx);
+  CS_LOW();
+  for (volatile uint8_t i = 0; i < 15; i++);
 
-  if ((rx & 0x4000U) || !AS5047P_CheckParity(rx))
+  /* 帧 1: 读命令 (16-bit × 1) */
+  status = HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&cmd, (uint8_t *)&rx, 1, 10);
+  if (status != HAL_OK) { CS_HIGH(); return 0xFFFFU; }
+
+  /* 帧 2: NOP 时钟读出响应数据 (16-bit × 1, 带偶校验) */
+  uint16_t nop = AS5047P_BuildReadCmd(AS5047P_REG_NOP);
+  status = HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&nop, (uint8_t *)&rx, 1, 10);
+
+  for (volatile uint8_t i = 0; i < 5; i++);
+  CS_HIGH();
+  for (volatile uint8_t i = 0; i < 15; i++);
+
+  if (status != HAL_OK || (rx & 0x4000U) || !AS5047P_CheckParity(rx))
   {
     return 0xFFFFU;
   }
   return rx;
+}
+
+/**
+  * @brief  配置 UVW 输出极对数（严格匹配官方手册 SETTINGS2[2:0] UVWPP） 
+  * @param  pp  极对数支持可选: 1, 3, 4, 5, 7（其他值将被忽略） 
+  * @note   仅写 volatile 影子寄存器，掉电丢失，需每次上电配置 [cite: 368, 369]
+  */
+void AS5047P_ConfigUVWPolePairs(uint8_t pp)
+{
+  uint8_t uvw_bits;
+  
+  /* 根据手册 Figure 29 严格对齐低 3 位的编码映射  */
+  switch (pp) {
+    case 1:  uvw_bits = 0x00U; break;  /* 000 = 1 pole pair    */
+    case 3:  uvw_bits = 0x02U; break;  /* 010 = 3 pole pairs   */
+    case 4:  uvw_bits = 0x03U; break;  /* 011 = 4 pole pairs   */
+    case 5:  uvw_bits = 0x04U; break;  /* 100 = 5 pole pairs   */
+    case 7:  uvw_bits = 0x06U; break;  /* 110 = 7 pole pairs   */
+    default: return;                   /* 不支持的极对数直接退出 */
+  }
+
+  /* 1. 读取当前寄存器全值 */
+  uint16_t reg = AS5047P_ReadRegister(AS5047P_REG_SETTINGS2);
+  if (reg == 0xFFFFU) return;
+
+  /* 2. 修改位域 */
+  reg &= ~0x0007U;       /* 精准清空 UVWPP 位 [2:0]（即低 3 位）  */
+  reg |= uvw_bits;       /* 写入正确的极对数编码  */
+
+  /* 3. 写入寄存器（内部会自动通过 16-bit SPI 触发写后立即校验） */
+  AS5047P_WriteRegister(AS5047P_REG_SETTINGS2, reg);
 }
 
 /* ========================== 高性能 DMA 核心流 ========================== */
