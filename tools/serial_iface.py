@@ -82,6 +82,7 @@ class SerialInterface:
         self._port: str = port
         self._baud: int = baud
         self._ser: Optional[serial.Serial] = None
+        self._line_buf: str = ""
 
     # ------------------------------------------------------------------
     # Public API
@@ -106,12 +107,13 @@ class SerialInterface:
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
-                timeout=timeout_s,
+                timeout=0,  # non-blocking — _read_one_frame polls manually
             )
         except (serial.SerialException, OSError):
             return False
 
         self._ser = ser
+        self._line_buf = ""
 
         # Flush any stale data in the input buffer.
         self.flush_input()
@@ -172,7 +174,8 @@ class SerialInterface:
         return dict(zip(self._CHANNEL_NAMES, frame))
 
     def flush_input(self) -> None:
-        """Discard all data in the serial input buffer."""
+        """Discard all data in the serial input buffer and the line buffer."""
+        self._line_buf = ""
         if self._ser is not None and self._ser.is_open:
             self._ser.reset_input_buffer()
 
@@ -225,13 +228,15 @@ class SerialInterface:
             raise RuntimeError("Serial port is not open. Call connect() first.")
 
     def _read_one_frame(self, timeout: float) -> Optional[List[float]]:
-        """Try to read a single telemetry line and parse it.
+        """Read one telemetry line using non-blocking reads + line buffer.
 
-        Reads until a ``\\n`` is found, or the timeout expires.
-        Silently discards lines that do not match the expected format.
+        Avoids ``readline()`` which is unreliable with USB-TTL adapters on
+        Windows (timeout may fire before a complete line arrives even when
+        data is flowing).  Instead polls ``read()`` with a short sleep,
+        accumulating bytes until a ``\\n`` is found or *timeout* expires.
 
         Args:
-            timeout: Seconds to wait for data.
+            timeout: Maximum total seconds to wait.
 
         Returns:
             List of 14 floats on success, None on timeout / parse failure.
@@ -239,43 +244,55 @@ class SerialInterface:
         if self._ser is None or not self._ser.is_open:
             return None
 
-        original_timeout = self._ser.timeout
-        try:
-            self._ser.timeout = timeout
-            line = self._ser.readline()
-        finally:
-            self._ser.timeout = original_timeout
+        deadline = time.monotonic() + timeout
+        # Use a small poll interval — fast enough to not miss data,
+        # slow enough to avoid busy-waiting the CPU.
+        poll_s = 0.005  # 5 ms
 
-        if not line:
-            return None  # timeout
+        while time.monotonic() < deadline:
+            try:
+                raw = self._ser.read(self._ser.in_waiting or 1)
+            except serial.SerialException:
+                return None
 
-        return self._parse_telemetry_line(line)
+            if raw:
+                self._line_buf += raw.decode("ascii", errors="replace")
 
-    def _parse_telemetry_line(self, line: bytes) -> Optional[List[float]]:
-        """Parse a raw bytes line into a list of 14 floats.
+            # Look for a complete line
+            while "\n" in self._line_buf:
+                nl = self._line_buf.index("\n")
+                line = self._line_buf[:nl].strip("\r")
+                self._line_buf = self._line_buf[nl + 1:]
 
-        Expected format: ``b"channels: f0,f1,...,f13\\r\\n"``
+                parsed = self._parse_telemetry_line(line)
+                if parsed is not None:
+                    return parsed
+
+            # No complete line yet — brief sleep then poll again
+            time.sleep(poll_s)
+
+        return None  # timeout
+
+    def _parse_telemetry_line(self, line: str) -> Optional[List[float]]:
+        """Parse a telemetry line string into a list of 14 floats.
+
+        Expected format: ``"channels: f0,f1,...,f13"``
 
         Args:
-            line: Raw bytes from the serial port.
+            line: Decoded line string (already stripped of \\r\\n).
 
         Returns:
             List of 14 floats on success, None on parse failure.
         """
-        try:
-            text = line.decode("ascii", errors="replace").strip()
-        except (UnicodeDecodeError, ValueError):
-            return None
-
-        if not text:
+        if not line:
             return None
 
         # Require the "channels:" prefix
         PREFIX = "channels:"
-        if not text.startswith(PREFIX):
+        if not line.startswith(PREFIX):
             return None
 
-        body = text[len(PREFIX):].strip()
+        body = line[len(PREFIX):].strip()
         if not body:
             return None
 
