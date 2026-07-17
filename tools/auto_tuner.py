@@ -114,10 +114,17 @@ def phase_connect(port: Optional[str]) -> SerialInterface:
     iface.send_cmd("T=0.0")
     iface.wait_for_flag(timeout_s=2.0)
 
-    # Read telemetry to verify mode
-    telemetry = iface.read_telemetry(timeout_s=1.0)
+    # Read telemetry to verify mode — retry a few times, serial can be slow
+    telemetry = None
+    for attempt in range(5):
+        telemetry = iface.read_telemetry(timeout_s=0.5)
+        if telemetry is not None:
+            break
+        print(f"  Retry {attempt + 1}/5 waiting for telemetry...")
     if telemetry is None:
-        print("ERROR: No telemetry received after connecting.")
+        print("ERROR: No telemetry received after 5 attempts (2.5 s).")
+        print("  Is the MCU in closed-loop mode (Phase 2)?")
+        print("  Try connecting with VOFA+ first to verify telemetry is flowing.")
         iface.disconnect()
         sys.exit(1)
 
