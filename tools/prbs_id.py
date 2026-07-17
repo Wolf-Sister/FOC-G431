@@ -293,6 +293,7 @@ def prbs_identify(
         "iterations": 0,
         "iq_data": [],
         "vq_data": [],
+        "missed_frames": 0,
     }
 
     # Generate PRBS sequence
@@ -301,6 +302,7 @@ def prbs_identify(
 
     iq_data: List[float] = []
     vq_data: List[float] = []
+    missed_frames: int = 0
 
     def _zero_current() -> None:
         """Best-effort: send T=0 and wait briefly."""
@@ -326,12 +328,23 @@ def prbs_identify(
             for _ in range(clock_samples):
                 telemetry = iface.read_telemetry(timeout_s=0.5)
                 if telemetry is None:
-                    continue  # skip missed frames
+                    missed_frames += 1
+                    continue  # skip missed frames; data stays aligned
                 iq_data.append(telemetry["iq_meas"])
                 vq_data.append(telemetry["vq_cmd"])
 
         # Return current to zero
         _zero_current()
+
+        # Report dropped frames and warn if excessive
+        total_expected = prbs_length * clock_samples
+        if missed_frames > 0:
+            drop_pct = 100.0 * missed_frames / total_expected
+            if drop_pct > 10.0:
+                print(
+                    f"WARNING: {missed_frames}/{total_expected} telemetry frames "
+                    f"missed ({drop_pct:.1f}%). RLS accuracy may be degraded."
+                )
 
         # -- Phase 2: sanity checks --------------------------------------
         # Need at least 50 RLS iterations (51 data points, since k=0 skipped)
@@ -344,6 +357,7 @@ def prbs_identify(
         # Store raw data
         result["iq_data"] = iq_data
         result["vq_data"] = vq_data
+        result["missed_frames"] = missed_frames
 
         # -- Phase 3: RLS estimation -------------------------------------
         rls = RLSEstimator(n_params=2, lambda_val=0.98)
