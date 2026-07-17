@@ -171,7 +171,7 @@ AS5047P_Init();
               motor_pid_init(1.4850f, 371.25f,   /* Iq: P, I */
                              1.4850f, 371.25f   /* Id: P, I */
                             );
-              speed_pid_init(0.0140f, 0.0164f);        /* Speed: P, I */
+              speed_pid_init(0.0140f, 0.0264f);        /* Speed: P, I */
 
       motor_control.set_torque = 0.0f;
 

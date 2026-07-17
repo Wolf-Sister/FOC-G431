@@ -500,18 +500,19 @@ void foc_current_loop(void)
     float I_d_raw = I_alpha * c + I_beta * s;
     float I_q_raw = I_beta  * c - I_alpha * s;
 
-    /* ── 3. Low-pass filter both axes (instance-based, no static clash) ── */
-    motor_control.id_meas = lowPassFilter(I_d_raw, 0.05f, &motor_control.id_filter_state);
-    motor_control.iq_meas = lowPassFilter(I_q_raw, 0.05f, &motor_control.iq_filter_state);
-
+    /* ── 3. Low-pass filter both axes, alpha=0.3 → fc≈480Hz @ 10kHz ── */
+    motor_control.id_meas = lowPassFilter(I_d_raw, 0.01f, &motor_control.id_filter_state);
+    motor_control.iq_meas = lowPassFilter(I_q_raw, 0.01f, &motor_control.iq_filter_state);
+		
     /* ── 4. Cross-coupling + back-EMF feedforward ── */
     /*     Vd = Rs·Id + Ld·dId/dt - ω·Lq·Iq   →   Vd_ff = -ω·Lq·Iq            */
     /*     Vq = Rs·Iq + Lq·dIq/dt + ω·(Ld·Id+ψm) → Vq_ff = +ω·(Ld·Id+ψm)      */
-    /* ── 4. 移除或修正前馈：低速/静止时关闭前馈，或对前馈电流进行强滤波 ── */
     float Vd_ff = 0.0f;
     float Vq_ff = 0.0f;
-    
-
+    if (fabsf(elec_vel) > 1000.0f) {
+        Vd_ff = -elec_vel * MOTOR_Lq * motor_control.iq_meas;
+        Vq_ff =  elec_vel * (MOTOR_Ld * motor_control.id_meas + MOTOR_FLUX);
+    }
 
     /* ── 5. Iq error — source depends on control mode ── */
     float error_q = motor_control.set_torque - motor_control.iq_meas;
@@ -520,9 +521,11 @@ void foc_current_loop(void)
     float error_d = motor_control.id_target - motor_control.id_meas;
 
     /* ── 7. Dead-band (Iq only — Id needs continuous regulation) ── */
-    if (fabsf(error_q) <= 0.04f) {
+		/*
+    if (fabsf(error_q) <= 0.00f) {
         error_q = 0.0f;
     }
+		*/
     /*
     if (fabsf(error_d) <= 0.00f) {
         error_d = 0.0f;
