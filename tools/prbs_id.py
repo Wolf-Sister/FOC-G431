@@ -54,7 +54,6 @@ class PRBSGenerator:
         self.mask: int = (1 << n_bits) - 1
         self.state: int = self.mask  # all-ones initialisation
         self._taps: List[int] = self._TAPS[n_bits]
-        self._seq_count: int = 0  # count of bits generated
 
     def next(self) -> int:
         """Return the next PRBS bit (0 or 1)."""
@@ -70,7 +69,6 @@ class PRBSGenerator:
         if self.state == 0:
             self.state = 1
 
-        self._seq_count += 1
         return feedback
 
     def sequence(self, length: int) -> List[int]:
@@ -296,8 +294,16 @@ def prbs_identify(
         "missed_frames": 0,
     }
 
-    # Generate PRBS sequence
-    prbs = PRBSGenerator(n_bits=7)
+    # Generate PRBS sequence with dynamic n_bits selection
+    # Find the smallest n_bits (>= 7, <= 12) whose MLS period covers
+    # the requested prbs_length.  Defaults to 7 for short sequences.
+    n_bits: int = 7
+    while (1 << n_bits) - 1 < prbs_length and n_bits < 12:
+        n_bits += 1
+    print(f"  PRBS n_bits={n_bits} (MLS period={(1 << n_bits) - 1}, "
+          f"requested length={prbs_length})")
+
+    prbs = PRBSGenerator(n_bits=n_bits)
     bits = prbs.sequence(prbs_length)
 
     iq_data: List[float] = []

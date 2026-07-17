@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .pi_calc import _median
 from .serial_iface import SerialInterface
 
 
@@ -27,22 +28,6 @@ _MIN_VALID_SAMPLES: int = 10
 _DEFAULT_SETTLE_SAMPLES: int = 15
 _DEFAULT_TOTAL_SAMPLES: int = 30
 _NEAR_ZERO_THRESHOLD: float = 1e-9        # Iq_ss below this is treated as zero
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _median(data: List[float]) -> float:
-    """Compute median of a list using manual sorting (no numpy)."""
-    if not data:
-        return 0.0
-    sorted_data = sorted(data)
-    n = len(sorted_data)
-    mid = n // 2
-    if n % 2 == 1:
-        return sorted_data[mid]
-    return (sorted_data[mid - 1] + sorted_data[mid]) / 2.0
 
 
 # ---------------------------------------------------------------------------

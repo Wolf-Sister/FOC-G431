@@ -9,7 +9,7 @@ a first-order low-pass filter with bandwidth omega_c.
     G_cl(s) = omega_c / (s + omega_c)
 """
 
-from typing import Tuple
+from typing import List, Tuple
 
 # ---------------------------------------------------------------------------
 # Reference constants (derived from a reference PI set)
@@ -21,6 +21,29 @@ DEFAULT_KI: float = 371.25
 REF_R: float = DEFAULT_KI / DEFAULT_OMEGA_C  # ≈ 0.12375 Ω
 REF_L: float = DEFAULT_KP / DEFAULT_OMEGA_C  # ≈ 0.000495 H = 495 µH
 REF_TAU: float = DEFAULT_KP / DEFAULT_KI  # ≈ 0.004 s = 4 ms
+
+
+# ---------------------------------------------------------------------------
+# Shared utility
+# ---------------------------------------------------------------------------
+
+def _median(vals: List[float]) -> float:
+    """Return the median of a list of numbers.
+
+    Sorts the list and picks the middle element (odd length) or the
+    average of the two middle elements (even length).
+
+    Args:
+        vals: List of numeric values.
+
+    Returns:
+        Median value.  Returns 0.0 for an empty list.
+    """
+    if not vals:
+        return 0.0
+    s = sorted(vals)
+    m = len(s) // 2
+    return s[m] if len(s) % 2 == 1 else (s[m - 1] + s[m]) / 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +88,10 @@ def implied_rl_from_pi(
     Because the crossover frequency omega_c is unknown when only the gains
     are available, R is normalised to 1.0.  The L/R ratio is Kp/Ki, which
     can be used for sanity checks against the known motor time constant.
+
+    This function is available for **external sanity checks** (e.g. in
+    notebooks or calibration dashboards) to validate whether uploaded gains
+    match the expected motor time constant.
 
     Args:
         Kp: Proportional gain.

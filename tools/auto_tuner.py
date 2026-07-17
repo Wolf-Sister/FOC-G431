@@ -422,6 +422,8 @@ def main() -> None:
             time.sleep(0.05)  # 50 ms settle
 
         # ---- Phase 4: Verification -------------------------------------------
+        verif_result: Optional[Dict[str, Any]] = None
+
         if not args.dry_run:
             verif_result = run_verification(
                 iface,
@@ -455,13 +457,25 @@ def main() -> None:
 
         # ---- JSON Output -----------------------------------------------------
         if args.save:
-            output = {
+            output: Dict[str, Any] = {
                 "R_ohm": R,
                 "L_uh": L * 1e6,
                 "Kp": Kp,
                 "Ki": Ki,
                 "bandwidth_rad_s": args.bw,
                 "method": method,
+                "verification": (
+                    {
+                        "rise_time_ms": verif_result["new"]["rise_time_ms"],
+                        "overshoot_pct": verif_result["new"]["overshoot_pct"],
+                        "settling_time_ms": verif_result["new"]["settling_time_ms"],
+                        "steady_state_error_a": verif_result["new"]["steady_state_error_a"],
+                        "passed": verif_result["passed"],
+                        "rollback": verif_result["rollback"],
+                    }
+                    if verif_result is not None
+                    else None
+                ),
             }
             with open(args.save, "w", encoding="utf-8") as f:
                 json.dump(output, f, indent=2)

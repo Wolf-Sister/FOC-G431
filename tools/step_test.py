@@ -10,30 +10,9 @@ Dependencies: stdlib only (time, typing).
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
-from .pi_calc import get_sanity_bounds, REF_TAU
-
-
-# ---------------------------------------------------------------------------
-# Median helper (no numpy)
-# ---------------------------------------------------------------------------
-
-def _median(vals: List[float]) -> float:
-    """Return the median of a list of numbers.
-
-    Sorts the list and picks the middle element (odd length) or the
-    average of the two middle elements (even length).
-
-    Args:
-        vals: List of numeric values.
-
-    Returns:
-        Median value.
-    """
-    s = sorted(vals)
-    m = len(s) // 2
-    return s[m] if len(s) % 2 == 1 else (s[m - 1] + s[m]) / 2.0
+from .pi_calc import _median, get_sanity_bounds, REF_TAU
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +97,7 @@ def _extract_rl_from_step(
 # ---------------------------------------------------------------------------
 
 def run_step_test(
-    iface: Any,
+    iface: "SerialInterface",
     amplitude: float = 1.0,
     n_samples: int = 30,
     n_steps: int = 3,
