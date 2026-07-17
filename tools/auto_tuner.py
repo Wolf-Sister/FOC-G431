@@ -256,8 +256,8 @@ def phase_calculate(
 ) -> Tuple[float, float, float, float, str]:
     """Compute PI gains from identified R/L parameters.
 
-    Prefers PRBS results over step results.  Sends the computed gains
-    to the MCU unless running in dry-run mode.
+    Prefers PRBS results over step results.  Returns the computed gains;
+    the caller (main) is responsible for sending them to the MCU.
 
     Args:
         step_result: Result dict from Phase 1.
@@ -289,9 +289,7 @@ def phase_calculate(
     if args.dry_run:
         print("  DRY-RUN: Gains NOT sent to MCU.")
     else:
-        iface_cmd = f"P={Kp:.6f},I={Ki:.6f}"
-        # The iface arg isn't passed to this function — we handle sending in main()
-        print(f"  Sending to MCU: P={Kp:.4f},I={Ki:.2f}")
+        print(f"  Ready to send: P={Kp:.4f},I={Ki:.2f}")
 
     print()
     return (Kp, Ki, R, L, method)
