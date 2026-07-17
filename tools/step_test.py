@@ -100,7 +100,7 @@ def _extract_rl_from_step(
         if L < 1e-6 or L > 0.01:
             L = R * REF_TAU  # fallback -- unphysical inductance
 
-    tau = L / R
+    tau = L / R if R != 0.0 else REF_TAU
 
     return {
         "R": R,
