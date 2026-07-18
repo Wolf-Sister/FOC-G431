@@ -16,8 +16,9 @@
 #include "utils.h"
 
 /* Conversion constant: AS5047P is 14-bit (0–16383) → 0–2π radians -----------*/
-#define AS5047P_ANGLE_MAX 16383.0f
-#define AS5047P_RAD_SCALE (_2PI / AS5047P_ANGLE_MAX)
+#define AS5047P_ANGLE_MAX     16383.0f
+#define AS5047P_RAD_SCALE     (_2PI / AS5047P_ANGLE_MAX)
+#define AS5047P_VEL_LPF_ALPHA 0.2f     /* fc ≈ 680 Hz @ 10 kHz update rate     */
 
 /* Global sensor instance ----------------------------------------------------*/
 AS5047P_Sensor_T AngleSensor = {0};
@@ -34,8 +35,9 @@ void AS5047P_Sensor_Init(AS5047P_Sensor_T *s)
     s->prev_angle     = 0.0f;
     s->turn_count     = 0;
     s->total_angle    = 0.0f;
-    s->velocity_rad_s = 0.0f;
-    s->prev_ts        = 0;
+    s->velocity_rad_s   = 0.0f;
+    s->vel_filter_state = 0.0f;
+    s->prev_ts          = 0;
 }
 
 /**
@@ -82,7 +84,9 @@ void AS5047P_Sensor_Update(AS5047P_Sensor_T *s)
     /* velocity (delta already corrected for wrap) */
     float dt = (float)(now - s->prev_ts) * 1e-6f;
     if (dt > 0.0f && dt < 0.1f) {
-        s->velocity_rad_s = delta / dt;
+        float vel_raw = delta / dt;
+        s->velocity_rad_s = lowPassFilter(vel_raw, AS5047P_VEL_LPF_ALPHA,
+                                           &s->vel_filter_state);
     }
 
     s->prev_angle = angle;

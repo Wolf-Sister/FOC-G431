@@ -48,7 +48,7 @@ extern "C" {
 
 /* Speed loop -----------------------------------------------------------------*/
 #define SPEED_DECIMATION   10         /* 20kHz / 10 = 2kHz speed loop          */
-#define SPEED_LPF_ALPHA    0.1f       /* Velocity LPF alpha @ 2kHz             */
+#define SPEED_LPF_ALPHA    0.3f       /* Velocity LPF alpha @ 2kHz             */
 #define SPEED_Ts           0.0005f    /* Speed loop period (s)                 */
 
 /* Position loop ---------------------------------------------------------------*/

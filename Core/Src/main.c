@@ -171,7 +171,7 @@ AS5047P_Init();
               motor_pid_init(1.4850f, 371.25f,   /* Iq: P, I */
                              1.4850f, 371.25f   /* Id: P, I */
                             );
-              speed_pid_init(0.0140f, 0.0264f);        /* Speed: P, I */
+              speed_pid_init(0.0050f, 0.0169f);        /* Speed: P, I */
 
       motor_control.set_torque = 0.0f;
 
@@ -197,7 +197,7 @@ AS5047P_Init();
          *   [2]  iq_target       - Q-axis target current (A) = set_torque
          *   [3]  iq_meas         - Q-axis actual current (A)
          *   [4]  vd_cmd          - D-axis voltage command (V)
-         *   [5]  vq_cmd          - Q-axis voltage command (V)
+         *   [5]  enc_velocity    - Encoder instantaneous velocity (rad/s)
          *   [6]  velocity        - Filtered mechanical velocity (rad/s)
          *   [7]  status_flag     - Step-sync flag (1=cmd received)
          *   [8]  speed_setpoint  - Speed setpoint (rad/s)
@@ -213,7 +213,7 @@ AS5047P_Init();
             motor_control.set_torque,
             motor_control.iq_meas,
             motor_control.id_set,
-            motor_control.iq_set,
+            encoder_cache.velocity_rad_s,
             motor_control.vel_meas,
             (float)motor_control.status_flag,
             motor_control.set_speed,

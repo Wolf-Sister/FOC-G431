@@ -22,7 +22,8 @@ typedef struct {
     float    prev_angle;      /* Previous raw angle (0–2π)                   */
     int32_t  turn_count;      /* Integer full-turn counter (no float drift)  */
     float    total_angle;     /* Multi-turn total angle (rad)                */
-    float    velocity_rad_s;  /* Angular velocity (rad/s)                    */
+    float    velocity_rad_s;  /* Angular velocity (rad/s), LPF-filtered       */
+    float    vel_filter_state;/* Velocity LPF state variable                 */
     uint32_t prev_ts;         /* Timestamp of last update (us)               */
 } AS5047P_Sensor_T;
 

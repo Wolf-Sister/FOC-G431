@@ -501,8 +501,8 @@ void foc_current_loop(void)
     float I_q_raw = I_beta  * c - I_alpha * s;
 
     /* ── 3. Low-pass filter both axes, alpha=0.3 → fc≈480Hz @ 10kHz ── */
-    motor_control.id_meas = lowPassFilter(I_d_raw, 0.01f, &motor_control.id_filter_state);
-    motor_control.iq_meas = lowPassFilter(I_q_raw, 0.01f, &motor_control.iq_filter_state);
+    motor_control.id_meas = lowPassFilter(I_d_raw, 0.05f, &motor_control.id_filter_state);
+    motor_control.iq_meas = lowPassFilter(I_q_raw, 0.05f, &motor_control.iq_filter_state);
 		
     /* ── 4. Cross-coupling + back-EMF feedforward ── */
     /*     Vd = Rs·Id + Ld·dId/dt - ω·Lq·Iq   →   Vd_ff = -ω·Lq·Iq            */
