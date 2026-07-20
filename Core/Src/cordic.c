@@ -44,11 +44,11 @@ void MX_CORDIC_Init(void)
   }
   /* USER CODE BEGIN CORDIC_Init 2 */
 
-  /* One-time CORDIC config for FOC sin/cos pipeline:
+  /* One-time CORDIC config for same-frame FOC sin/cos:
    *   Cosine function (generates both sin + cos when NBREAD=2)
    *   6 cycles × 4 iter/cycle = 24 iterations → ~6e-8 precision (exceeds float32)
    *   Q1.31 I/O, 1×32-bit write (angle), 2×32-bit read (cos then sin)
-   *   IEN enabled → CORDIC ISR fires on result ready
+   *   Interrupt disabled: the 20 kHz current ISR polls and reads this frame.
    */
   LL_CORDIC_Config(CORDIC,
                    LL_CORDIC_FUNCTION_COSINE,
@@ -58,7 +58,7 @@ void MX_CORDIC_Init(void)
                    LL_CORDIC_NBREAD_2,
                    LL_CORDIC_INSIZE_32BITS,
                    LL_CORDIC_OUTSIZE_32BITS);
-  LL_CORDIC_EnableIT(CORDIC);
+  LL_CORDIC_DisableIT(CORDIC);
 
   /* USER CODE END CORDIC_Init 2 */
 

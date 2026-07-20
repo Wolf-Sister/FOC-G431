@@ -1,9 +1,9 @@
 /**
   ******************************************************************************
   * @file    foc.c
-  * @brief   FOC motor control — SVPWM, current loop, sensor alignment
+  * @brief   FOC 电机控制 — SVPWM、电流环、传感器对齐
   *
-  *          Merges TinyFoc's motor.c + foc.c into the existing G431 module.
+  *          将 TinyFoc 的 motor.c + foc.c 合并到现有 G431 模块中
   ******************************************************************************
   */
 
@@ -19,34 +19,43 @@
 #include <string.h>
 
 /* ========================================================================== */
-/*  Global variables                                                          */
+/*  全局变量                                                                   */
 /* ========================================================================== */
 
-/* Phase currents (dual-ADC captured) */
+/* 相电流（双 ADC 采集） */
 volatile Phase_Current_t motor_current = {0};
 
-/* Current loop enable — set after calibration + alignment done */
+/* 电流环使能 — 校准 + 对齐完成后设置 */
 volatile uint8_t current_loop_enable = 0;
 
-/* Sensor alignment in progress — TIM callback must not overwrite PWM */
+/* Set only after all motor-control state has been initialized. */
+volatile uint8_t motor_ready = 0;
+
+/* 传感器对齐进行中 — TIM 回调不得覆盖 PWM */
 volatile uint8_t alignment_in_progress = 0;
 
-/* Motor config (from TinyFoc) */
+/* 电机配置 (来自 TinyFoc) */
 motor_config_t motor_config = {
     .voltage_supply         = MOTOR_VBUS,
     .dir                    = -1,
     .pairs                  = 11,
-    .iq_p_gain              = 0,
-    .iq_i_gain              = 0,
-    .id_p_gain              = 0,
-    .id_i_gain              = 0,
-    .spd_p_gain             = 0.05f,
-    .spd_i_gain             = 2.0f,
-    .pos_p_gain             = 5.0f,
+    .iq_p_gain              = IQ_CURRENT_KP_DEFAULT,
+    .iq_i_gain              = IQ_CURRENT_KI_DEFAULT,
+    .id_p_gain              = ID_CURRENT_KP_DEFAULT,
+    .id_i_gain              = ID_CURRENT_KI_DEFAULT,
+    .spd_p_gain             = SPEED_KP_DEFAULT,
+    .spd_i_gain             = SPEED_KI_DEFAULT,
+    .spd_p_low_speed       = SPEED_KP_LOW_SPEED_DEFAULT,
+    .spd_p_high_speed      = SPEED_KP_HIGH_SPEED_DEFAULT,
+    .spd_gain_schedule     = SPEED_GAIN_SCHEDULE_DEFAULT,
+    .pos_p_gain             = POSITION_KP_DEFAULT,
+    .current_voltage_limit  = CURRENT_VOLTAGE_LIMIT_DEFAULT,
+    .speed_current_limit    = SPEED_CURRENT_LIMIT_DEFAULT,
     .pos_speed_limit        = POS_SPEED_LIMIT_DEFAULT,
+    .pos_accel_limit        = POS_ACCEL_LIMIT_DEFAULT,
 };
 
-/* Motor control state (from TinyFoc) */
+/* 电机控制状态 (来自 TinyFoc) */
 motor_control_t motor_control = {
     .IphA              = 0.0f,
     .IphB              = 0.0f,
@@ -70,6 +79,8 @@ motor_control_t motor_control = {
     .vel_meas          = 0.0f,
     .vel_raw           = 0.0f,
     .vel_filter_state  = 0.0f,
+    .spd_kp_active     = SPEED_KP_LOW_SPEED_DEFAULT,
+    .spd_gain_region   = SPEED_GAIN_REGION_LOW_SPEED,
     .mod_q             = 0.0f,
     .mod_d             = 0.0f,
     .du                = 0.0f,
@@ -79,16 +90,16 @@ motor_control_t motor_control = {
     .latest_ic_raw     = 0,
 };
 
-/* CORDIC sin/cos cache — written by CORDIC ISR, read by foc_current_loop()    */
+/* CORDIC sin/cos 缓存 — CORDIC ISR 写入, foc_current_loop() 读取              */
 volatile float cordic_sin_cache = 0.0f;
-volatile float cordic_cos_cache = 1.0f;  /* cos(0)=1 safe initial value         */
+volatile float cordic_cos_cache = 1.0f;  /* cos(0)=1 安全初始值                  */
 
 /* ========================================================================== */
-/*  Existing SVPWM (kept for backward compat / open-loop testing)             */
+/*  现有 SVPWM（保留用于向后兼容 / 开环测试）                                  */
 /* ========================================================================== */
 
 /**
-  * @brief  11-segment SVPWM update — writes CCR1/2/3 for TIM1
+  * @brief  11 段 SVPWM 更新 — 写入 TIM1 CCR1/2/3
   */
 void SVPWM_Update(float Ud, float Uq, float angle, uint32_t period)
 {
@@ -157,7 +168,7 @@ void SVPWM_Update(float Ud, float Uq, float angle, uint32_t period)
 }
 
 /* ========================================================================== */
-/*  Calibration & angle filter (kept)                                         */
+/*  校准 & 角度滤波器（保留）                                                   */
 /* ========================================================================== */
 
 void Motor_Current_Calibration(void)
@@ -175,19 +186,19 @@ void Motor_Current_Calibration(void)
 
 void UART2_SendString(const char *str)
 {
-    /* Wait for previous DMA transfer to complete (DMA_NORMAL mode:
-     * TC ISR restores gState to READY) */
+    /* 等待上一次 DMA 传输完成（DMA_NORMAL 模式：
+     * TC 中断服务函数会将 gState 恢复为 READY） */
     while (huart2.gState != HAL_UART_STATE_READY) {}
     HAL_UART_Transmit_DMA(&huart2, (uint8_t *)str, strlen(str));
 }
 
 /* ========================================================================== */
-/*  Phase current sync — copy ADC-captured currents to motor_control          */
+/*  相电流同步 — 将 ADC 采集电流复制到 motor_control                           */
 /* ========================================================================== */
 
 /**
-  * @brief  Sync phase currents from dual-ADC buffers to motor_control struct.
-  *         Called in ADC injection callback before current loop.
+  * @brief  将相电流从双 ADC 缓冲区同步到 motor_control 结构体
+  *         在 ADC 注入回调中、电流环之前调用
   */
 void foc_sync_phase_currents(void)
 {
@@ -197,11 +208,14 @@ void foc_sync_phase_currents(void)
 }
 
 /* ========================================================================== */
-/*  Motor parameter init                                                      */
+/*  电机参数初始化                                                             */
 /* ========================================================================== */
 
 void motor_control_parm_init(void)
 {
+    encoder_cache_t encoder = {0};
+    (void)AS5047P_EncoderCache_Read(&encoder);
+
     motor_control.iq_set     = 0.0f;
     motor_control.id_set     = 0.0f;
     motor_control.iq_meas    = 0.0f;
@@ -214,39 +228,116 @@ void motor_control_parm_init(void)
     motor_control.vel_meas         = 0.0f;
     motor_control.vel_raw          = 0.0f;
     motor_control.vel_filter_state = 0.0f;
-    motor_control.spd_prev_angle   = encoder_cache.total_angle_rad;
     motor_control.spd_needs_init   = 1;
-    motor_control.set_position     = encoder_cache.total_angle_rad;
-    motor_control.pos_meas         = encoder_cache.total_angle_rad;
+    motor_control.set_position     = encoder.total_angle_rad;
+    motor_control.pos_meas         = encoder.total_angle_rad;
+}
+
+static void foc_clamp_pid_state(struct PIDController *pid, float limit)
+{
+    if (pid->integral_prev >  limit) pid->integral_prev =  limit;
+    if (pid->integral_prev < -limit) pid->integral_prev = -limit;
+    if (pid->output_prev >  limit) pid->output_prev =  limit;
+    if (pid->output_prev < -limit) pid->output_prev = -limit;
+}
+
+void foc_set_loop_limits(float current_voltage_limit,
+                         float speed_current_limit,
+                         float position_speed_limit)
+{
+    float hardware_voltage_limit = motor_config.voltage_supply / SQRT3;
+
+    if (!(current_voltage_limit > 0.0f)) {
+        current_voltage_limit = motor_config.current_voltage_limit;
+    }
+    if (!(speed_current_limit > 0.0f)) {
+        speed_current_limit = motor_config.speed_current_limit;
+    }
+    if (!(position_speed_limit > 0.0f)) {
+        position_speed_limit = motor_config.pos_speed_limit;
+    }
+
+    if (current_voltage_limit > hardware_voltage_limit) {
+        current_voltage_limit = hardware_voltage_limit;
+    }
+    if (speed_current_limit > ABSOLUTE_CURRENT_LIMIT) {
+        speed_current_limit = ABSOLUTE_CURRENT_LIMIT;
+    }
+    if (position_speed_limit > POS_SPEED_LIMIT_MAX) {
+        position_speed_limit = POS_SPEED_LIMIT_MAX;
+    }
+
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+
+    motor_config.current_voltage_limit = current_voltage_limit;
+    current_loop.limit = current_voltage_limit;
+    id_current_loop.limit = current_voltage_limit;
+    foc_clamp_pid_state(&current_loop, current_voltage_limit);
+    foc_clamp_pid_state(&id_current_loop, current_voltage_limit);
+
+    motor_config.speed_current_limit = speed_current_limit;
+    speed_loop.limit = speed_current_limit;
+    foc_clamp_pid_state(&speed_loop, speed_current_limit);
+    if (motor_control.set_torque > speed_current_limit) {
+        motor_control.set_torque = speed_current_limit;
+    }
+    if (motor_control.set_torque < -speed_current_limit) {
+        motor_control.set_torque = -speed_current_limit;
+    }
+    if (motor_control.id_target > speed_current_limit) {
+        motor_control.id_target = speed_current_limit;
+    }
+    if (motor_control.id_target < -speed_current_limit) {
+        motor_control.id_target = -speed_current_limit;
+    }
+
+    motor_config.pos_speed_limit = position_speed_limit;
+
+    __set_PRIMASK(primask);
 }
 
 /* ========================================================================== */
-/*  Electrical angle helpers (from TinyFoc utils.c)                            */
+/*  电气角度辅助函数 (来自 TinyFoc utils.c)                                    */
 /* ========================================================================== */
 
 /**
-  * @brief  Calculate zero-electric-angle offset during alignment
+  * @brief  在传感器对齐过程中计算零电角偏移量
   */
 float _calculate_zero_electric_angle(void)
 {
-    float sum_angle = 0.0f;
-    for (int i = 0; i < 10; i++) {
-        AS5047P_Sensor_Update(&AngleSensor);
-        sum_angle += AS5047P_GetAngle(&AngleSensor);
+    float sum_sin = 0.0f;
+    float sum_cos = 0.0f;
+    uint8_t valid_samples = 0U;
+
+    while (valid_samples < 10U) {
+        if (AS5047P_Sensor_Update(&AngleSensor)) {
+            float angle = AS5047P_GetAngle(&AngleSensor);
+            float s;
+            float c;
+            arm_sin_cos_f32(angle * RAD_TO_DEG, &s, &c);
+            sum_sin += s;
+            sum_cos += c;
+            valid_samples++;
+        }
         HAL_Delay(1);
     }
-    float mech_angle = sum_angle / 10.0f;
+
+    float mech_angle = atan2f(sum_sin, sum_cos);
+    if (mech_angle < 0.0f) mech_angle += _2PI;
 
     float raw_elec_angle = (float)(motor_config.dir * motor_config.pairs) * mech_angle;
     return _normalizeAngle(raw_elec_angle);
 }
 
 /**
-  * @brief  Get instantaneous electrical angle [0, 2π)
+  * @brief  获取瞬时电角度 [0, 2π)
   */
 float _electricalAngle(void)
 {
-    float mech_angle = encoder_cache.angle_raw;  /* volatile read from TIM2 ISR cache */
+    encoder_cache_t encoder = {0};
+    (void)AS5047P_EncoderCache_Read(&encoder);
+    float mech_angle = encoder.angle_raw;
     float elec_angle = (float)(motor_config.dir * motor_config.pairs)
                        * mech_angle
                        - motor_control.zero_elec_angle;
@@ -254,273 +345,515 @@ float _electricalAngle(void)
 }
 
 /**
-  * @brief  Get electrical angular velocity [rad/s]
+  * @brief  获取电角速度 [rad/s]
   */
 float _electricalVelocity(void)
 {
-    float mech_vel = encoder_cache.velocity_rad_s;  /* volatile read from TIM2 ISR cache */
+    encoder_cache_t encoder = {0};
+    (void)AS5047P_EncoderCache_Read(&encoder);
+    float mech_vel = encoder.velocity_rad_s;
     return (float)(motor_config.dir * motor_config.pairs) * mech_vel;
 }
 
 /* ========================================================================== */
-/*  Clarke + Park transform (from TinyFoc motor.c)                             */
+/*  Clarke + Park 变换 (来自 TinyFoc motor.c)                                  */
 /* ========================================================================== */
 
 /**
-  * @brief  Compute Iq from phase B & C currents via Clarke + Park
-  * @param  cur_b    B-phase current (A)
-  * @param  cur_c    C-phase current (A)
-  * @param  angle_el electrical angle [rad]
-  * @return Iq (torque-producing current)
+  * @brief  从 B、C 相电流通过 Clarke + Park 变换计算 Iq
+  * @param  cur_b    B 相电流 (A)
+  * @param  cur_c    C 相电流 (A)
+  * @param  angle_el 电角度 [rad]
+  * @return Iq (产生转矩的电流分量)
   */
 float cal_Iq_Id(float cur_b, float cur_c, float angle_el)
 {
-    /* Clarke transform */
+    /* Clarke 变换 */
     float I_alpha = -(cur_b + cur_c);
     float I_beta  = _1_SQRT3 * (cur_b - cur_c);
 
-    /* Park transform */
+    /* Park 变换 */
     float s, c;
     arm_sin_cos_f32(angle_el * RAD_TO_DEG, &s, &c);
     float I_q = I_beta * c - I_alpha * s;
     return I_q;
 }
 
+/* Return the largest absolute phase-current value during alignment. */
+static float foc_align_max_phase_current(void)
+{
+    float max_current = fabsf(motor_current.I_A);
+    float phase_current = fabsf(motor_current.I_B);
+
+    if (phase_current > max_current) {
+        max_current = phase_current;
+    }
+
+    phase_current = fabsf(motor_current.I_C);
+    if (phase_current > max_current) {
+        max_current = phase_current;
+    }
+
+    return max_current;
+}
+
+/* Delay in 1 ms steps and reject sustained alignment overcurrent. */
+static HAL_StatusTypeDef foc_align_wait(uint32_t delay_ms,
+                                        uint32_t *overcurrent_ms)
+{
+    uint32_t elapsed_ms;
+
+    for (elapsed_ms = 0U; elapsed_ms < delay_ms; elapsed_ms++) {
+        HAL_Delay(1U);
+
+        if (foc_align_max_phase_current() > FOC_ALIGN_CURRENT_LIMIT_A) {
+            (*overcurrent_ms)++;
+            if (*overcurrent_ms >= FOC_ALIGN_OVERCURRENT_MS) {
+                return HAL_ERROR;
+            }
+        } else {
+            *overcurrent_ms = 0U;
+        }
+    }
+
+    return HAL_OK;
+}
+
+/* Change the static alignment voltage smoothly in 1 ms steps. */
+static HAL_StatusTypeDef foc_align_ramp(float start_voltage,
+                                        float end_voltage,
+                                        uint32_t ramp_ms,
+                                        uint32_t *overcurrent_ms)
+{
+    uint32_t step;
+
+    if (ramp_ms == 0U) {
+        foc_forward(end_voltage, 0.0f, 0.0f);
+        return foc_align_wait(1U, overcurrent_ms);
+    }
+
+    for (step = 1U; step <= ramp_ms; step++) {
+        float ratio = (float)step / (float)ramp_ms;
+        float voltage = start_voltage + ((end_voltage - start_voltage) * ratio);
+
+        foc_forward(voltage, 0.0f, 0.0f);
+        if (foc_align_wait(1U, overcurrent_ms) != HAL_OK) {
+            return HAL_ERROR;
+        }
+    }
+
+    return HAL_OK;
+}
+
 /* ========================================================================== */
-/*  Sensor alignment (from TinyFoc motor.c)                                   */
+/*  传感器对齐 (来自 TinyFoc motor.c)                                          */
 /* ========================================================================== */
 
 /**
-  * @brief  Align rotor to a known electrical angle by energizing a static
-  *         voltage vector, then record the zero-angle offset.
-  * @param  q_voltage  alignment voltage magnitude (2–4 V recommended)
+  * @brief  通过注入静态电压矢量将转子对齐到已知电角度，记录零角偏移量
+  * @retval HAL_OK 对齐完成；HAL_ERROR 对齐阶段持续过流
   */
-void foc_alignSensor(float q_voltage)
+HAL_StatusTypeDef foc_alignSensor(void)
 {
     char log_buf[128];
+    uint32_t overcurrent_ms = 0U;
+    uint8_t encoder_timer_stopped = 0U;
 	
-    /* Set flag so TIM callback does NOT overwrite PWM during alignment */
+    /* 设置标志，防止 TIM 回调在对齐期间覆盖 PWM */
     alignment_in_progress = 1;
 
-    /* Inject static voltage vector at 90° electrical to hold rotor */
-    foc_forward(q_voltage, 0.0f, 0.0f);
-    HAL_Delay(1000);
+    /* 从零开始渐升静态电压矢量，避免阶跃激发机械啸叫。 */
+    foc_forward(0.0f, 0.0f, 0.0f);
+    if (foc_align_ramp(0.0f,
+                       FOC_ALIGN_VOLTAGE_V,
+                       FOC_ALIGN_RAMP_UP_MS,
+                       &overcurrent_ms) != HAL_OK) {
+        goto alignment_failed;
+    }
 
-    /* ── Stop TIM2 encoder ISR: main thread takes exclusive encoder access ── */
+    if (foc_align_wait(FOC_ALIGN_HOLD_MS, &overcurrent_ms) != HAL_OK) {
+        goto alignment_failed;
+    }
+
+    /* Lower the holding torque before sampling the encoder zero point. */
+    if (foc_align_ramp(FOC_ALIGN_VOLTAGE_V,
+                       FOC_ALIGN_HOLD_VOLTAGE_V,
+                       FOC_ALIGN_RAMP_DOWN_MS,
+                       &overcurrent_ms) != HAL_OK) {
+        goto alignment_failed;
+    }
+
+    /* ── 停止 TIM2 编码器 ISR：主线程独占编码器访问 ── */
     HAL_TIM_Base_Stop_IT(&htim2);
+    encoder_timer_stopped = 1U;
 
-    /* Read encoder multiple times to let rotor settle */
-    AS5047P_Sensor_Update(&AngleSensor); HAL_Delay(10);
-    AS5047P_Sensor_Update(&AngleSensor); HAL_Delay(10);
-    AS5047P_Sensor_Update(&AngleSensor); HAL_Delay(100);
+    /* 多次读取编码器，等待转子稳定 */
+    AS5047P_Sensor_Update(&AngleSensor);
+    if (foc_align_wait(10U, &overcurrent_ms) != HAL_OK) {
+        goto alignment_failed;
+    }
+    AS5047P_Sensor_Update(&AngleSensor);
+    if (foc_align_wait(10U, &overcurrent_ms) != HAL_OK) {
+        goto alignment_failed;
+    }
+    AS5047P_Sensor_Update(&AngleSensor);
+    if (foc_align_wait(100U, &overcurrent_ms) != HAL_OK) {
+        goto alignment_failed;
+    }
 
-    /* Compute zero-electric-angle via averaged readings */
+    /* 通过平均多次读数计算零电角 */
     motor_control.zero_elec_angle = _calculate_zero_electric_angle();
 
-    /* ── Prime DMA pipeline and restart TIM2 encoder ISR ── */
+    /* Remove the holding voltage smoothly after zero-angle sampling. */
+    if (foc_align_ramp(FOC_ALIGN_HOLD_VOLTAGE_V,
+                       0.0f,
+                       FOC_ALIGN_RAMP_DOWN_MS,
+                       &overcurrent_ms) != HAL_OK) {
+        goto alignment_failed;
+    }
+    foc_forward(0.0f, 0.0f, 0.0f);
+
+    /* ── 启动 DMA 流水线并重启 TIM2 编码器 ISR ── */
     AS5047P_DMA_StartRequest();
     __HAL_TIM_CLEAR_IT(&htim2, TIM_IT_UPDATE);
     HAL_TIM_Base_Start_IT(&htim2);
+    encoder_timer_stopped = 0U;
 
-    /* Reset both current-loop PIDs so they start from 0V smoothly */
+    /* 重置两个电流环 PID，使其从 0V 平滑启动 */
     current_loop.integral_prev   = 0.0f;
     current_loop.output_prev     = 0.0f;
     current_loop.error_prev      = 0.0f;
-    current_loop.timestamp_prev  = dwt_get_micros();
+    current_loop.timestamp_prev_cycles  = dwt_get_cycles();
 
     id_current_loop.integral_prev   = 0.0f;
     id_current_loop.output_prev     = 0.0f;
     id_current_loop.error_prev      = 0.0f;
-    id_current_loop.timestamp_prev  = dwt_get_micros();
+    id_current_loop.timestamp_prev_cycles  = dwt_get_cycles();
 
     speed_loop.integral_prev   = 0.0f;
     speed_loop.output_prev     = 0.0f;
     speed_loop.error_prev      = 0.0f;
-    speed_loop.timestamp_prev  = dwt_get_micros();
+    speed_loop.timestamp_prev_cycles  = dwt_get_cycles();
 
-    /* Reset filter states so they don't carry stale values */
+    /* 重置滤波器状态，避免残余值干扰 */
     motor_control.id_filter_state = 0.0f;
     motor_control.iq_filter_state = 0.0f;
 
-    /* Enable current loop BEFORE clearing alignment flag —
-     * this guarantees the very next ADC ISR takes over PWM,
-     * eliminating the race where legacy SVPWM could run. */
-    current_loop_enable = 1;
-
-    /* Clear alignment flag — current loop is now in control */
+    /* Alignment is complete. main() initializes all control state before it
+     * enables the current loop, so the ADC ISR cannot race startup writes. */
     alignment_in_progress = 0;
 
     sprintf(log_buf, "[FOC] Zero elec angle = %.3f rad\r\n", motor_control.zero_elec_angle);
     UART2_SendString(log_buf);
     UART2_SendString("[FOC] Encoder Calibration Done!\r\n");
+    return HAL_OK;
+
+alignment_failed:
+    /* Remove voltage before main() disables the gate driver. */
+    foc_forward(0.0f, 0.0f, 0.0f);
+    if (encoder_timer_stopped != 0U) {
+        AS5047P_DMA_StartRequest();
+        __HAL_TIM_CLEAR_IT(&htim2, TIM_IT_UPDATE);
+        HAL_TIM_Base_Start_IT(&htim2);
+    }
+    alignment_in_progress = 0;
+    UART2_SendString("[FOC] Alignment aborted: phase current limit exceeded!\r\n");
+    return HAL_ERROR;
 }
 
 /* ========================================================================== */
-/*  Closed-loop: current control                                               */
+/*  闭环: 电流控制                                                             */
 /* ========================================================================== */
 
-/* Forward declarations for static helpers (defined after foc_current_loop)     */
+/* 静态辅助函数前向声明（在 foc_current_loop 之后定义）                          */
 static void foc_forward_cordic(float d, float q, float s_ff, float c_ff);
-static void foc_speed_loop(void);
+static void foc_cordic_sin_cos_current(float angle_el, float *s, float *c);
+static void foc_speed_loop(const encoder_cache_t *encoder);
 static void set_pwm_duty(float d_u, float d_v, float d_w);
 static int  SVM(float alpha, float beta, float *tA, float *tB, float *tC);
 
 /**
-  * @brief  Position outer loop — 1 kHz, called from TIM3 ISR.
-  *         Pure P control: speed_cmd = pos_error * pos_p_gain.
-  *         Output is hard-clamped to +/- pos_speed_limit, then written
-  *         to motor_control.set_speed for the 2 kHz speed loop.
+  * @brief  Compute current-frame CORDIC sin/cos; use the last valid result on timeout
+  */
+static void foc_cordic_sin_cos_current(float angle_el, float *s, float *c)
+{
+    float a = angle_el;
+    uint32_t poll_count = FOC_CORDIC_POLL_LIMIT;
+    /* Drain a late result left by a previous timeout before starting a new frame. */
+    if ((CORDIC->CSR & CORDIC_CSR_RRDY) != 0U) {
+        (void)CORDIC->RDATA;
+        (void)CORDIC->RDATA;
+    }
+
+
+    if (a >= PI) {
+        a -= _2PI;  /* [0, 2pi) -> [-pi, +pi) */
+    }
+
+    CORDIC->WDATA = (uint32_t)(int32_t)(a * CORDIC_Q31_PER_RAD);
+    while (((CORDIC->CSR & CORDIC_CSR_RRDY) == 0U) && (poll_count > 0U)) {
+        poll_count--;
+    }
+
+    if ((CORDIC->CSR & CORDIC_CSR_RRDY) != 0U) {
+        int32_t cos_q31 = (int32_t)CORDIC->RDATA;
+        int32_t sin_q31 = (int32_t)CORDIC->RDATA;
+
+        *c = (float)cos_q31 / 2147483648.0f;
+        *s = (float)sin_q31 / 2147483648.0f;
+        cordic_cos_cache = *c;
+        cordic_sin_cache = *s;
+    } else {
+        *c = cordic_cos_cache;
+        *s = cordic_sin_cache;
+    }
+}
+
+/**
+  * @brief  位置外环 — 1 kHz，在 TIM3 ISR 中调用
+  *         P 位置控制产生速度目标，并受最大速度、加速度和
+  *         剩余制动距离共同约束，避免大位置阶跃直接冲击速度环。
+  *         规划后的 motor_control.set_speed 供 2 kHz 速度环使用。
   *
-  *         Reads encoder_cache.total_angle_rad (TIM2 ISR, P=1).
-  *         Writes motor_control.set_speed (ADC ISR reader, P=0).
-  *         Returns immediately if mode != MOTOR_POSITION.
+  *         读取 TIM2 ISR (P=1) 发布的编码器一致性快照
+  *         写入 motor_control.set_speed (ADC ISR 读取者, P=0)
+  *         如果 mode != MOTOR_POSITION 则立即返回
   */
 void foc_position_loop(void)
 {
     if (motor_control.mode != MOTOR_POSITION) return;
 
-    /* 1. Read current multi-turn position */
-    float curr_pos  = encoder_cache.total_angle_rad;
+    /* 1. 读取当前多圈位置 */
+    encoder_cache_t encoder = {0};
+    (void)AS5047P_EncoderCache_Read(&encoder);
+    float curr_pos = encoder.total_angle_rad;
 
-    /* 2. Compute position error & pure-P speed command */
+    /* 2. P 位置控制给出期望速度 */
     float pos_error = motor_control.set_position - curr_pos;
     float speed_cmd = pos_error * motor_config.pos_p_gain;
 
-    /* 3. Hard speed-limit clamp — prevents runaway on large step */
-    float limit = motor_config.pos_speed_limit;
-    if (speed_cmd >  limit) speed_cmd =  limit;
-    if (speed_cmd < -limit) speed_cmd = -limit;
+    /* 3. 用户指定的硬速度上限 */
+    float speed_limit = motor_config.pos_speed_limit;
+    if (speed_cmd >  speed_limit) speed_cmd =  speed_limit;
+    if (speed_cmd < -speed_limit) speed_cmd = -speed_limit;
 
-    /* 4. Feed into speed loop */
-    motor_control.set_speed = speed_cmd;
+    /* 4. 按剩余距离计算可制动速度，形成梯形/三角形速度轨迹 */
+    float accel_limit = motor_config.pos_accel_limit;
+    if (!(accel_limit > 0.0f)) accel_limit = POS_ACCEL_LIMIT_DEFAULT;
+    float braking_speed = sqrtf(2.0f * accel_limit * fabsf(pos_error));
+    if (speed_cmd >  braking_speed) speed_cmd =  braking_speed;
+    if (speed_cmd < -braking_speed) speed_cmd = -braking_speed;
+
+    /* 5. 1 kHz 速度指令斜率限制，避免速度目标瞬时跳变 */
+    float max_speed_delta = accel_limit * POSITION_LOOP_DT_S;
+    float planned_speed = motor_control.set_speed;
+    if (speed_cmd > planned_speed + max_speed_delta) {
+        planned_speed += max_speed_delta;
+    } else if (speed_cmd < planned_speed - max_speed_delta) {
+        planned_speed -= max_speed_delta;
+    } else {
+        planned_speed = speed_cmd;
+    }
+
+    /* 6. 馈入速度环 */
+    motor_control.set_speed = planned_speed;
     motor_control.pos_meas  = curr_pos;
 }
 
-/**
-  * @brief  Speed (velocity) outer loop — 2 kHz, cascaded above current loop.
-  *         Computes mechanical velocity from multi-turn total angle delta,
-  *         applies LPF, runs PI controller, sets motor_control.set_torque.
-  *
-  *         Called from foc_current_loop() every 10th ADC ISR (SPEED_DECIMATION).
-  */
-static void foc_speed_loop(void)
+static float foc_select_speed_kp(float speed_ref)
 {
-    /* 1. Read current multi-turn total angle (volatile, atomic on M4) */
-    float curr_total_angle = encoder_cache.total_angle_rad;
+    if (motor_config.spd_gain_schedule == 0U) {
+        return motor_config.spd_p_gain;
+    }
 
-    /* 2. Re-init guard: capture angle, skip control this cycle.
-     *    Triggered by motor_control_parm_init() or VOFA M=1.           */
-    if (motor_control.spd_needs_init) {
-        motor_control.spd_prev_angle = curr_total_angle;
-        motor_control.vel_raw        = 0.0f;
-        motor_control.vel_meas       = 0.0f;
-        motor_control.spd_needs_init = 0;
+    float abs_speed_ref = fabsf(speed_ref);
+    if (motor_control.spd_gain_region == SPEED_GAIN_REGION_LOW_SPEED) {
+        if (abs_speed_ref >= SPEED_KP_SWITCH_UP_RAD_S) {
+            motor_control.spd_gain_region = SPEED_GAIN_REGION_HIGH_SPEED;
+        }
+    } else if (abs_speed_ref <= SPEED_KP_SWITCH_DOWN_RAD_S) {
+        motor_control.spd_gain_region = SPEED_GAIN_REGION_LOW_SPEED;
+    }
+
+    return (motor_control.spd_gain_region == SPEED_GAIN_REGION_LOW_SPEED)
+         ? motor_config.spd_p_low_speed
+         : motor_config.spd_p_high_speed;
+}
+
+static void foc_set_speed_kp_bumpless(float new_kp, float error)
+{
+    float old_kp = speed_loop.P;
+    if (fabsf(new_kp - old_kp) < 0.000001f) {
+        motor_control.spd_kp_active = old_kp;
         return;
     }
 
-    /* 3. Compute velocity from delta angle (mechanical rad/s) */
-    float delta   = curr_total_angle - motor_control.spd_prev_angle;
-    motor_control.spd_prev_angle = curr_total_angle;
-    float vel_raw = delta / SPEED_Ts;  /* SPEED_Ts = 0.0005s */
+    float integral = speed_loop.integral_prev + (old_kp - new_kp) * error;
+    if (integral >  speed_loop.limit) integral =  speed_loop.limit;
+    if (integral < -speed_loop.limit) integral = -speed_loop.limit;
 
-    /* 4. Low-pass filter velocity */
+    speed_loop.integral_prev = integral;
+    speed_loop.P = new_kp;
+    motor_control.spd_kp_active = new_kp;
+}
+
+static float foc_initial_speed_kp(float speed_ref)
+{
+    motor_control.spd_gain_region =
+        (fabsf(speed_ref) >= SPEED_KP_SWITCH_UP_RAD_S)
+        ? SPEED_GAIN_REGION_HIGH_SPEED : SPEED_GAIN_REGION_LOW_SPEED;
+    return foc_select_speed_kp(speed_ref);
+}
+
+/**
+  * @brief  速度外环 — 2 kHz，级联在电流环之上
+  *         滤波编码器的 4 ms 整数计数窗口速度，运行
+  *         PI 控制器，并设置 motor_control.set_torque
+  *
+  *         在 foc_current_loop() 中每 10 次 ADC ISR (SPEED_DECIMATION) 调用一次
+  */
+static void foc_speed_loop(const encoder_cache_t *encoder)
+{
+    /* 1. 重新初始化保护：在控制 ISR 中重置动态状态 */
+    if (motor_control.spd_needs_init) {
+        motor_control.vel_filter_state = 0.0f;
+        motor_control.vel_raw          = 0.0f;
+        motor_control.vel_meas         = 0.0f;
+        speed_loop.P = foc_initial_speed_kp(motor_control.set_speed);
+        speed_loop.I = motor_config.spd_i_gain;
+        motor_control.spd_kp_active = speed_loop.P;
+        speed_pid_reset();
+        motor_control.spd_needs_init   = 0;
+        return;
+    }
+
+    /* 2. 使用编码器的 4 ms 整数计数滑动窗口速度 */
+    float vel_raw = encoder->velocity_rad_s;
+
+    /* 3. 在 2 kHz 速度环频率下应用约 17 Hz 一阶低通滤波器 */
     float vel_filt = lowPassFilter(vel_raw, SPEED_LPF_ALPHA,
                                    &motor_control.vel_filter_state);
 
-    /* Store for telemetry */
+    /* 存储用于遥测 */
     motor_control.vel_raw  = vel_raw;
     motor_control.vel_meas = vel_filt;
 
-    /* 5. PI control: error = setpoint - measured, corrected for dir */
-    float error   = (float)motor_config.dir * (motor_control.set_speed - vel_filt);
-    float iq_ref  = PIDController_Update(&speed_loop, error);
+    /* 4. PI 控制：误差 = 目标 - 测量值，按方向修正 */
+    float error = (float)motor_config.dir * (motor_control.set_speed - vel_filt);
+    float scheduled_kp = foc_select_speed_kp(motor_control.set_speed);
+    foc_set_speed_kp_bumpless(scheduled_kp, error);
+    speed_loop.I = motor_config.spd_i_gain;
 
-    /* 6. Clamp Iq reference to motor current limit.
-     *    PIDController_Update already clamps to speed_loop.limit,
-     *    but double-clamp is defense-in-depth. */
-    if (iq_ref >  LIMIT_CURRENT) iq_ref =  LIMIT_CURRENT;
-    if (iq_ref < -LIMIT_CURRENT) iq_ref = -LIMIT_CURRENT;
+    float iq_ref = PIDController_Update(&speed_loop, error);
+
+    /* 5. 将 Iq 参考钳位到电机电流限幅值
+     *    PIDController_Update 已经钳位到 speed_loop.limit，
+     *    此处二次钳位为深度防御 */
+    float current_limit = motor_config.speed_current_limit;
+    if (iq_ref >  current_limit) iq_ref =  current_limit;
+    if (iq_ref < -current_limit) iq_ref = -current_limit;
 
     motor_control.set_torque = iq_ref;
 }
 
 /**
-  * @brief  Current (torque) loop — 20 kHz execution in ADC injection callback
+  * @brief  电流（转矩）环 — 20 kHz，在 ADC 注入回调中执行
   *
-  *          Features:
-  *            - Iq PI control (torque / speed / position outer loop)
-  *            - Id PI control → keeps Id at 0 (MTPA for SPM motors)
-  *            - Cross-coupling decoupling: Vd_ff = -ω·Lq·Iq
-  *            - Back-EMF feedforward:      Vq_ff = +ω·(Ld·Id + ψm)
-  *            - Single angle read per iteration → no drift between Park & iPark
+  *          功能:
+  *            - Iq PI 控制（转矩 / 速度 / 位置外环）
+  *            - Id PI 控制 → 保持 Id = 0（SPM 电机 MTPA）
+  *            - 交叉耦合解耦: Vd_ff = -ω·Lq·Iq
+  *            - 反电动势前馈:  Vq_ff = +ω·(Ld·Id + ψm)
+  *            - 每次迭代单次角度读取 → Park 和 iPark 之间无漂移
   */
 void foc_current_loop(void)
 {
-    /* ── 0. Speed loop decimation: run @ 2 kHz (every 10th ADC ISR) ── */
+    encoder_cache_t encoder = {0};
+    (void)AS5047P_EncoderCache_Read(&encoder);
+
+    /* ── 0. 速度环降采样: 每 10 次 ADC ISR 运行一次 @ 2 kHz ── */
     {
         static uint8_t speed_cnt = 0;
         if (motor_control.mode == MOTOR_SPEED || motor_control.mode == MOTOR_POSITION) {
             speed_cnt++;
             if (speed_cnt >= SPEED_DECIMATION) {
                 speed_cnt = 0;
-                foc_speed_loop();
+                foc_speed_loop(&encoder);
             }
         } else {
-            speed_cnt = 0;  /* hold at 0 in torque mode for clean transition */
+            speed_cnt = 0;  /* 转矩模式下保持在 0，确保干净的模式切换 */
         }
     }
 
-    /* ── 1. Read angle with linear extrapolation between 10 kHz encoder updates ── */
-    static uint32_t last_enc_update = 0;
-    float angle_mech = encoder_cache.angle_raw;
-    if (encoder_cache.update_count == last_enc_update) {
-        /* Same encoder sample as last frame — extrapolate 50 µs (one 20 kHz period) */
-        angle_mech += encoder_cache.velocity_rad_s * 10e-6f;
+    /* ── 1. 按 DMA 实际采样时刻，将编码器角度预测到当前电流帧 ── */
+    float angle_mech = encoder.angle_raw;
+    uint32_t angle_age_cycles = dwt_get_cycles() - encoder.sample_cycle;
+    float angle_age_s = dwt_cycles_to_seconds(angle_age_cycles);
+    if (angle_age_s > FOC_ENCODER_PREDICTION_MAX_S) {
+        angle_age_s = FOC_ENCODER_PREDICTION_MAX_S;
     }
-    last_enc_update = encoder_cache.update_count;
+    angle_mech += encoder.velocity_rad_s * angle_age_s;
 
     float angle_el = (float)(motor_config.dir * motor_config.pairs)
                      * angle_mech
                      - motor_control.zero_elec_angle;
     angle_el = _normalizeAngle(angle_el);
-    float elec_vel = _electricalVelocity();  /* velocity still from TIM2 ISR cache */
+    float elec_vel = (float)(motor_config.dir * motor_config.pairs)
+                     * encoder.velocity_rad_s;
 
-    /* ── 0. Kick CORDIC: write angle_el Q31 → hw starts sin/cos for NEXT frame ── */
-    {
-        float a = angle_el;
-        if (a >= PI) { a -= _2PI; }   /* [0,2π) → [-π,+π) for CORDIC */
-        CORDIC->WDATA = (uint32_t)(int32_t)(a * CORDIC_Q31_PER_RAD);
-    }
+    /* ── 0. 当前帧 CORDIC: 写入 angle_el 并立即短轮询读取 sin/cos ── */
+    float s;
+    float c;
+    foc_cordic_sin_cos_current(angle_el, &s, &c);
 
-    /* ── 2. Clarke + Park: compute Id & Iq from B,C phase currents ── */
+    /* ── 2. Clarke + Park: 从 B、C 相电流计算 Id & Iq ── */
     float I_alpha = -(motor_control.IphB + motor_control.IphC);
     float I_beta  = _1_SQRT3 * (motor_control.IphB - motor_control.IphC);
-    float s = cordic_sin_cache;   /* from previous-frame CORDIC */
-    float c = cordic_cos_cache;
     float I_d_raw = I_alpha * c + I_beta * s;
     float I_q_raw = I_beta  * c - I_alpha * s;
 
-    /* ── 3. Low-pass filter both axes, alpha=0.3 → fc≈480Hz @ 10kHz ── */
+    /* ── 3. 双轴低通滤波, alpha=0.05 → fc≈163Hz @ 20kHz ── */
     motor_control.id_meas = lowPassFilter(I_d_raw, 0.05f, &motor_control.id_filter_state);
     motor_control.iq_meas = lowPassFilter(I_q_raw, 0.05f, &motor_control.iq_filter_state);
 		
-    /* ── 4. Cross-coupling + back-EMF feedforward ── */
+    /* ── 4. 交叉耦合 + 反电动势前馈 ── */
     /*     Vd = Rs·Id + Ld·dId/dt - ω·Lq·Iq   →   Vd_ff = -ω·Lq·Iq            */
     /*     Vq = Rs·Iq + Lq·dIq/dt + ω·(Ld·Id+ψm) → Vq_ff = +ω·(Ld·Id+ψm)      */
     float Vd_ff = 0.0f;
     float Vq_ff = 0.0f;
-    if (fabsf(elec_vel) > 1000.0f) {
-        Vd_ff = -elec_vel * MOTOR_Lq * motor_control.iq_meas;
-        Vq_ff =  elec_vel * (MOTOR_Ld * motor_control.id_meas + MOTOR_FLUX);
+#if FOC_FEEDFORWARD_ENABLE
+    float ff_blend = 0.0f;
+    float abs_elec_vel = fabsf(elec_vel);
+    if (abs_elec_vel >= FF_FULL_ELEC_RAD_S) {
+        ff_blend = 1.0f;
+    } else if (abs_elec_vel > FF_START_ELEC_RAD_S &&
+               FF_FULL_ELEC_RAD_S > FF_START_ELEC_RAD_S) {
+        float x = (abs_elec_vel - FF_START_ELEC_RAD_S)
+                / (FF_FULL_ELEC_RAD_S - FF_START_ELEC_RAD_S);
+        ff_blend = x * x * (3.0f - 2.0f * x);
+    }
+    Vd_ff = ff_blend * (-elec_vel * MOTOR_Lq * motor_control.iq_meas);
+    Vq_ff = ff_blend * ( elec_vel * (MOTOR_Ld * motor_control.id_meas + MOTOR_FLUX));
+#endif
+
+    /* ── 5. 调节前限制 dq 电流参考矢量 ── */
+    float iq_target = motor_control.set_torque;
+    float id_target = motor_control.id_target;
+    float current_limit = motor_config.speed_current_limit;
+    float current_ref_sq = iq_target * iq_target + id_target * id_target;
+    float current_limit_sq = current_limit * current_limit;
+    if (current_ref_sq > current_limit_sq && current_ref_sq > 0.0f) {
+        float scale = current_limit / sqrtf(current_ref_sq);
+        iq_target *= scale;
+        id_target *= scale;
     }
 
-    /* ── 5. Iq error — source depends on control mode ── */
-    float error_q = motor_control.set_torque - motor_control.iq_meas;
+    float error_q = iq_target - motor_control.iq_meas;
 
-    /* ── 6. Id error — regulate to id_target (default 0 for SPM motors) ── */
-    float error_d = motor_control.id_target - motor_control.id_meas;
+    /* ── 6. Id 误差 — 调节到限幅后的 id_target ── */
+    float error_d = id_target - motor_control.id_meas;
 
-    /* ── 7. Dead-band (Iq only — Id needs continuous regulation) ── */
+    /* ── 7. 死区 (仅 Iq — Id 需要连续调节) ── */
 		/*
     if (fabsf(error_q) <= 0.00f) {
         error_q = 0.0f;
@@ -531,17 +864,23 @@ void foc_current_loop(void)
         error_d = 0.0f;
     }
     */
-    /* ── 8. PI controllers ── */
+    /* ── 8. PI 控制器 ── */
     float Vd_pi = PIDController_Update(&id_current_loop, error_d);
     float Vq_pi = PIDController_Update(&current_loop,    error_q);
 
-    /* ── 9. Combine PI output + feedforward ── */
+    /* ── 9. 合并 PI 输出 + 前馈 ── */
     float Vd = Vd_pi + Vd_ff;
     float Vq = Vq_pi + Vq_ff;
+    float Vd_requested = Vd;
+    float Vq_requested = Vq;
 
-    /* ── 10. Saturation — respect SVM linear modulation limit ── */
+    /* ── 10. 饱和处理 — 遵守 SVM 线性调制限幅 ── */
     float mod_to_V  = (2.0f / 3.0f) * motor_config.voltage_supply;
-    float V_limit   = mod_to_V * SQRT3_BY_2;   /* SVM inscribed circle       */
+    float hardware_V_limit = mod_to_V * SQRT3_BY_2;
+    float V_limit = motor_config.current_voltage_limit;
+    if (V_limit > hardware_V_limit || V_limit <= 0.0f) {
+        V_limit = hardware_V_limit;
+    }
     float V_mag     = sqrtf(Vd * Vd + Vq * Vq);
     if (V_mag > V_limit) {
         float scale = V_limit / V_mag;
@@ -549,47 +888,54 @@ void foc_current_loop(void)
         Vq *= scale;
     }
 
-    motor_control.id_set = Vd;   /* for debug telemetry                      */
-    motor_control.iq_set = Vq;   /* for debug telemetry                      */
+    motor_control.id_set = Vd;   /* 用于调试遥测                             */
+    motor_control.iq_set = Vq;   /* 用于调试遥测                             */
 
-    /* ── 11. Inverse Park with cached sin/cos (same prev-frame angle).
-     *        No feed-forward compensation — 50 µs pipeline delay dominates
-     *        the 1.6·Ts intra-frame computational delay. PI compensates.  ── */
-    foc_forward_cordic(Vd, Vq, cordic_sin_cache, cordic_cos_cache);
+    /* Track final coupled dq saturation, including feed-forward voltage. */
+    if (Vd != Vd_requested || Vq != Vq_requested) {
+        PIDController_ApplyTracking(&id_current_loop, Vd - Vd_requested,
+                                    CURRENT_VECTOR_AW_GAIN_DEFAULT);
+        PIDController_ApplyTracking(&current_loop, Vq - Vq_requested,
+                                    CURRENT_VECTOR_AW_GAIN_DEFAULT);
+    }
+
+    /* ── 11. 使用同一当前帧的 sin/cos 做逆 Park 变换 ── */
+    foc_forward_cordic(Vd, Vq, s, c);
 }
 
 /* ========================================================================== */
-/*  CORDIC-accelerated forward path — pre-computed sin/cos → SVM → PWM        */
-/*  Replaces foc_forward() on the closed-loop hot path.                        */
+/*  CORDIC 加速前向通道 — 预计算 sin/cos → SVM → PWM                          */
+/*  在闭环热路径上替代 foc_forward()                                           */
 /* ========================================================================== */
 static void foc_forward_cordic(float d, float q, float s_ff, float c_ff)
 {
     float d_u = 0.0f, d_v = 0.0f, d_w = 0.0f;
 
-    /* Scale voltage commands to modulation index */
+    /* 将电压指令缩放为调制指数 */
     float mod_to_V  = (2.0f / 3.0f) * motor_config.voltage_supply;
     float V_to_mod  = 1.0f / mod_to_V;
     float mod_d     = V_to_mod * d;
     float mod_q     = V_to_mod * q;
     motor_control.mod_q = mod_q;
 
-    /* Inverse Park — use caller-supplied sin/cos */
+    motor_control.mod_d = mod_d;
+    /* 逆 Park 变换 — 使用调用者提供的 sin/cos */
     float mod_alpha = mod_d * c_ff - mod_q * s_ff;
     float mod_beta  = mod_d * s_ff + mod_q * c_ff;
 
-    /* SVM → duty cycles */
+    /* SVM → 占空比 */
     SVM(mod_alpha, mod_beta, &d_u, &d_v, &d_w);
 
-    /* Write to PWM registers */
+    /* 写入 PWM 寄存器 */
     set_pwm_duty(d_u, d_v, d_w);
 }
 
 /* ========================================================================== */
-/*  SVPWM forward path — d,q → duty cycles → PWM (from TinyFoc foc.c)         */
+/*  SVPWM 前向通道 — d,q → 占空比 → PWM (来自 TinyFoc foc.c)                  */
 /* ========================================================================== */
 
 /**
-  * @brief  Write PWM duty cycles to TIM1 CCR registers
+  * @brief  将 PWM 占空比写入 TIM1 CCR 寄存器
   */
 static void set_pwm_duty(float d_u, float d_v, float d_w)
 {
@@ -607,8 +953,8 @@ static void set_pwm_duty(float d_u, float d_v, float d_w)
 }
 
 /**
-  * @brief  Space-Vector Modulation — convert α,β to 3-phase duty cycles
-  * @return 0 on success, -1 if invalid sector
+  * @brief  空间矢量调制 — 将 α,β 转换为三相占空比
+  * @return 成功返回 0，无效扇区返回 -1
   */
 static int SVM(float alpha, float beta, float *tA, float *tB, float *tC)
 {
@@ -693,34 +1039,35 @@ static int SVM(float alpha, float beta, float *tA, float *tB, float *tC)
 }
 
 /**
-  * @brief  Closed-loop FOC forward path: d,q voltage → inverse Park → SVM → PWM
+  * @brief  闭环 FOC 前向通道: d,q 电压 → 逆 Park 变换 → SVM → PWM
   *
-  * @param  d        d-axis voltage command
-  * @param  q        q-axis voltage command
-  * @param  angle_el electrical angle [rad]
+  * @param  d        d 轴电压指令
+  * @param  q        q 轴电压指令
+  * @param  angle_el 电角度 [rad]
   */
 void foc_forward(float d, float q, float angle_el)
 {
     float d_u = 0.0f, d_v = 0.0f, d_w = 0.0f;
 
-    /* Scale voltage commands to modulation index.
-     * Saturation already done in foc_current_loop() — single-point limit,
-     * no redundant clamp here. */
+    /* 将电压指令缩放为调制指数
+     * 饱和处理已在 foc_current_loop() 中完成 — 单点限幅，
+     * 此处无需重复钳位 */
     float mod_to_V  = (2.0f / 3.0f) * motor_config.voltage_supply;
     float V_to_mod  = 1.0f / mod_to_V;
     float mod_d     = V_to_mod * d;
     float mod_q     = V_to_mod * q;
     motor_control.mod_q = mod_q;
 
-    /* Inverse Park transform */
+    motor_control.mod_d = mod_d;
+    /* 逆 Park 变换 */
     float s, c;
     arm_sin_cos_f32(angle_el * RAD_TO_DEG, &s, &c);
     float mod_alpha = mod_d * c - mod_q * s;
     float mod_beta  = mod_d * s + mod_q * c;
 
-    /* SVM → duty cycles */
+    /* SVM → 占空比 */
     SVM(mod_alpha, mod_beta, &d_u, &d_v, &d_w);
 
-    /* Write to PWM registers */
+    /* 写入 PWM 寄存器 */
     set_pwm_duty(d_u, d_v, d_w);
 }

@@ -57,17 +57,17 @@ TX (PC -> MCU):  ASCII commands terminated by \\n
     "M=0\\n"          set torque mode
 
 RX (MCU -> PC):  100 Hz telemetry in VOFA+ JustFloat format
-    "channels: f0,f1,...,f13\\n"
-    14 comma-separated floats after "channels: " prefix.
+    "channels: f0,f1,...,f9\\n"
+    10 comma-separated floats after "channels: " prefix.
 
     Index mapping:
-      0: id_target      5: vq_cmd        10: position_sp
-      1: id_meas        6: velocity      11: pos_meas
-      2: iq_target      7: status_flag   12: raw_adc_a
-      3: iq_meas        8: speed_sp      13: raw_adc_c
-      4: vd_cmd         9: mode
+      0: id_target      5: status_flag
+      1: id_meas        6: speed_sp
+      2: iq_target      7: position_sp
+      3: iq_meas        8: pos_meas
+      4: velocity       9: mode
 
-Step sync: status_flag (index 7) is set to 1 on command reception,
+Step sync: status_flag (index 5) is set to 1 on command reception,
 then cleared to 0 on next telemetry TX.  Python watches this flag
 to confirm command delivery.
 """
@@ -86,16 +86,12 @@ class SerialInterface:
     IDX_ID_MEAS     = 1
     IDX_IQ_TARGET   = 2
     IDX_IQ_MEAS     = 3
-    IDX_VD_CMD      = 4
-    IDX_VQ_CMD      = 5
-    IDX_VELOCITY    = 6
-    IDX_STATUS_FLAG = 7
-    IDX_SPEED_SP    = 8
+    IDX_VELOCITY    = 4
+    IDX_STATUS_FLAG = 5
+    IDX_SPEED_SP    = 6
+    IDX_POSITION_SP = 7
+    IDX_POS_MEAS    = 8
     IDX_MODE        = 9
-    IDX_POSITION_SP = 10
-    IDX_POS_MEAS    = 11
-    IDX_RAW_ADC_A   = 12
-    IDX_RAW_ADC_C   = 13
 
     def __init__(self, port: str, baud: int = 115200):
         self.port = port
@@ -170,14 +166,14 @@ class SerialInterface:
             if not line.startswith("channels:"):
                 continue
 
-            # Parse "channels: f0,f1,...,f13"
+            # Parse "channels: f0,f1,...,f9"
             payload = line[len("channels:"):]
             parts = payload.split(",")
-            if len(parts) < 14:
+            if len(parts) < 10:
                 continue
 
             values = []
-            for p in parts[:14]:
+            for p in parts[:10]:
                 try:
                     values.append(float(p))
                 except ValueError:
@@ -188,16 +184,12 @@ class SerialInterface:
                 "id_meas":     values[1],
                 "iq_target":   values[2],
                 "iq_meas":     values[3],
-                "vd_cmd":      values[4],
-                "vq_cmd":      values[5],
-                "velocity":    values[6],
-                "status_flag": int(values[7]),
-                "speed_sp":    values[8],
+                "velocity":    values[4],
+                "status_flag": int(values[5]),
+                "speed_sp":    values[6],
+                "position_sp": values[7],
+                "pos_meas":    values[8],
                 "mode":        int(values[9]),
-                "position_sp": values[10],
-                "pos_meas":    values[11],
-                "raw_adc_a":   values[12],
-                "raw_adc_c":   values[13],
             }
 
         return None

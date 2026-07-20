@@ -1,7 +1,7 @@
 /**
   ******************************************************************************
   * @file    utils.c
-  * @brief   FOC utility implementations
+  * @brief   FOC 工具函数实现
   ******************************************************************************
   */
 
@@ -10,12 +10,12 @@
 #include <math.h>
 #include "arm_math.h"
 
-/* Private variables ---------------------------------------------------------*/
+/* 私有变量 ---------------------------------------------------------*/
 static uint32_t cpu_freq_mhz = 0;
 
 /* --------------------------------------------------------------------------*/
 /**
-  * @brief  Initialize DWT cycle counter for microsecond timing
+  * @brief  初始化 DWT 周期计数器，用于微秒级计时
   */
 void DWT_Init(void)
 {
@@ -26,19 +26,36 @@ void DWT_Init(void)
 }
 
 /**
-  * @brief  Get elapsed microseconds since DWT_Init (wraps ~70s on 170MHz)
+  * @brief  读取原始 32 位 DWT 周期计数值
   */
-unsigned long dwt_get_micros(void)
+uint32_t dwt_get_cycles(void)
 {
-    return DWT->CYCCNT / cpu_freq_mhz;
+    return DWT->CYCCNT;
 }
 
 /**
-  * @brief  First-order low-pass filter (instance-based)
-  * @param  new_val  new sample
-  * @param  alpha    smoothing factor (0～1, smaller = more filtering)
-  * @param  state    pointer to persistent filter state variable
-  * @retval filtered value
+  * @brief  将 DWT 周期差值（无符号）转换为秒
+  */
+float dwt_cycles_to_seconds(uint32_t cycles)
+{
+    return (float)cycles / (float)SystemCoreClock;
+}
+
+/**
+  * @brief  获取自 DWT_Init 以来的短期微秒级时间
+  * @note   跨溢出场景下建议直接使用原始周期差值
+  */
+unsigned long dwt_get_micros(void)
+{
+    return dwt_get_cycles() / cpu_freq_mhz;
+}
+
+/**
+  * @brief  一阶低通滤波器（实例化接口）
+  * @param  new_val  新采样值
+  * @param  alpha    平滑系数（0～1，越小滤波越强）
+  * @param  state    指向持久化滤波状态的指针
+  * @retval 滤波后的值
   */
 float lowPassFilter(float new_val, float alpha, float *state)
 {
@@ -47,7 +64,7 @@ float lowPassFilter(float new_val, float alpha, float *state)
 }
 
 /**
-  * @brief  Normalize angle to [0, 2*PI)
+  * @brief  将角度归一化到 [0, 2*PI) 范围
   */
 float _normalizeAngle(float angle)
 {

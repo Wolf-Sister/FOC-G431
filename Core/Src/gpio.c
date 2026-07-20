@@ -58,7 +58,7 @@ void MX_GPIO_Init(void)
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, NSLEEP_Pin|NRESET_Pin|DRV_EN1_Pin|DRV_EN2_Pin
-                          |DRV_EN3_Pin, GPIO_PIN_SET);
+                          |DRV_EN3_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;

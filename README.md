@@ -8,25 +8,24 @@
 
 ## 项目简介
 
-**FOC_v1** 是一个基于 STM32G431CBT6 微控制器的嵌入式无刷直流电机磁场定向控制 (FOC) 项目。使用 14 位 AS5047P 磁旋转编码器进行位置反馈，双 ADC 进行相电流采样，实现完整电流闭环 FOC 控制，同时通过 USART2 DMA 与上位机 VOFA+ 进行实时数据交互。
-
-项目移植并融合了 TinyFoc 的核心算法，在此基础上加入了去耦前馈补偿、VOFA+ 协议通信、Python 上位机调参等实用功能。
+**FOC_v1** 是一个基于 STM32G431CBT6 微控制器的嵌入式无刷直流电机磁场定向控制 (FOC) 项目。使用 14 位 AS5047P 磁旋转编码器进行位置反馈，双 ADC 进行相电流采样，硬件 CORDIC 加速三角函数计算，实现完整的三环级联 FOC 控制（位置环 → 速度环 → 电流环），同时通过 USART2 DMA 与上位机 VOFA+ 进行实时数据交互与在线调参。
 
 ### 主要特性
 
-- **主控**: STM32G431CBT6 (ARM Cortex-M4, 170 MHz, FPU)
-- **位置传感器**: AS5047P 14 位磁旋转编码器 (SPI1 + DMA，非阻塞流水线读取)
-- **电流采样**: 双 ADC (ADC1 + ADC2) 同步注入采样，自动零点校准
+- **主控**: STM32G431CBT6 (ARM Cortex-M4, 170 MHz, FPU, 硬件 CORDIC)
+- **位置传感器**: AS5047P 14 位磁旋转编码器 (SPI1 + DMA，非阻塞流水线读取，多圈累积)
+- **电流采样**: 双 ADC (ADC1 + ADC2) 同步注入采样，自动零点校准 (2000 样本)
 - **控制算法**:
   - Clarke + Park 变换，SVPWM 空间矢量调制
-  - Iq/Id 双轴 PI 闭环控制（Tustin 离散化 + 抗饱和 + 输出斜率限制）
-  - 交叉解耦 + 反电动势前馈补偿
-  - 12 扇区 SVM 线性调制
+  - 三环级联控制：位置环 (1 kHz P 控制) → 速度环 (2 kHz PI 控制) → 电流环 (20 kHz Iq/Id PI)
+  - Iq/Id 双轴 PI 闭环控制（Tustin 离散化 + 双向抗饱和 + 输出斜率限制）
+  - 交叉解耦 + 反电动势前馈补偿 (>1000 rad/s 时自动启用)
+  - CORDIC 硬件加速 sin/cos 计算，一个 PWM 周期的流水线角度补偿
 - **电机驱动**: TIM1 3 相互补 PWM，兼容 DRV8313 驱动芯片
-- **传感器对准**: 自动零电角度校准流程
-- **上位机通信**: VOFA+ JustFloat 协议发送遥测数据，文本命令接收控制参数
-- **环路频率**: PWM / 电流环 20 kHz，遥测 10 Hz
-- **Python 工具**: `foc_auto_tuner.py` 自动扫参 / 阶跃响应分析 / PID 调优
+- **传感器对准**: 自动零电角度校准流程（静态电压矢量锁定 + 平均采样）
+- **上位机通信**: VOFA+ JustFloat 协议发送 10 通道遥测数据，文本命令在线调整全部参数
+- **环路频率**: PWM/电流环 20 kHz，速度环 2 kHz，位置环 1 kHz，遥测 10 Hz
+- **编码器接口**: 双缓冲无锁缓存 (TIM2 ISR 写入, FOC 电流环读取)，10 kHz 固定速率滑动窗口速度估算
 
 ---
 
@@ -52,35 +51,38 @@ FOC_v1/
 │   ├── Inc/                       # 应用层头文件
 │   │   ├── main.h                 # 主程序配置
 │   │   ├── foc.h                  # FOC 核心 — SVPWM、电流环、传感器对准
-│   │   ├── pid.h                  # PID 控制器 — Tustin 积分器 + 输出限幅
+│   │   ├── pid.h                  # PID 控制器 — Tustin 积分器 + 输出限幅 + 默认参数
 │   │   ├── vofa.h                 # VOFA+ JustFloat 遥测 + 命令接收
 │   │   ├── utils.h                # 工具函数 — DWT 微秒计时、LPF、角度归一化
 │   │   ├── as5047p.h              # AS5047P 编码器 SPI+DMA 底层驱动
-│   │   ├── as5047p_ext.h          # AS5047P 高层接口 (角度/速度/多圈累计)
-│   │   ├── adc.h                  # ADC 配置
-│   │   ├── dma.h                  # DMA 配置
-│   │   ├── spi.h                  # SPI 配置
-│   │   ├── tim.h                  # 定时器/PWM 配置
-│   │   ├── usart.h                # 串口配置
-│   │   ├── gpio.h                 # GPIO 引脚定义
-│   │   └── stm32g4xx_hal_conf.h   # HAL 模块配置
+│   │   ├── as5047p_ext.h          # AS5047P 高层接口 (角度/速度/多圈累积)
+│   │   ├── cordic.h               # CORDIC 硬件加速器配置 (CubeMX)
+│   │   ├── adc.h                  # ADC 配置 (CubeMX)
+│   │   ├── dma.h                  # DMA 配置 (CubeMX)
+│   │   ├── spi.h                  # SPI 配置 (CubeMX)
+│   │   ├── tim.h                  # 定时器/PWM 配置 (CubeMX)
+│   │   ├── usart.h                # 串口配置 (CubeMX)
+│   │   ├── gpio.h                 # GPIO 引脚定义 (CubeMX)
+│   │   ├── stm32g4xx_it.h         # 中断服务函数声明 (CubeMX)
+│   │   └── stm32g4xx_hal_conf.h   # HAL 模块配置 (CubeMX)
 │   └── Src/                       # 应用层源码
-│       ├── main.c                 # 主循环 + 状态机 + ADC 中断回调
-│       ├── foc.c                  # FOC 算法：Clarke/Park、PI、前馈、SVPWM
-│       ├── pid.c                  # PID 控制器实现
-│       ├── vofa.c                 # VOFA+ 协议：遥测发送 + 命令解析
+│       ├── main.c                 # 主循环 + 状态机 + ADC 中断回调 + 遥测
+│       ├── foc.c                  # FOC 算法：Clarke/Park、三环控制、前馈、SVPWM
+│       ├── pid.c                  # PID 控制器实现 + 参数初始化
+│       ├── vofa.c                 # VOFA+ 协议：遥测发送 + 16 键命令解析
 │       ├── utils.c                # 工具函数实现
-│       ├── as5047p.c              # AS5047P SPI+DMA 驱动
-│       ├── as5047p_ext.c          # AS5047P 高层接口实现
-│       ├── adc.c                  # ADC 初始化
-│       ├── dma.c                  # DMA 初始化与回调
-│       ├── spi.c                  # SPI 初始化
-│       ├── tim.c                  # 定时器/PWM 初始化
-│       ├── usart.c                # 串口初始化
-│       ├── gpio.c                 # GPIO 初始化
+│       ├── as5047p.c              # AS5047P SPI+DMA 驱动 (临界区保护)
+│       ├── as5047p_ext.c          # AS5047P 高层接口：速度窗口/多圈/编码器缓存
+│       ├── cordic.c               # CORDIC 硬件初始化 (CubeMX)
+│       ├── adc.c                  # ADC 初始化 (CubeMX)
+│       ├── dma.c                  # DMA 初始化与回调 (CubeMX)
+│       ├── spi.c                  # SPI 初始化 (CubeMX)
+│       ├── tim.c                  # 定时器/PWM 初始化 (CubeMX)
+│       ├── usart.c                # 串口初始化 (CubeMX)
+│       ├── gpio.c                 # GPIO 初始化 (CubeMX)
 │       ├── system_stm32g4xx.c     # 系统时钟初始化 (170 MHz)
-│       ├── stm32g4xx_hal_msp.c    # HAL MSP 层
-│       └── stm32g4xx_it.c         # 中断服务函数
+│       ├── stm32g4xx_hal_msp.c    # HAL MSP 层 (CubeMX)
+│       └── stm32g4xx_it.c         # 中断服务函数 (CubeMX)
 ├── Drivers/
 │   ├── CMSIS/                     # ARM CMSIS 核心 + 设备支持
 │   └── STM32G4xx_HAL_Driver/      # STM32G4 HAL 驱动库
@@ -88,7 +90,6 @@ FOC_v1/
 │   ├── FOC_v1.uvprojx             # Keil uVision 工程文件
 │   ├── FOC_v1.uvoptx              # Keil 工程选项
 │   └── startup_stm32g431xx.s      # 启动汇编文件 (向量表)
-├── TinyFoc-main/                  # 参考：TinyFoc 原始实现 (STM32F401)
 ├── .gitignore
 └── README.md
 ```
@@ -121,84 +122,107 @@ FOC_v1/
 
 连接 USART2 (PA15 RX, PB3 TX)，波特率 **115200**：
 
-- **遥测接收**: 打开 VOFA+，选择 JustFloat 协议，添加 8 通道数据显示
+- **遥测接收**: 打开 VOFA+，选择 JustFloat 协议，添加 10 通道数据显示
 - **命令发送**: 在 VOFA+ 终端输入文本命令，格式为逗号分隔的键值对
 
-支持的遥测通道:
+支持的遥测通道 (12 通道):
 
-通道 | 变量         | 说明
-------|-------------|------------------
-[0]   | id_target   | D 轴目标电流 (A)
-[1]   | id_meas     | D 轴实测电流 (A)
-[2]   | iq_target   | Q 轴目标电流 (A)
-[3]   | iq_meas     | Q 轴实测电流 (A)
-[4]   | vd_cmd      | D 轴电压指令 (V)
-[5]   | vq_cmd      | Q 轴电压指令 (V)
-[6]   | vbus        | 母线电压 (V)
-[7]   | status_flag | 步进同步标志
+通道    | 变量              | 说明
+--------|-------------------|------------------
+[0]     | id_target         | D 轴目标电流 (A)
+[1]     | id_meas           | D 轴实测电流 (A)
+[2]     | iq_target         | Q 轴目标电流 / 转矩指令 (A)
+[3]     | iq_meas           | Q 轴实测电流 (A)
+[4]     | velocity_raw      | 80 点滑窗原始速度 (rad/s)
+[5]     | velocity_filt     | 速度 PI 使用的滤波速度 (rad/s)
+[6]     | set_speed         | 速度目标值 (rad/s)
+[7]     | speed_kp_active   | 当前调度的速度环 P 增益
+[8]     | status_flag       | 命令同步标志
+[9]     | mode              | 控制模式 (0=转矩, 1=速度, 2=位置)
+[10]    | set_position      | 绝对多圈位置目标 (rad)
+[11]    | pos_meas          | 多圈位置实测值 (rad)
 
-支持的命令:
+支持的命令 (21 键):
 
-命令 | 说明            | 示例
------|----------------|--------
-T=V  | 扭矩/电流指令 (A) | `T=0.5`
-D=V  | D 轴电流目标 (A)  | `D=0.0`
-P=V  | Q 轴 P 增益      | `P=1.5`
-I=V  | Q 轴 I 增益      | `I=200`
-DP=V | D 轴 P 增益      | `DP=1.5`
-DI=V | D 轴 I 增益      | `DI=200`
+命令  | 说明                        | 示例
+------|-----------------------------|--------
+T=V   | 转矩 / Iq 电流指令 (A)      | `T=0.5`
+D=V   | D 轴电流目标 (A)            | `D=0.0`
+P=V   | Q 轴电流环 P 增益           | `P=1.5`
+I=V   | Q 轴电流环 I 增益           | `I=200`
+DP=V  | D 轴电流环 P 增益           | `DP=1.5`
+DI=V  | D 轴电流环 I 增益           | `DI=200`
+S=V   | 速度目标值 (rad/s)          | `S=50`
+SP=V  | 手动速度环 P；同时关闭调度    | `SP=0.09`
+SI=V  | 速度环 I 增益               | `SI=0.10`
+SG=V  | 速度增益调度开关 (0/1)       | `SG=1`
+SPL=V | 调度低速区 P 增益            | `SPL=0.09`
+SPH=V | 调度高速区 P 增益           | `SPH=0.02`
+PS=V  | 位置目标值 (多圈 rad)       | `PS=6.28`
+PR=V  | 从当前位置开始的相对位移，单次限幅 ±2π rad | `PR=0.5`
+PP=V  | 位置环 P 增益               | `PP=10`
+PL=V  | 位置环速度硬限幅 (rad/s)    | `PL=50`
+CVL=V | 电流环电压矢量限幅 (V)      | `CVL=6`
+SIL=V | 速度环电流限幅 (A)          | `SIL=0.6`
+PSL=V | 位置环速度硬限幅 (rad/s)    | `PSL=50`
+PAL=V | 位置轨迹加减速度 (rad/s^2)  | `PAL=20`
+M=V   | 控制模式 (0=转矩,1=速度,2=位置) | `M=1`
+
+示例: `M=2,PR=6.28,PP=10,PSL=50,PAL=20,SIL=0.6` — 从当前位置移动 1 圈，硬限速 50 rad/s，并自动按制动距离减速
 
 ---
 
 ## 控制架构
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │           foc_current_loop() @ 20kHz     │
-                    │                                          │
-  set_torque ──►[+]──►[ PI Iq ]──►[+]──►[ 饱和 ]──┐          │
-                 ▲                  ▲                │          │
-                 │ iq_meas          │ Vq_ff          │          │
-                 │                  │                │          │
-  id_target  ──►[+]──►[ PI Id ]──►[+]──►[ 饱和 ]──┐│          │
-                 ▲                  ▲              ││          │
-                 │ id_meas          │ Vd_ff        ││          │
-                 │                  │              ││          │
-            ┌────┴────┐      ┌──────┴──────┐      ││          │
-            │ 低通滤波  │      │ 前馈补偿     │      ││          │
-            │ α=0.05   │      │ -ωLq·Iq     │      ││          │
-            │          │      │ +ω(Ld·Id+ψ) │      ││          │
-            └────▲─────┘      └──────▲──────┘      ││          │
-                 │                    │             ││          │
-            ┌────┴────┐        ┌─────┴─────┐       ││          │
-            │ Park    │        │ 电角速度   │       ││          │
-            │ Iα,Iβ→dq│        │ _elecVel()│       ││          │
-            └────▲─────┘        └─────▲─────┘       ││          │
-                 │                     │             ││          │
-            ┌────┴────┐         ┌──────┴──────┐     ││          │
-            │ Clarke  │         │ 编码器       │     ││          │
-            │ Ib,Ic→αβ│         │ AS5047P     │     ││          │
-            └────▲─────┘         └────────────┘     ││          │
-                 │                                   ││          │
-            ┌────┴────┐                              ││          │
-            │ 双ADC    │                              ││          │
-            │ A,B,C相 │                              ││          │
-            └─────────┘                              ││          │
-                                                     ▼▼          │
-                                               ┌──────────┐     │
-                                               │ 反Park   │◄────┘
-                                               │ Vd,Vq→αβ │
-                                               └────┬─────┘
-                                                    │
-                                               ┌────┴─────┐
-                                               │  SVM     │
-                                               │  αβ→占空比│
-                                               └────┬─────┘
-                                                    │
-                                               ┌────┴─────┐
-                                               │ TIM1 PWM │
-                                               │ 3相输出   │
-                                               └──────────┘
+  位置外环 (1 kHz, TIM3)      速度外环 (2 kHz, 降采样)      电流内环 (20 kHz, ADC ISR)
+  ┌─────────────────────┐   ┌──────────────────────┐   ┌────────────────────────────┐
+  │ pos_setpoint        │   │ speed_setpoint       │   │                            │
+  │     │               │   │     │                │   │  ┌───────────────────────┐ │
+  │  ┌──▼───┐           │   │  ┌──▼───┐            │   │  │ CORDIC 硬件 sin/cos   │ │
+  │  │ P 控制│──speed_cmd┼──►│ PI 控制│──Iq_cmd────┼──►│  │ (Q31 写入, 下帧读取)    │ │
+  │  └──────┘           │   │ └──────┘            │   │  └───────────────────────┘ │
+  │     ▲               │   │     ▲               │   │                            │
+  │     │ pos_meas      │   │     │ vel_filt      │   │  Iq_cmd──►[PI Iq]──►[+]──┐ │
+  └─────┼───────────────┘   └─────┼───────────────┘   │            ▲        ▲    │ │
+        │                         │                   │   iq_meas  │  Vq_ff │    │ │
+        │                         │                   │            │        │    │ │
+  ┌─────┴─────────────────────────┴───────────────────┴────────────┴────────┴────┴─┴─┐
+  │                            编码器双缓冲缓存 (TIM2 ISR)                             │
+  │  单圈角度 [0,2π)  ·  滑动窗口速度 [rad/s]  ·  多圈累积总角度 [rad]               │
+  └────────────────────────────┬──────────────────────────────────────────────────────┘
+                               │
+  ┌────────────────────────────┴──────────────────────────────────────────────────────┐
+  │  AS5047P SPI+DMA (10 kHz)    │  双 ADC 注入采样    │  交叉解耦+反电动势前馈        │
+  │  非阻塞流水线读取            │  A,B,C 三相电流       │  Vd_ff=-ωLq·Iq (>1000rad/s)  │
+  └────────────────────────────┬──────────────────────────────────────────────────────┘
+                               │
+  Id_cmd──►[PI Id]──►[+]──┐    │             ┌──────────┐
+            ▲        ▲    │    │             │ 反Park   │◄── Vd,Vq
+   id_meas  │  Vd_ff │    │    │             │ Vd,Vq→αβ │
+            │        │    │    │             └────┬─────┘
+            │   ┌────┴────┴────┴──┐               │
+            │   │ 电压饱和限制      │          ┌────┴─────┐
+            │   │ (SVM内切圆限幅)   │          │  SVM     │
+            │   └─────────────────┘          │  αβ→占空比│
+            │                                └────┬─────┘
+            │                                     │
+      ┌─────┴──────┐                          ┌────┴─────┐
+      │ Park 变换   │                          │ TIM1 PWM │
+      │ Iα,Iβ→Id,Iq │                          │ 3相输出   │
+      └─────▲──────┘                          └──────────┘
+            │
+      ┌─────┴──────┐
+      │ Clarke 变换 │
+      │ Ib,Ic→Iα,Iβ │
+      └─────▲──────┘
+            │
+      ┌─────┴──────┐
+      │ LPF α=0.05 │
+      │ fc≈80Hz    │
+      └─────▲──────┘
+            │
+       双ADC 相电流
 ```
 
 ---
@@ -208,67 +232,28 @@ DI=V | D 轴 I 增益      | `DI=200`
 ### 已完成
 
 - [x] 系统时钟: HSE 旁路 → PLL @ 170 MHz
-- [x] AS5047P 编码器 SPI+DMA 流水线驱动
-- [x] 编码器高层接口: 角度/速度/多圈累计
+- [x] AS5047P 编码器 SPI+DMA 流水线驱动 (临界区保护)
+- [x] 编码器高层接口: 角度/速度/多圈累积 + 双缓冲无锁缓存
 - [x] 双 ADC 注入同步采样 + 自动零点校准 (2000 样本)
-- [x] 3 相互补 PWM 输出 (TIM1)
+- [x] 3 相互补 PWM 输出 (TIM1)，DRV8313 兼容
+- [x] CORDIC 硬件加速器 sin/cos 计算
 - [x] Clarke + Park 变换，12 扇区 SVPWM
-- [x] Iq/Id 双轴 PI 电流闭环 (Tustin 离散化 + 抗饱和 + 斜率限制)
-- [x] 交叉解耦 + 反电动势前馈补偿
-- [x] 传感器自动对准 (零电角度校准)
-- [x] VOFA+ JustFloat 遥测数据发送
-- [x] VOFA+ 文本命令接收与解析 (PID 在线调参)
+- [x] Iq/Id 双轴 PI 电流闭环 (Tustin 离散化 + 双向抗饱和 + 斜率限制)
+- [x] 交叉解耦 + 反电动势前馈补偿 (>1000 rad/s)
+- [x] 速度闭环 — 2 kHz PI 控制，级联在电流环之上
+- [x] 位置闭环 — 1 kHz P 控制，硬限幅速度输出
+- [x] 三模式控制: 转矩 / 速度 / 位置，在线切换
+- [x] 传感器自动对准 (静态电压矢量 + 平均采样零电角度校准)
+- [x] VOFA+ JustFloat 10 通道遥测数据发送 (100 Hz)
+- [x] VOFA+ 16 键文本命令接收与解析 (PID 在线调参、模式切换)
 - [x] DWT 微秒级计时
+- [x] 默认 PID 参数预设 (pid.h 集中管理)
 
 ### 计划中
 
-- [ ] 速度闭环 (PI 速度环外环)
-- [ ] 位置闭环
-- [ ] Python 自动扫参 / 阶跃响应分析脚本
 - [ ] 参数自动保存到 Flash
 - [ ] 过流 / 过压 / 欠压保护
-
----
-
-## 关键代码参考
-
-### 电流环主流程 (`Core/Src/foc.c`)
-
-```c
-void foc_current_loop(void)
-{
-    // 1. 读取电角度 & 电角速度 (仅一次)
-    float angle_el = _electricalAngle();
-    float elec_vel = _electricalVelocity();
-
-    // 2. Clarke + Park: B,C 相电流 → Id, Iq
-    // 3. 低通滤波 (α=0.05)
-    // 4. 交叉解耦 + 反电动势前馈 (仅速度 > 1 rad/s 时开启)
-    // 5. Iq / Id PI 控制 (死区 0.04A)
-    // 6. 电压饱和限制 (SVM 内切圆)
-    // 7. 计算延迟角度补偿
-    // 8. 反 Park + SVM → PWM 占空比输出
-}
-```
-
-### PID 控制器 (`Core/Src/pid.c`)
-
-```c
-float PIDController_Update(struct PIDController *pid, float error)
-{
-    // Tustin 梯形积分器
-    // 积分抗饱和 (clamp to ±limit)
-    // 输出斜率限制 (output ramp)
-    // 返回限幅后的控制量
-}
-```
-
-### 主循环状态机 (`Core/Src/main.c`)
-
-```c
-// Phase 0: 等待 ADC 电流零点校准完成 → 传感器对准 → 闭环启动
-// Phase 2: 电流闭环运行 → 10 Hz VOFA+ 遥测 + 命令处理
-```
+- [ ] CAN 总线通信
 
 ---
 
@@ -281,19 +266,7 @@ float PIDController_Update(struct PIDController *pid, float error)
 | STM32G4xx HAL | `Drivers/STM32G4xx_HAL_Driver/` | ST SLA |
 | CMSIS Core | `Drivers/CMSIS/` | Apache 2.0 |
 | CMSIS DSP | `Middlewares/ST/ARM/DSP/` | Apache 2.0 |
-| TinyFoc (参考) | `TinyFoc-main/` | MIT |
-
----
-
-## 参考工程
-
-`TinyFoc-main/` 是 TinyFoc 在 STM32F401 上的原始实现，本项目将其核心算法移植到 STM32G431 平台并做了以下改进：
-
-- 将 C++ 类重写为 C 结构体 + 函数，适配 Keil C99 编译环境
-- 加入电流低通滤波，消除高频噪声
-- 加入交叉解耦 + 反电动势前馈，提升动态响应
-- 引入 VOFA+ 协议，实现无需额外硬件的在线调参
-- PID 改用 Tustin 离散化，消除采样频率变化对积分项的影响
+| CORDIC 硬件加速 | STM32G4 片上外设 | — |
 
 ---
 
@@ -312,3 +285,15 @@ float PIDController_Update(struct PIDController *pid, float error)
 - [VOFA+](https://www.vofa.plus/) — 伏特加电子，优秀的串口数据可视化工具
 - [STMicroelectronics](https://www.st.com/) — STM32G4 HAL & CMSIS 库
 - [ams-OSRAM](https://ams.com/) — AS5047P 磁旋转编码器
+
+---
+
+## 安全启动与维护约定
+
+- CubeMX 中 `NSLEEP`、`NRESET`、`DRV_EN1`、`DRV_EN2`、`DRV_EN3` 的上电初始电平必须保持为 `LOW`。
+- 电流零点校准完成后，程序按 `NRESET → NSLEEP → DRV_EN1~3 → 编码器对齐` 的顺序使能驱动，每一步保留 1 ms 稳定时间。
+- `foc_alignSensor()` 不直接开启电流环；只有电机状态、目标值和全部 PID 状态初始化完成后，`main()` 才同时置位 `current_loop_enable` 和 `motor_ready`。
+- 一帧 VOFA 命令先完整解析到局部变量，再在临界区统一提交，因此 `M=1,S=4` 与 `S=4,M=1` 语义一致。
+- dq 电压矢量被 SVM 线性区限幅后，会把实际施加量回算到 Id/Iq 积分器，避免耦合饱和造成积分累积。
+- 前馈默认总开关为 `FOC_FEEDFORWARD_ENABLE=0U`。需要高速前馈时改为 `1U`；电角速度低于 1000 rad/s 时仍为零，并在 1000～1300 rad/s 之间平滑接入。
+- CubeMX 重新生成代码后，应首先执行下面的源码契约检查，确认 `.ioc` 与生成代码没有恢复为不安全的 GPIO 初始状态。

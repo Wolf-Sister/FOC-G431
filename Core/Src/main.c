@@ -115,11 +115,13 @@ int main(void)
   AS5047P_Sensor_Init(&AngleSensor);
 AS5047P_Init();
   /* 3. Kick off first DMA encoder read (pipelined: each Update reads previous result).
-   *    TIM2 encoder ISR @ 10kHz is started later by foc_alignSensor(). */
-  AS5047P_DMA_StartRequest();
+   *    TIM2 encoder ISR @ 20kHz is started later by foc_alignSensor(). */
+  (void)AS5047P_DMA_StartRequest();
 
-  /* 4. Disable DRV8813 (NSLEEP=LOW), then calibrate current offsets */
+  /* 4. Keep the gate driver disabled while calibrating current offsets. */
+  HAL_GPIO_WritePin(NRESET_GPIO_Port, NRESET_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(NSLEEP_GPIO_Port, NSLEEP_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, DRV_EN1_Pin|DRV_EN2_Pin|DRV_EN3_Pin, GPIO_PIN_RESET);
   Motor_Current_Calibration();
 
   /* 5. Start TIM1 3-phase PWM */
@@ -129,8 +131,14 @@ AS5047P_Init();
   __HAL_TIM_MOE_ENABLE(&htim1);
 
   /* 6. Start dual-ADC injected conversion (slave first, then master) */
-  HAL_ADC_Start(&hadc2);
-  HAL_ADCEx_InjectedStart_IT(&hadc1);
+  if (HAL_ADCEx_InjectedStart(&hadc2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_ADCEx_InjectedStart_IT(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
   /* 7. Start TIM1 update interrupt → TRGO triggers ADC chain */
   __HAL_TIM_CLEAR_IT(&htim1, TIM_IT_UPDATE);
@@ -159,23 +167,42 @@ AS5047P_Init();
               motor_current.Offset_A, motor_current.Offset_C);
       UART2_SendString(log_buf);
 
-      /* Re-enable DRV8813 (NSLEEP=HIGH), then sensor alignment */
+      /* Enable the gate driver in a deterministic order before alignment. */
+      HAL_GPIO_WritePin(NRESET_GPIO_Port, NRESET_Pin, GPIO_PIN_SET);
+      HAL_Delay(1);
       HAL_GPIO_WritePin(NSLEEP_GPIO_Port, NSLEEP_Pin, GPIO_PIN_SET);
-      foc_alignSensor(4.0f);  /* stronger alignment to overcome cogging */
+      HAL_Delay(1);
+      HAL_GPIO_WritePin(GPIOB, DRV_EN1_Pin|DRV_EN2_Pin|DRV_EN3_Pin, GPIO_PIN_SET);
+      HAL_Delay(1);
+      if (foc_alignSensor() != HAL_OK)
+      {
+        /* Keep startup failures safe: disable all gate-driver controls and
+         * do not enter closed loop with an invalid zero angle. */
+        HAL_GPIO_WritePin(GPIOB, DRV_EN1_Pin|DRV_EN2_Pin|DRV_EN3_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(NSLEEP_GPIO_Port, NSLEEP_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(NRESET_GPIO_Port, NRESET_Pin, GPIO_PIN_RESET);
+        test_phase = 1;
+        continue;
+      }
+
+      encoder_cache_t encoder_wait = {0};
 
       /* Wait for encoder cache to be populated (at least 2 TIM2 updates ≈ 200 us) */
-      while (encoder_cache.update_count < 2) { /* spin */ }
+      do {
+        (void)AS5047P_EncoderCache_Read(&encoder_wait);
+      } while (encoder_wait.update_count < 2U);
 
       /* Init motor state & PID */
       motor_control_parm_init();
-              motor_pid_init(1.4850f, 371.25f,   /* Iq: P, I */
-                             1.4850f, 371.25f   /* Id: P, I */
-                            );
-              speed_pid_init(0.0050f, 0.0169f);        /* Speed: P, I */
+      control_pid_init();
 
       motor_control.set_torque = 0.0f;
 
-      /* current_loop_enable already set inside foc_alignSensor() */
+      motor_control.id_target  = 0.0f;
+      motor_control.set_speed  = 0.0f;
+      /* Enable command handling and the ISR only after state initialization. */
+      current_loop_enable = 1;
+      motor_ready = 1;
       test_phase = 2;
 
       /* Start TIM3 position-loop timer (1 kHz). ISR returns immediately
@@ -191,39 +218,35 @@ AS5047P_Init();
       {
         last_print_time = HAL_GetTick();
 
-        /* Channel layout for VOFA+ / Python tuning script:
-         *   [0]  id_target       - D-axis target current (A)
-         *   [1]  id_meas         - D-axis actual current (A)
-         *   [2]  iq_target       - Q-axis target current (A) = set_torque
-         *   [3]  iq_meas         - Q-axis actual current (A)
-         *   [4]  vd_cmd          - D-axis voltage command (V)
-         *   [5]  enc_velocity    - Encoder instantaneous velocity (rad/s)
-         *   [6]  velocity        - Filtered mechanical velocity (rad/s)
-         *   [7]  status_flag     - Step-sync flag (1=cmd received)
-         *   [8]  speed_setpoint  - Speed setpoint (rad/s)
-         *   [9]  mode            - Control mode (0=torque, 1=speed, 2=pos)
-         *   [10] position_sp     - Position setpoint (rad)
-         *   [11] pos_meas        - Measured position (rad)
-         *   [12] raw_adc_a       - ADC1 raw value (phase A current)
-         *   [13] raw_adc_c       - ADC2 raw value (phase C current)
+        /* Channel layout for VOFA+:
+         *   [0] id_target       - D-axis target current (A)
+         *   [1] id_meas         - D-axis actual current (A)
+         *   [2] iq_target       - Q-axis target current (A) = set_torque
+         *   [3] iq_meas         - Q-axis actual current (A)
+         *   [4] velocity_raw    - Sliding-window velocity (rad/s)
+         *   [5] velocity_filt   - Filtered velocity used by speed PI (rad/s)
+         *   [6] speed_setpoint  - Speed setpoint (rad/s)
+         *   [7] speed_kp_active - Active scheduled speed P gain
+         *   [8] status_flag     - Command synchronization flag
+         *   [9] mode            - Control mode (0=torque, 1=speed, 2=pos)
+         *   [10] position_target - Absolute multi-turn position target (rad)
+         *   [11] position_meas   - Measured multi-turn position (rad)
          */
-        float vofa_data[14] = {
+        float vofa_data[12] = {
             motor_control.id_target,
             motor_control.id_meas,
             motor_control.set_torque,
             motor_control.iq_meas,
-            motor_control.id_set,
-            encoder_cache.velocity_rad_s,
+            motor_control.vel_raw,
             motor_control.vel_meas,
-            (float)motor_control.status_flag,
             motor_control.set_speed,
+            motor_control.spd_kp_active,
+            (float)motor_control.status_flag,
             (float)motor_control.mode,
             motor_control.set_position,
-            motor_control.pos_meas,
-            (float)motor_current.Raw_A,
-            (float)motor_current.Raw_C
+            motor_control.pos_meas
         };
-        VOFA_SendData(vofa_data, 14);
+        VOFA_SendData(vofa_data, 12);
         motor_control.status_flag = 0;  /* clear after TX */
       }
     }
@@ -325,7 +348,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
             motor_current.I_C = current_diff_c * CURRENT_FACTOR;
             motor_current.I_B = -(motor_current.I_A + motor_current.I_C);
 
-			      /* 1. Encoder updated by TIM2 ISR @ 10kHz — FOC reads from cache */
+        /* 1. Encoder updated by TIM2 ISR @ 20kHz — FOC reads from cache */
 
 			      // 2. 同步电流数据
 			      foc_sync_phase_currents();
@@ -341,7 +364,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 /**
   * @brief  TIM period elapsed callback
   *         - TIM1 (20 kHz): PWM safety no-op (FOC runs in ADC ISR)
-  *         - TIM2 (10 kHz): AS5047P encoder SPI read + angle/velocity → cache
+  *         - TIM2 (20 kHz): AS5047P encoder SPI read + angle/velocity → cache
   */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
@@ -352,15 +375,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   }
   else if (htim->Instance == TIM2)
   {
-    /* ── 10 kHz encoder update ── */
+    /* ── 20 kHz encoder update ── */
     /* ① SPI read raw angle → parity check → angle unwrap → velocity */
-    AS5047P_Sensor_Update(&AngleSensor);
-
-    encoder_cache.angle_raw       = AngleSensor.prev_angle;
-    encoder_cache.velocity_rad_s  = AngleSensor.velocity_rad_s;
-    encoder_cache.total_angle_rad = AngleSensor.total_angle;
-    encoder_cache.update_count++;
-    encoder_cache.data_valid      = 1;
+    if (AS5047P_Sensor_Update(&AngleSensor))
+    {
+      AS5047P_EncoderCache_Publish(&AngleSensor);
+    }
   }
   else if (htim->Instance == TIM3)
   {
