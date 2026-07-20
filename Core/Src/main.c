@@ -124,7 +124,7 @@ AS5047P_Init();
   HAL_GPIO_WritePin(GPIOB, DRV_EN1_Pin|DRV_EN2_Pin|DRV_EN3_Pin, GPIO_PIN_RESET);
   Motor_Current_Calibration();
 
-  /* 5. Start TIM1 3-phase PWM */
+  /* 5. Start TIM1 40 kHz 3-phase PWM */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
@@ -140,7 +140,7 @@ AS5047P_Init();
     Error_Handler();
   }
 
-  /* 7. Start TIM1 update interrupt → TRGO triggers ADC chain */
+  /* 7. Start TIM1 update interrupt @ 20 kHz → TRGO triggers ADC chain */
   __HAL_TIM_CLEAR_IT(&htim1, TIM_IT_UPDATE);
   HAL_TIM_Base_Start_IT(&htim1);
 
@@ -363,7 +363,8 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 
 /**
   * @brief  TIM period elapsed callback
-  *         - TIM1 (20 kHz): PWM safety no-op (FOC runs in ADC ISR)
+  *         - TIM1 update/TRGO (20 kHz, PWM carrier 40 kHz): safety no-op
+  *           (FOC runs in ADC ISR)
   *         - TIM2 (20 kHz): AS5047P encoder SPI read + angle/velocity → cache
   */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)

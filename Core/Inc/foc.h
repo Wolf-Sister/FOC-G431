@@ -73,7 +73,7 @@ extern "C" {
 #define POS_SPEED_LIMIT_DEFAULT       50.0f /* 位置环输出硬限幅 (rad/s)            */
 #define POS_SPEED_LIMIT_MAX          600.0f /* 配置速度的硬上限                     */
 #define POS_RELATIVE_STEP_MAX_RAD      6.2831853f
-#define POS_ACCEL_LIMIT_DEFAULT       20.0f /* 位置轨迹加减速度 (rad/s^2)           */
+#define POS_ACCEL_LIMIT_DEFAULT       40.0f /* 位置轨迹加减速度 (rad/s^2)           */
 #define POS_ACCEL_LIMIT_MAX         2000.0f
 #define POSITION_LOOP_DT_S             0.001f
 
