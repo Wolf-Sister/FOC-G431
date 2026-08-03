@@ -119,9 +119,7 @@ AS5047P_Init();
   (void)AS5047P_DMA_StartRequest();
 
   /* 4. Keep the gate driver disabled while calibrating current offsets. */
-  HAL_GPIO_WritePin(NRESET_GPIO_Port, NRESET_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(NSLEEP_GPIO_Port, NSLEEP_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOB, DRV_EN1_Pin|DRV_EN2_Pin|DRV_EN3_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(DRV_EN_GPIO_Port, DRV_EN_Pin, GPIO_PIN_RESET);
   Motor_Current_Calibration();
 
   /* 5. Start TIM1 40 kHz 3-phase PWM */
@@ -167,20 +165,14 @@ AS5047P_Init();
               motor_current.Offset_A, motor_current.Offset_C);
       UART2_SendString(log_buf);
 
-      /* Enable the gate driver in a deterministic order before alignment. */
-      HAL_GPIO_WritePin(NRESET_GPIO_Port, NRESET_Pin, GPIO_PIN_SET);
-      HAL_Delay(1);
-      HAL_GPIO_WritePin(NSLEEP_GPIO_Port, NSLEEP_Pin, GPIO_PIN_SET);
-      HAL_Delay(1);
-      HAL_GPIO_WritePin(GPIOB, DRV_EN1_Pin|DRV_EN2_Pin|DRV_EN3_Pin, GPIO_PIN_SET);
-      HAL_Delay(1);
+      /* Enable the gate driver before alignment. */
+      HAL_GPIO_WritePin(DRV_EN_GPIO_Port, DRV_EN_Pin, GPIO_PIN_SET);
+      HAL_Delay(5);
       if (foc_alignSensor() != HAL_OK)
       {
-        /* Keep startup failures safe: disable all gate-driver controls and
-         * do not enter closed loop with an invalid zero angle. */
-        HAL_GPIO_WritePin(GPIOB, DRV_EN1_Pin|DRV_EN2_Pin|DRV_EN3_Pin, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(NSLEEP_GPIO_Port, NSLEEP_Pin, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(NRESET_GPIO_Port, NRESET_Pin, GPIO_PIN_RESET);
+        /* Keep startup failures safe: disable the gate driver and do not
+         * enter closed loop with an invalid zero angle. */
+        HAL_GPIO_WritePin(DRV_EN_GPIO_Port, DRV_EN_Pin, GPIO_PIN_RESET);
         test_phase = 1;
         continue;
       }

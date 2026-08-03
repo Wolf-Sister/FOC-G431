@@ -59,18 +59,10 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 #define SPI1_CS_Pin GPIO_PIN_4
 #define SPI1_CS_GPIO_Port GPIOA
-#define NSLEEP_Pin GPIO_PIN_11
-#define NSLEEP_GPIO_Port GPIOB
-#define NRESET_Pin GPIO_PIN_12
-#define NRESET_GPIO_Port GPIOB
-#define DRV_EN1_Pin GPIO_PIN_13
-#define DRV_EN1_GPIO_Port GPIOB
-#define DRV_EN2_Pin GPIO_PIN_14
-#define DRV_EN2_GPIO_Port GPIOB
-#define DRV_EN3_Pin GPIO_PIN_15
-#define DRV_EN3_GPIO_Port GPIOB
-#define NCOMPO_Pin GPIO_PIN_9
-#define NCOMPO_GPIO_Port GPIOB
+#define DRV_EN_Pin GPIO_PIN_10
+#define DRV_EN_GPIO_Port GPIOB
+#define NFAULT_Pin GPIO_PIN_9
+#define NFAULT_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
