@@ -11,6 +11,7 @@
 #include "adc.h"
 #include "cordic.h"
 #include "dma.h"
+#include "i2c.h"
 #include "spi.h"
 #include "tim.h"
 #include "usart.h"
@@ -25,6 +26,7 @@
 #include "pid.h"
 #include "utils.h"
 #include "vofa.h"
+#include "ina219.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -101,12 +103,23 @@ int main(void)
   MX_TIM2_Init();
   MX_CORDIC_Init();
   MX_TIM3_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
   uint32_t last_print_time = 0;
 
   UART2_SendString("========================================\r\n");
   UART2_SendString("  STM32G431 FOC v1\r\n");
   UART2_SendString("========================================\r\n");
+
+  /* INA219 母线电压/电流检测 — 器件不在位时仅告警，不阻塞 FOC */
+  if (INA219_Init() != HAL_OK)
+  {
+    UART2_SendString("[INA219] ERROR: device not found on I2C1\r\n");
+  }
+  else
+  {
+    UART2_SendString("[INA219] OK: bus monitor ready\r\n");
+  }
 
   /* 1. Init DWT for PID microsecond timing */
   DWT_Init();
@@ -152,6 +165,32 @@ AS5047P_Init();
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    /* INA219 母线电压/电流采样 @ 1 Hz — 更新 FOC 供电电压 */
+    {
+      static uint32_t last_ina_time = 0;
+      if (HAL_GetTick() - last_ina_time >= 1000)
+      {
+        last_ina_time = HAL_GetTick();
+
+        float vbus = 0.0f;
+        float ibus = 0.0f;
+
+        if (INA219_ReadBusVoltage(&vbus) == HAL_OK)
+        {
+          /* 限幅 6~16V，防止异常值破坏 FOC 调制比换算 */
+          if (vbus > 16.0f) vbus = 16.0f;
+          if (vbus < 6.0f)  vbus = 6.0f;
+
+          ina219_vbus = vbus;
+          motor_config.voltage_supply = vbus;
+        }
+        if (INA219_ReadCurrent(&ibus) == HAL_OK)
+        {
+          ina219_ibus = ibus;
+        }
+      }
+    }
+
     /* Process incoming VOFA+ commands (PC → MCU) */
     VOFA_ProcessCmd();
 
@@ -223,8 +262,10 @@ AS5047P_Init();
          *   [9] mode            - Control mode (0=torque, 1=speed, 2=pos)
          *   [10] position_target - Absolute multi-turn position target (rad)
          *   [11] position_meas   - Measured multi-turn position (rad)
+         *   [12] bus_voltage    - Bus voltage from INA219 (V)
+         *   [13] bus_current    - Bus current from INA219 (A)
          */
-        float vofa_data[12] = {
+        float vofa_data[14] = {
             motor_control.id_target,
             motor_control.id_meas,
             motor_control.set_torque,
@@ -236,9 +277,11 @@ AS5047P_Init();
             (float)motor_control.status_flag,
             (float)motor_control.mode,
             motor_control.set_position,
-            motor_control.pos_meas
+            motor_control.pos_meas,
+            ina219_vbus,      /* [12] 母线电压 (V) */
+            ina219_ibus       /* [13] 母线电流 (A) */
         };
-        VOFA_SendData(vofa_data, 12);
+        VOFA_SendData(vofa_data, 14);
         motor_control.status_flag = 0;  /* clear after TX */
       }
     }
