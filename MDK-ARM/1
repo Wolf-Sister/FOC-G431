@@ -1,0 +1,184 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file    cordic.c
+  * @brief   This file provides code for the configuration
+  *          of the CORDIC instances.
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "cordic.h"
+
+/* USER CODE BEGIN 0 */
+#include "utils.h"
+#include <math.h>
+
+/* Q1.31 fixed-point conversion constants */
+#define CORDIC_Q31_SCALE      2147483648.0f    /* 2^31                           */
+#define CORDIC_Q31_SCALE_INV  4.656612873e-10f /* 1 / 2^31                       */
+
+/*
+ * Pre-computed CORDIC CSR register values for each mode.
+ * Direct register write avoids HAL_CORDIC_Calculate() bug:
+ *   HAL skips RRDY wait when NbCalc=1, reading garbage before CORDIC finishes.
+ */
+#define CORDIC_CSR_COS  (CORDIC_FUNCTION_COSINE                     \
+                         | CORDIC_PRECISION_6CYCLES                 \
+                         | CORDIC_SCALE_0                           \
+                         | CORDIC_INSIZE_32BITS                     \
+                         | CORDIC_OUTSIZE_32BITS                    \
+                         | CORDIC_NBWRITE_1      /* NARGS=0: 1 in  */ \
+                         | CORDIC_NBREAD_2)      /* NRES =1: 2 out */
+
+#define CORDIC_CSR_MOD  (CORDIC_FUNCTION_MODULUS                    \
+                         | CORDIC_PRECISION_6CYCLES                 \
+                         | CORDIC_SCALE_0                           \
+                         | CORDIC_INSIZE_32BITS                     \
+                         | CORDIC_OUTSIZE_32BITS                    \
+                         | CORDIC_NBWRITE_2      /* NARGS=1: 2 in  */ \
+                         | CORDIC_NBREAD_1)      /* NRES =0: 1 out */
+
+/* Track current CORDIC mode to avoid redundant CSR writes */
+static uint32_t cordic_current_mode = 0xFF; /* 0=Cos, 1=Modulus, 0xFF=uninit */
+
+/* USER CODE END 0 */
+
+CORDIC_HandleTypeDef hcordic;
+
+/* CORDIC init function */
+void MX_CORDIC_Init(void)
+{
+
+  /* USER CODE BEGIN CORDIC_Init 0 */
+
+  /* USER CODE END CORDIC_Init 0 */
+
+  /* USER CODE BEGIN CORDIC_Init 1 */
+
+  /* USER CODE END CORDIC_Init 1 */
+  hcordic.Instance = CORDIC;
+  if (HAL_CORDIC_Init(&hcordic) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CORDIC_Init 2 */
+
+  /* USER CODE END CORDIC_Init 2 */
+
+}
+
+void HAL_CORDIC_MspInit(CORDIC_HandleTypeDef* cordicHandle)
+{
+
+  if(cordicHandle->Instance==CORDIC)
+  {
+  /* USER CODE BEGIN CORDIC_MspInit 0 */
+
+  /* USER CODE END CORDIC_MspInit 0 */
+    /* CORDIC clock enable */
+    __HAL_RCC_CORDIC_CLK_ENABLE();
+  /* USER CODE BEGIN CORDIC_MspInit 1 */
+
+  /* USER CODE END CORDIC_MspInit 1 */
+  }
+}
+
+void HAL_CORDIC_MspDeInit(CORDIC_HandleTypeDef* cordicHandle)
+{
+
+  if(cordicHandle->Instance==CORDIC)
+  {
+  /* USER CODE BEGIN CORDIC_MspDeInit 0 */
+
+  /* USER CODE END CORDIC_MspDeInit 0 */
+    /* Peripheral clock disable */
+    __HAL_RCC_CORDIC_CLK_DISABLE();
+  /* USER CODE BEGIN CORDIC_MspDeInit 1 */
+
+  /* USER CODE END CORDIC_MspDeInit 1 */
+  }
+}
+
+/* USER CODE BEGIN 1 */
+
+/**
+  * @brief  Compute sine & cosine via CORDIC hardware (Cosine mode, Q1.31)
+  * @note   Uses direct register access — avoids HAL_CORDIC_Calculate()
+  *         NbCalc=1 bug (missing RRDY poll for single-shot).
+  * @param  angle_rad  Input angle in radians, auto-normalized to [-PI, PI)
+  * @param  pSin       Pointer to output sine value
+  * @param  pCos       Pointer to output cosine value
+  */
+void CORDIC_SinCos(float angle_rad, float *pSin, float *pCos)
+{
+    /* 1. Switch CORDIC to Cosine mode if not already configured */
+    if (cordic_current_mode != 0) {
+        CORDIC->CSR = CORDIC_CSR_COS;
+        cordic_current_mode = 0;
+    }
+
+    /* 2. Normalize angle to [-PI, PI) for Q1.31 representation */
+    float a = angle_rad;
+    while (a >= PI)  a -= _2PI;
+    while (a < -PI)  a += _2PI;
+
+    /* 3. Write angle in Q1.31 — starts computation */
+    CORDIC->WDATA = (int32_t)((a / PI) * CORDIC_Q31_SCALE);
+
+    /* 4. Wait for result ready */
+    while (!(CORDIC->CSR & CORDIC_CSR_RRDY));
+
+    /* 5. Read cos (first), sin (second) in Q1.31 */
+    *pCos = (float)(int32_t)CORDIC->RDATA * CORDIC_Q31_SCALE_INV;
+    *pSin = (float)(int32_t)CORDIC->RDATA * CORDIC_Q31_SCALE_INV;
+}
+
+/**
+  * @brief  Compute sqrt(x^2 + y^2) via CORDIC hardware (Modulus mode, Q1.31)
+  * @note   Uses direct register access — avoids HAL_CORDIC_Calculate()
+  *         NbCalc=1 bug (missing RRDY poll for single-shot).
+  * @param  x  First value
+  * @param  y  Second value
+  * @return    sqrt(x^2 + y^2)
+  */
+float CORDIC_Modulus(float x, float y)
+{
+    /* 1. Switch CORDIC to Modulus mode if not already configured */
+    if (cordic_current_mode != 1) {
+        CORDIC->CSR = CORDIC_CSR_MOD;
+        cordic_current_mode = 1;
+    }
+
+    /* 2. Scale inputs to fit Q1.31 range [-1, 1) */
+    float abs_x = fabsf(x);
+    float abs_y = fabsf(y);
+    float max_val = (abs_x > abs_y) ? abs_x : abs_y;
+    if (max_val < 1e-12f) return 0.0f;
+
+    float x_norm = x / max_val;
+    float y_norm = y / max_val;
+
+    /* 3. Write x, y in Q1.31 — second write starts computation */
+    CORDIC->WDATA = (int32_t)(x_norm * CORDIC_Q31_SCALE);
+    CORDIC->WDATA = (int32_t)(y_norm * CORDIC_Q31_SCALE);
+
+    /* 4. Wait for result ready */
+    while (!(CORDIC->CSR & CORDIC_CSR_RRDY));
+
+    /* 5. Read modulus in Q1.31 and restore scale */
+    float result = (float)(int32_t)CORDIC->RDATA * CORDIC_Q31_SCALE_INV;
+    return result * max_val;
+}
+
+/* USER CODE END 1 */
