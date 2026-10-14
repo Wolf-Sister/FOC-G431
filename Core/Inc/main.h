@@ -54,7 +54,8 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-
+/* Main-context service only; never call from ADC/TIM/CAN interrupts. */
+void App_CalibrationPoll(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

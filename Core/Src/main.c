@@ -54,7 +54,7 @@
 /* USER CODE BEGIN PV */
 
 /* Control state globals — accessible from TIM/ADC callbacks */
-uint8_t  test_phase  = 0;   /* 0=wait cal, 1=openloop, 2=closed loop */
+uint8_t  test_phase  = 0;   /* 0=auto calibration, 1=stopped/fault, 2=ready disabled */
 
 /* 外设就绪标志 — Error_Handler() 据此判断哪些寄存器可以安全操作。
  * 必须在 MX_TIM1_Init() / MX_USART2_UART_Init() 的 USER CODE 区置位，
@@ -72,6 +72,14 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+void App_CalibrationPoll(void)
+{
+  CAN_Poll();
+#if APP_UART_ENABLE
+  UART_TX_Pump();
+#endif
+}
 
 static void App_ReportEncoderDiagnostics(void)
 {
@@ -145,7 +153,14 @@ int main(void)
 
   if (CAN_Init() != HAL_OK) {
     UART2_SendString("[CAN] ERROR: service not started\r\n");
+    foc_disarm();
   }
+#if APP_CAN_ENABLE
+  if (APP_CAN_NODE_ID == 0U) foc_disarm();
+#endif
+
+  /* TIM3 supervision is independent of startup and of the selected mode. */
+  if (HAL_TIM_Base_Start_IT(&htim3) != HAL_OK) Error_Handler();
 
   /* INA219 母线电压/电流检测 — 母线无效时禁止使能功率级 */
   if (INA219_Init() != HAL_OK)
@@ -182,7 +197,8 @@ int main(void)
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-    __HAL_TIM_MOE_ENABLE(&htim1);
+    /* PWM starts the ADC trigger timer; offsets are sampled with outputs off. */
+    Motor_HardwareDisable();
 
     /* 6. Start dual-ADC injected conversion (slave first, then master) */
     if (HAL_ADCEx_InjectedStart(&hadc2) != HAL_OK)
@@ -274,8 +290,9 @@ int main(void)
     VOFA_CheckCommandTimeout();
 #endif
 
-    /* --- Phase 0: calibration done → sensor alignment → closed loop --- */
-    if (motor_current.Calibrated == 1 && test_phase == 0 && motor_fault_reason == MOTOR_FAULT_NONE)
+    /* Automatic electrical calibration remains; normal closed loop is unavailable. */
+    if (motor_current.Calibrated == 1 && test_phase == 0 &&
+        motor_fault_reason == MOTOR_FAULT_NONE && !motor_startup_cancelled)
     {
       /* Log calibration result */
       char log_buf[128];
@@ -289,10 +306,13 @@ int main(void)
       {
         /* Keep startup failures safe: disable the gate driver and do not
          * enter closed loop with an invalid zero angle. */
-        motor_fault_trip(MOTOR_FAULT_ALIGN_TIMEOUT);
+        if (!motor_startup_cancelled) motor_fault_trip(MOTOR_FAULT_ALIGN_TIMEOUT);
         test_phase = 1;
         continue;
       }
+
+      /* Alignment no longer falls through into automatic motor control. */
+      foc_disarm();
 
       encoder_cache_t encoder_wait = {0};
 
@@ -302,6 +322,7 @@ int main(void)
       bool encoder_ready = false;
       uint32_t encoder_wait_start = HAL_GetTick();
       do {
+        App_CalibrationPoll();
         (void)AS5047P_EncoderCache_Read(&encoder_wait);
         if (motor_fault_reason != MOTOR_FAULT_NONE) break;
         if (encoder_wait.data_valid && !encoder_wait.stale && encoder_wait.update_count >= 2U) {
@@ -327,21 +348,13 @@ int main(void)
 
       motor_control.id_target  = 0.0f;
       motor_control.set_speed  = 0.0f;
-      /* Enable command handling and the ISR only after state initialization. */
-      if (!foc_enable_control()) {
-        motor_fault_trip(MOTOR_FAULT_ENCODER);
-        test_phase = 1U;
-        continue;
-      }
+      /* Stage one never calls foc_enable_control(), even when CAN is disabled. */
       test_phase = 2;
-
-      /* Start TIM3 position-loop timer (1 kHz). ISR returns immediately
-       * unless mode == MOTOR_POSITION. */
-      HAL_TIM_Base_Start_IT(&htim3);
+      UART2_SendString("[FOC] Ready: output disabled; CAN motion unavailable in stage 1\r\n");
 
     }
 
-    /* --- Phase 2: closed-loop telemetry via VOFA+ JustFloat --- */
+    /* --- Phase 2: existing UART telemetry, with the power stage disabled --- */
 #if APP_UART_ENABLE
     if (test_phase == 2)
     {
@@ -455,6 +468,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         uint16_t raw_c = HAL_ADCEx_InjectedGetValue(&hadc2, ADC_INJECTED_RANK_1);
 
         foc_process_current_sample(raw_a, raw_c);
+        CAN_OnCurrentSample();
     }
 }
 
@@ -481,6 +495,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   }
   else if (htim->Instance == TIM3)
   {
+    foc_check_sampling_progress();
     /* ── 1 kHz Position loop ── */
     foc_position_loop();
   }

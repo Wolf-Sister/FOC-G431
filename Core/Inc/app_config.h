@@ -12,12 +12,25 @@
 #error "APP_UART_ENABLE must be 0 or 1"
 #endif
 
-/* CAN communication test: 1=on, 0=skip FDCAN initialization and polling. */
+/* CAN node service: disabling CAN never restores automatic closed-loop startup. */
 #ifndef APP_CAN_ENABLE
 #define APP_CAN_ENABLE 1
 #endif
 #if (APP_CAN_ENABLE != 0) && (APP_CAN_ENABLE != 1)
 #error "APP_CAN_ENABLE must be 0 or 1"
+#endif
+
+/* Explicit seed for this bench board. Assign a unique 1..63 to every board;
+ * 0 is unconfigured and sends no node-addressed traffic. No Flash writes. */
+#ifndef APP_CAN_NODE_ID
+#define APP_CAN_NODE_ID 1U
+#endif
+#if (APP_CAN_NODE_ID < 0) || (APP_CAN_NODE_ID > 63U)
+#error "APP_CAN_NODE_ID must be 0..63"
+#endif
+
+#ifndef APP_FIRMWARE_VERSION
+#define APP_FIRMWARE_VERSION 0x00010100U
 #endif
 
 /* 0: attended bench keeps the last target. Remote integrations must choose a

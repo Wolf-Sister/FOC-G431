@@ -1,20 +1,270 @@
 #include "can.h"
+#include "can_protocol.h"
 #include "fdcan.h"
+#include "foc.h"
+#include <string.h>
 
 volatile CAN_DebugTypeDef canDebug;
 
 #if APP_CAN_ENABLE
-static const uint8_t canTestData[8] =
-    {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
-static FDCAN_TxHeaderTypeDef canTxHeader;
-static uint32_t lastCanTxTick;
+#define CAN_QUEUE_DEPTH 8U
+#define CAN_CACHE_TIME_MS 2000U
+#define CAN_TX_BUFFERS (FDCAN_TX_BUFFER0 | FDCAN_TX_BUFFER1 | FDCAN_TX_BUFFER2)
+#define CAN_FAULT_BUS_OFF (1U << 11)
+
+typedef struct { uint8_t data[8]; } CAN_Packet;
+typedef struct {
+    uint8_t valid, request[8], reply[8];
+    uint32_t created;
+} CAN_CachedReply;
+
+/* Equal CAN IRQ priorities give one RX producer; main is the consumer. */
+static CAN_Packet requests[CAN_QUEUE_DEPTH], replies[CAN_QUEUE_DEPTH];
+static volatile uint32_t requestHead, requestTail;
+static uint32_t replyHead, replyTail, nextCache, lastHeartbeat;
+static CAN_CachedReply cache[CAN_QUEUE_DEPTH];
+static uint8_t heartbeatPending, faultPending, recoveryPrepared, sampleDivider;
+static uint16_t lastReportedFault;
+static uint8_t lastHealthyState, faultState, busOffOriginState;
+static uint16_t firstFaultDetail;
+static volatile uint16_t canFaultBits;
+static volatile uint8_t adcProgress;
+static uint32_t recoveryTick;
+static volatile uint32_t busOffTick;
+static FDCAN_TxHeaderTypeDef txHeader;
 
 static HAL_StatusTypeDef CAN_InitResult(HAL_StatusTypeDef result)
 {
-    if (result != HAL_OK) {
+    if (result != HAL_OK) canDebug.halError = HAL_FDCAN_GetError(&hfdcan1);
+    return result;
+}
+
+static uint16_t CAN_MotorFaultBits(void)
+{
+    switch (motor_fault_reason) {
+    case MOTOR_FAULT_NONE: case MOTOR_FAULT_STOP: return 0U;
+    case MOTOR_FAULT_ENCODER: return 1U << 6;
+    case MOTOR_FAULT_ALIGN_TIMEOUT: case MOTOR_FAULT_ALIGN_UNSTABLE: return 1U << 9;
+    case MOTOR_FAULT_ADC_RANGE: {
+        uint16_t bits = 0U;
+        if (motor_fault_snapshot.raw_a < CURRENT_ADC_MIN_CODE || motor_fault_snapshot.raw_a > CURRENT_ADC_MAX_CODE)
+            bits |= 1U << 2;
+        if (motor_fault_snapshot.raw_c < CURRENT_ADC_MIN_CODE || motor_fault_snapshot.raw_c > CURRENT_ADC_MAX_CODE)
+            bits |= 1U << 3;
+        return bits != 0U ? bits : (uint16_t)((1U << 2) | (1U << 3));
+    }
+    case MOTOR_FAULT_CALIBRATION: return 1U << 4;
+    /* Legacy reason does not distinguish hard/soft overcurrent. */
+    case MOTOR_FAULT_OVERCURRENT: return 1U << 0;
+    case MOTOR_FAULT_DRIVER: return 1U << 5;
+    case MOTOR_FAULT_NONFINITE: return 1U << 7;
+    case MOTOR_FAULT_ADC_TIMEOUT: return 1U << 8;
+    case MOTOR_FAULT_COMMAND_TIMEOUT: return 1U << 10;
+    default: return 1U << 15; /* Bus-monitor/internal fault: detail stays in RAM. */
+    }
+}
+
+static void CAN_ReadStatus(CAN_NodeStatus *status)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    status->faultBits = (uint16_t)(CAN_MotorFaultBits() | canFaultBits);
+    if (motor_fault_reason != MOTOR_FAULT_NONE && motor_fault_reason != MOTOR_FAULT_STOP)
+        status->state = CAN_STATE_FAULT;
+    else if (canFaultBits != 0U) status->state = CAN_STATE_COMM_LOST;
+    else if (motor_electrical_calibrated) status->state = CAN_STATE_READY;
+    else if (motor_startup_cancelled) status->state = CAN_STATE_DISABLED;
+    else if (alignment_in_progress) status->state = CAN_STATE_ALIGNING;
+    else if (!motor_current.Calibrated) status->state = CAN_STATE_CALIBRATING;
+    else status->state = CAN_STATE_DISABLED;
+    status->mode = motor_control.mode;
+    status->adcProgress = adcProgress;
+    status->capabilities = 1U | ((uint32_t)APP_UART_ENABLE << 2) |
+                           ((uint32_t)(motor_electrical_calibrated != 0U) << 5);
+    status->busStatus = canDebug.tec | (canDebug.rec << 8) |
+                        (canDebug.busOff << 16) | (canDebug.errorPassive << 17);
+    __set_PRIMASK(primask);
+    status->firmwareVersion = APP_FIRMWARE_VERSION;
+    status->uid[0] = HAL_GetUIDw0();
+    status->uid[1] = HAL_GetUIDw1();
+    status->uid[2] = HAL_GetUIDw2();
+}
+
+static void CAN_Stop(void)
+{
+    foc_disarm();
+    canDebug.stopCount++;
+}
+
+static void CAN_BusOff(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (canDebug.recoveryPhase == 0U) {
+        busOffOriginState = alignment_in_progress ? CAN_STATE_ALIGNING : lastHealthyState;
+        CAN_Stop();
+        canFaultBits |= CAN_FAULT_BUS_OFF;
+        busOffTick = HAL_GetTick();
+        canDebug.busOffCount++;
+        __DMB();
+        canDebug.recoveryPhase = 1U;
+    }
+    __set_PRIMASK(primask);
+}
+
+static void CAN_Receive(uint32_t fifo, uint32_t events)
+{
+    uint32_t budget;
+    if (!canDebug.active) return;
+    if (events & (FDCAN_IT_RX_FIFO0_MESSAGE_LOST | FDCAN_IT_RX_FIFO1_MESSAGE_LOST))
+        canDebug.rxLostCount++;
+    for (budget = 0U; budget < 3U; budget++) {
+        FDCAN_RxHeaderTypeDef header = {0};
+        uint8_t data[64]; /* HAL copies the full DLC before we reject FD. */
+        uint32_t i;
+        if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, fifo) == 0U) break;
+        if (HAL_FDCAN_GetRxMessage(&hfdcan1, fifo, &header, data) != HAL_OK) {
+            canDebug.rxReadFailedCount++;
+            canDebug.halError = HAL_FDCAN_GetError(&hfdcan1);
+            break;
+        }
+        if (header.IdType != FDCAN_STANDARD_ID || header.RxFrameType != FDCAN_DATA_FRAME ||
+            header.FDFormat != FDCAN_CLASSIC_CAN || header.BitRateSwitch != FDCAN_BRS_OFF ||
+            header.DataLength != FDCAN_DLC_BYTES_8) {
+            canDebug.rxIgnoredCount++;
+            continue;
+        }
+        canDebug.rxCount++;
+        canDebug.lastRxId = header.Identifier;
+        canDebug.lastRxDlc = header.DataLength;
+        for (i = 0U; i < 8U; i++) canDebug.lastRxData[i] = data[i];
+        if (header.Identifier == CAN_ID_DISARM) {
+            uint8_t nonzero = 0U;
+            for (i = 0U; i < 8U; i++) nonzero |= data[i];
+            if (nonzero == 0U) CAN_Stop();
+            else canDebug.rxIgnoredCount++;
+        } else if (APP_CAN_NODE_ID != 0U && header.Identifier == CAN_ID_REQUEST + APP_CAN_NODE_ID) {
+            /* Stop before queue checks: a full queue cannot delay shutdown. */
+            if (CAN_ProtocolIsStop(data)) CAN_Stop();
+            if ((uint32_t)(requestHead - requestTail) >= CAN_QUEUE_DEPTH) canDebug.requestQueueFullCount++;
+            else {
+                memcpy(requests[requestHead % CAN_QUEUE_DEPTH].data, data, 8U);
+                __DMB();
+                requestHead++;
+            }
+        } else canDebug.rxIgnoredCount++; /* Targets are unavailable in stage one. */
+    }
+}
+
+static void CAN_HandleRequest(const uint8_t request[8], const CAN_NodeStatus *status,
+                               uint32_t now, uint8_t reply[8])
+{
+    uint32_t i;
+    if (!CAN_ProtocolIsStop(request)) {
+        for (i = 0U; i < CAN_QUEUE_DEPTH; i++) {
+            if (cache[i].valid && (uint32_t)(now - cache[i].created) < CAN_CACHE_TIME_MS &&
+                cache[i].request[1] == request[1]) {
+                if (memcmp(cache[i].request, request, 8U) == 0) memcpy(reply, cache[i].reply, 8U);
+                else {
+                    memset(reply, 0, 8U);
+                    reply[0] = request[0]; reply[1] = request[1]; reply[2] = CAN_RESULT_CONFLICT;
+                }
+                return;
+            }
+        }
+    }
+    CAN_ProtocolReply(request, status, reply);
+    if (!CAN_ProtocolIsStop(request)) {
+        CAN_CachedReply *entry = &cache[nextCache++ % CAN_QUEUE_DEPTH];
+        memcpy(entry->request, request, 8U);
+        memcpy(entry->reply, reply, 8U);
+        entry->created = now;
+        entry->valid = 1U;
+    }
+}
+
+/* HAL_Stop contains timeout polling. RM0440 bus-off recovery requests INIT=0
+ * and observes completion, while cancelling every stale hardware TX request. */
+static bool CAN_Recover(uint32_t now, const FDCAN_ProtocolStatusTypeDef *protocol)
+{
+    if (canDebug.recoveryPhase == 0U) return false;
+    if (!recoveryPrepared) {
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        requestTail = requestHead;
+        __set_PRIMASK(primask);
+        replyTail = replyHead;
+        memset(cache, 0, sizeof(cache));
+        heartbeatPending = faultPending = 0U;
+        recoveryPrepared = 1U;
+        if (HAL_FDCAN_AbortTxRequest(&hfdcan1, CAN_TX_BUFFERS) != HAL_OK) {
+            canDebug.halError = HAL_FDCAN_GetError(&hfdcan1);
+            canDebug.recoveryPhase = 3U;
+        }
+    }
+    if (canDebug.recoveryPhase == 3U) return true;
+    if (canDebug.recoveryPhase == 1U && (uint32_t)(now - busOffTick) >= 100U) {
+        CLEAR_BIT(hfdcan1.Instance->CCCR, FDCAN_CCCR_INIT);
+        canDebug.recoveryAttempts++;
+        recoveryTick = now;
+        canDebug.recoveryPhase = 2U;
+        return true;
+    }
+    if (canDebug.recoveryPhase == 2U) {
+        if (!protocol->BusOff && (hfdcan1.Instance->CCCR & FDCAN_CCCR_INIT) == 0U &&
+            hfdcan1.Instance->TXBRP == 0U) {
+            canDebug.recoveryPhase = 0U;
+            recoveryPrepared = 0U;
+            lastHeartbeat = now - CAN_HEARTBEAT_PERIOD_MS;
+            faultPending = 1U;
+            return false; /* Fault and startup inhibition remain latched. */
+        }
+        if ((uint32_t)(now - recoveryTick) >= 250U) {
+            if (canDebug.recoveryAttempts >= 3U) canDebug.recoveryPhase = 3U;
+            else { busOffTick = now; canDebug.recoveryPhase = 1U; }
+        }
+    }
+    return true;
+}
+
+static void CAN_Send(const CAN_NodeStatus *status)
+{
+    uint8_t data[8];
+    uint32_t kind;
+    if (canDebug.recoveryPhase != 0U || !APP_CAN_NODE_ID ||
+        (!faultPending && replyHead == replyTail && !heartbeatPending)) return;
+    /* At most one periodic frame in hardware; reserve room for replies/faults. */
+    if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) <=
+        (uint32_t)((!faultPending && replyHead == replyTail) ? 2U : 0U)) {
+        canDebug.txBusyCount++;
+        return;
+    }
+    if (faultPending) {
+        kind = 0U;
+        txHeader.Identifier = CAN_ID_FAULT + APP_CAN_NODE_ID;
+        data[0] = faultState; data[1] = status->mode;
+        CAN_WriteU16(data + 2, status->faultBits);
+        CAN_WriteU16(data + 4, 0U);
+        CAN_WriteU16(data + 6, firstFaultDetail);
+    } else if (replyHead != replyTail) {
+        kind = 1U;
+        txHeader.Identifier = CAN_ID_REPLY + APP_CAN_NODE_ID;
+        memcpy(data, replies[replyTail % CAN_QUEUE_DEPTH].data, 8U);
+    } else {
+        kind = 2U;
+        txHeader.Identifier = CAN_ID_HEARTBEAT + APP_CAN_NODE_ID;
+        CAN_ProtocolHeartbeat(status, data);
+    }
+    canDebug.txAttemptCount++;
+    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txHeader, data) == HAL_OK) {
+        canDebug.txQueuedCount++;
+        if (kind == 0U) faultPending = 0U;
+        else if (kind == 1U) replyTail++;
+        else heartbeatPending = 0U;
+    } else {
+        canDebug.txFailedCount++;
         canDebug.halError = HAL_FDCAN_GetError(&hfdcan1);
     }
-    return result;
 }
 #endif
 
@@ -24,44 +274,59 @@ HAL_StatusTypeDef CAN_Init(void)
 #if APP_CAN_ENABLE
     FDCAN_FilterTypeDef filter = {0};
     HAL_StatusTypeDef result;
-
-    if (hfdcan1.State != HAL_FDCAN_STATE_READY || hfdcan1.Init.StdFiltersNbr < 1U) {
+    uint32_t i;
+    canDebug.nodeId = APP_CAN_NODE_ID;
+    if (hfdcan1.State != HAL_FDCAN_STATE_READY || hfdcan1.Init.StdFiltersNbr != 3U)
         return CAN_InitResult(HAL_ERROR);
-    }
-
+    requestHead = requestTail = replyHead = replyTail = nextCache = 0U;
+    heartbeatPending = faultPending = recoveryPrepared = sampleDivider = adcProgress = 0U;
+    canFaultBits = lastReportedFault = 0U;
+    lastHealthyState = faultState = busOffOriginState = CAN_STATE_BOOT;
+    firstFaultDetail = 0U;
+    memset(cache, 0, sizeof(cache));
     canDebug.initStage = 1U;
     filter.IdType = FDCAN_STANDARD_ID;
-    filter.FilterIndex = 0U;
     filter.FilterType = FDCAN_FILTER_MASK;
-    filter.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-    /* A zero mask accepts every standard ID into FIFO0. */
-    filter.FilterID1 = 0U;
-    filter.FilterID2 = 0U;
-    result = HAL_FDCAN_ConfigFilter(&hfdcan1, &filter);
-    if (result != HAL_OK) return CAN_InitResult(result);
-
+    filter.FilterID2 = 0x7FFU;
+    for (i = 0U; i < 3U; i++) {
+        filter.FilterIndex = i;
+        filter.FilterID1 = i == 0U ? CAN_ID_DISARM :
+                          (i == 1U ? CAN_ID_TARGET : CAN_ID_REQUEST) + APP_CAN_NODE_ID;
+        filter.FilterConfig = i == 2U ? FDCAN_FILTER_TO_RXFIFO1 : FDCAN_FILTER_TO_RXFIFO0;
+        if (i != 0U && APP_CAN_NODE_ID == 0U) filter.FilterConfig = FDCAN_FILTER_DISABLE;
+        result = HAL_FDCAN_ConfigFilter(&hfdcan1, &filter);
+        if (result != HAL_OK) return CAN_InitResult(result);
+    }
     canDebug.initStage = 2U;
     result = HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT,
                                          FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE);
     if (result != HAL_OK) return CAN_InitResult(result);
-
-    canTxHeader = (FDCAN_TxHeaderTypeDef){0};
-    canTxHeader.Identifier = CAN_TEST_TX_ID;
-    canTxHeader.IdType = FDCAN_STANDARD_ID;
-    canTxHeader.TxFrameType = FDCAN_DATA_FRAME;
-    canTxHeader.DataLength = FDCAN_DLC_BYTES_8;
-    canTxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    canTxHeader.BitRateSwitch = FDCAN_BRS_OFF;
-    canTxHeader.FDFormat = FDCAN_CLASSIC_CAN;
-    canTxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
-
     canDebug.initStage = 3U;
-    result = HAL_FDCAN_Start(&hfdcan1);
+    result = HAL_FDCAN_ConfigInterruptLines(&hfdcan1, FDCAN_IT_GROUP_RX_FIFO0, FDCAN_INTERRUPT_LINE0);
     if (result != HAL_OK) return CAN_InitResult(result);
-
-    lastCanTxTick = HAL_GetTick();
+    result = HAL_FDCAN_ConfigInterruptLines(&hfdcan1, FDCAN_IT_GROUP_RX_FIFO1 | FDCAN_IT_GROUP_SMSG |
+              FDCAN_IT_GROUP_BIT_LINE_ERROR | FDCAN_IT_GROUP_PROTOCOL_ERROR, FDCAN_INTERRUPT_LINE1);
+    if (result != HAL_OK) return CAN_InitResult(result);
     canDebug.initStage = 4U;
-    canDebug.active = 1U;
+    result = HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE |
+          FDCAN_IT_RX_FIFO0_MESSAGE_LOST | FDCAN_IT_RX_FIFO1_NEW_MESSAGE | FDCAN_IT_RX_FIFO1_MESSAGE_LOST |
+          FDCAN_IT_TX_COMPLETE | FDCAN_IT_BUS_OFF | FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_ERROR_WARNING,
+          CAN_TX_BUFFERS);
+    if (result != HAL_OK) return CAN_InitResult(result);
+    txHeader = (FDCAN_TxHeaderTypeDef){0};
+    txHeader.IdType = FDCAN_STANDARD_ID;
+    txHeader.TxFrameType = FDCAN_DATA_FRAME;
+    txHeader.DataLength = FDCAN_DLC_BYTES_8;
+    txHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+    txHeader.BitRateSwitch = FDCAN_BRS_OFF;
+    txHeader.FDFormat = FDCAN_CLASSIC_CAN;
+    txHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+    canDebug.initStage = 5U;
+    canDebug.active = 1U; /* Fully initialize before Start can trigger callbacks. */
+    result = HAL_FDCAN_Start(&hfdcan1);
+    if (result != HAL_OK) { canDebug.active = 0U; return CAN_InitResult(result); }
+    lastHeartbeat = HAL_GetTick();
+    canDebug.initStage = 6U;
 #endif
     return HAL_OK;
 }
@@ -69,48 +334,88 @@ HAL_StatusTypeDef CAN_Init(void)
 void CAN_Poll(void)
 {
 #if APP_CAN_ENABLE
-    uint32_t now;
-    if (canDebug.active == 0U) return;
-
+    CAN_NodeStatus status;
+    FDCAN_ProtocolStatusTypeDef protocol = {0};
+    FDCAN_ErrorCountersTypeDef counters = {0};
+    uint32_t now, budget;
+    if (!canDebug.active) return;
     now = HAL_GetTick();
-    if ((uint32_t)(now - lastCanTxTick) >= CAN_TEST_TX_PERIOD_MS) {
-        /* Schedule from now so a delayed main loop never bursts to catch up. */
-        lastCanTxTick = now;
-        canDebug.txAttemptCount++;
-        if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) > 0U) {
-            if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &canTxHeader, canTestData) == HAL_OK) {
-                canDebug.txQueuedCount++;
+    if (HAL_FDCAN_GetProtocolStatus(&hfdcan1, &protocol) != HAL_OK ||
+        HAL_FDCAN_GetErrorCounters(&hfdcan1, &counters) != HAL_OK) {
+        canDebug.halError = HAL_FDCAN_GetError(&hfdcan1);
+        return;
+    }
+    canDebug.tec = counters.TxErrorCnt;
+    canDebug.rec = counters.RxErrorCnt;
+    canDebug.busOff = protocol.BusOff;
+    canDebug.errorPassive = protocol.ErrorPassive;
+    if (protocol.BusOff) CAN_BusOff();
+    if (CAN_Recover(now, &protocol)) return;
+    CAN_ReadStatus(&status);
+    if (status.faultBits != lastReportedFault) {
+        if (lastReportedFault == 0U && status.faultBits != 0U) {
+            if (motor_fault_reason != MOTOR_FAULT_NONE && motor_fault_reason != MOTOR_FAULT_STOP) {
+                faultState = motor_fault_snapshot.was_aligning ? CAN_STATE_ALIGNING : lastHealthyState;
+                firstFaultDetail = (uint16_t)motor_fault_reason;
             } else {
-                canDebug.txFailedCount++;
-                canDebug.halError = HAL_FDCAN_GetError(&hfdcan1);
+                faultState = busOffOriginState;
+                firstFaultDetail = 0U;
             }
-        } else {
-            canDebug.txBusyCount++;
         }
+        lastReportedFault = status.faultBits;
+        if (status.faultBits != 0U) faultPending = 1U;
     }
-
-    /* Read one message per call to bound work under heavy bus traffic. */
-    if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0U) {
-        FDCAN_RxHeaderTypeDef header = {0};
-        /* G4 HAL copies the DLC's full length, up to 64 bytes for an FD frame. */
-        uint8_t data[64];
-        if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &header, data) != HAL_OK) {
-            canDebug.rxReadFailedCount++;
-            canDebug.halError = HAL_FDCAN_GetError(&hfdcan1);
-        } else if (header.IdType != FDCAN_STANDARD_ID || header.Identifier > 0x7FFU ||
-                   header.RxFrameType != FDCAN_DATA_FRAME || header.FDFormat != FDCAN_CLASSIC_CAN ||
-                   header.DataLength > FDCAN_DLC_BYTES_8) {
-            canDebug.rxIgnoredCount++;
-        } else {
-            uint32_t i;
-            canDebug.lastRxId = header.Identifier;
-            canDebug.lastRxDlc = header.DataLength;
-            /* For Classic CAN the G4 HAL's unshifted DLC equals the byte count. */
-            for (i = 0U; i < sizeof(canDebug.lastRxData); i++) {
-                canDebug.lastRxData[i] = (i < header.DataLength) ? data[i] : 0U;
-            }
-            canDebug.rxCount++;
-        }
+    if (status.faultBits == 0U) lastHealthyState = status.state;
+    for (budget = 0U; budget < 4U && requestTail != requestHead &&
+         (uint32_t)(replyHead - replyTail) < CAN_QUEUE_DEPTH; budget++) {
+        uint8_t request[8];
+        __DMB();
+        memcpy(request, requests[requestTail % CAN_QUEUE_DEPTH].data, 8U);
+        __DMB();
+        requestTail++;
+        CAN_HandleRequest(request, &status, now, replies[replyHead++ % CAN_QUEUE_DEPTH].data);
     }
+    if ((uint32_t)(now - lastHeartbeat) >= CAN_HEARTBEAT_PERIOD_MS) {
+        lastHeartbeat = now;
+        heartbeatPending = 1U;
+    }
+    CAN_Send(&status);
 #endif
 }
+
+void CAN_OnCurrentSample(void)
+{
+#if APP_CAN_ENABLE
+    if (++sampleDivider >= 20U) { sampleDivider = 0U; adcProgress++; }
+#endif
+}
+
+#if APP_CAN_ENABLE
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t events)
+{
+    if (hfdcan == &hfdcan1) CAN_Receive(FDCAN_RX_FIFO0, events);
+}
+void HAL_FDCAN_RxFifo1Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t events)
+{
+    if (hfdcan == &hfdcan1) CAN_Receive(FDCAN_RX_FIFO1, events);
+}
+void HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t buffers)
+{
+    if (hfdcan == &hfdcan1 && canDebug.active) {
+        if (buffers & FDCAN_TX_BUFFER0) canDebug.txCompleteCount++;
+        if (buffers & FDCAN_TX_BUFFER1) canDebug.txCompleteCount++;
+        if (buffers & FDCAN_TX_BUFFER2) canDebug.txCompleteCount++;
+    }
+}
+void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t events)
+{
+    FDCAN_ProtocolStatusTypeDef protocol = {0};
+    if (hfdcan != &hfdcan1 || !canDebug.active) return;
+    if ((events & FDCAN_IT_BUS_OFF) && HAL_FDCAN_GetProtocolStatus(hfdcan, &protocol) == HAL_OK &&
+        protocol.BusOff) CAN_BusOff();
+}
+void HAL_FDCAN_ErrorCallback(FDCAN_HandleTypeDef *hfdcan)
+{
+    if (hfdcan == &hfdcan1 && canDebug.active) canDebug.halError = HAL_FDCAN_GetError(hfdcan);
+}
+#endif

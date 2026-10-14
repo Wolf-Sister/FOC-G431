@@ -32,6 +32,8 @@ volatile uint8_t current_loop_enable = 0;
 
 /* Set only after all motor-control state has been initialized. */
 volatile uint8_t motor_ready = 0;
+volatile uint8_t motor_startup_cancelled = 0U;
+volatile uint8_t motor_electrical_calibrated = 0U;
 
 volatile motor_fault_t motor_fault_reason = MOTOR_FAULT_NONE;
 volatile motor_fault_snapshot_t motor_fault_snapshot;
@@ -386,6 +388,26 @@ void foc_safe_stop(void)
     motor_fault_trip(MOTOR_FAULT_STOP);
 }
 
+void foc_disarm(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    /* A stop received before/during alignment must prevent every later enable. */
+    motor_startup_cancelled = 1U;
+    Motor_HardwareDisable();
+    current_loop_enable = 0U;
+    motor_ready = 0U;
+    alignment_in_progress = 0U;
+    driver_monitor_enabled = 0U;
+    motor_control.set_torque = motor_control.id_target = motor_control.set_speed = 0.0f;
+    motor_control.set_position = motor_control.pos_meas;
+    motor_control.id_set = motor_control.iq_set = 0.0f;
+    current_loop.integral_prev = current_loop.output_prev = current_loop.error_prev = 0.0f;
+    id_current_loop.integral_prev = id_current_loop.output_prev = id_current_loop.error_prev = 0.0f;
+    speed_loop.integral_prev = speed_loop.output_prev = speed_loop.error_prev = 0.0f;
+    __set_PRIMASK(primask);
+}
+
 void motor_fault_trip(motor_fault_t reason)
 {
     uint32_t primask = __get_PRIMASK();
@@ -452,7 +474,8 @@ bool foc_enable_driver(void)
     uint32_t sensor_start = HAL_GetTick();
     uint8_t sensor_ready = 0U;
     do {
-        if (motor_fault_reason != MOTOR_FAULT_NONE) return false;
+        App_CalibrationPoll();
+        if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return false;
         if (AS5047P_Sensor_Update(&AngleSensor) &&
             (uint32_t)(dwt_get_cycles() - AngleSensor.sample_cycle) <
             (uint32_t)((float)SystemCoreClock * AS5047P_STALE_LIMIT_S)) {
@@ -467,7 +490,7 @@ bool foc_enable_driver(void)
     uint32_t primask = __get_PRIMASK();
     uint32_t start, stable_since;
     __disable_irq();
-    if (motor_fault_reason != MOTOR_FAULT_NONE || !motor_current.Calibrated ||
+    if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled || !motor_current.Calibrated ||
         !AS5047P_DiagnosticsHealthy()) {
         __set_PRIMASK(primask);
         return false;
@@ -486,13 +509,14 @@ bool foc_enable_driver(void)
     start = HAL_GetTick();
     stable_since = start;
     do {
-        if (motor_fault_reason != MOTOR_FAULT_NONE) return false;
+        App_CalibrationPoll();
+        if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return false;
         if (HAL_GPIO_ReadPin(NFAULT_GPIO_Port, NFAULT_Pin) == GPIO_PIN_RESET) {
             stable_since = HAL_GetTick();
         } else if ((uint32_t)(HAL_GetTick() - stable_since) >= 5U) {
             primask = __get_PRIMASK();
             __disable_irq();
-            if (motor_fault_reason == MOTOR_FAULT_NONE &&
+            if (motor_fault_reason == MOTOR_FAULT_NONE && !motor_startup_cancelled &&
                 HAL_GPIO_ReadPin(NFAULT_GPIO_Port, NFAULT_Pin) == GPIO_PIN_SET) {
                 driver_monitor_enabled = 1U;
                 __set_PRIMASK(primask);
@@ -512,7 +536,7 @@ bool foc_enable_control(void)
     bool enabled = false;
     encoder_cache_t encoder = {0};
     __disable_irq();
-    if (motor_fault_reason == MOTOR_FAULT_NONE && motor_current.Calibrated &&
+    if (motor_fault_reason == MOTOR_FAULT_NONE && !motor_startup_cancelled && motor_current.Calibrated &&
         driver_monitor_enabled && !alignment_in_progress &&
         AS5047P_DiagnosticsHealthy() && AS5047P_EncoderCache_Read(&encoder) &&
         encoder.data_valid && !encoder.stale) {
@@ -606,7 +630,8 @@ static HAL_StatusTypeDef foc_calculate_zero(float *zero)
     uint32_t start = HAL_GetTick();
 
     while (valid_samples < 10U) {
-        if (motor_fault_reason != MOTOR_FAULT_NONE) return HAL_ERROR;
+        App_CalibrationPoll();
+        if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return HAL_ERROR;
         if ((uint32_t)(HAL_GetTick() - start) >= FOC_ALIGN_SAMPLE_TIMEOUT_MS ||
             (alignment_in_progress && (uint32_t)(HAL_GetTick() - alignment_start_ms) >=
              FOC_ALIGN_TOTAL_TIMEOUT_MS)) {
@@ -731,15 +756,16 @@ static HAL_StatusTypeDef foc_align_wait(uint32_t delay_ms,
 
     for (elapsed_ms = 0U; elapsed_ms < delay_ms; elapsed_ms++) {
         uint32_t start_cycle = dwt_get_cycles();
+        App_CalibrationPoll();
         do {
-            if (motor_fault_reason != MOTOR_FAULT_NONE) return HAL_ERROR;
+            if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return HAL_ERROR;
             /* SysTick remains a separate deadline if DWT stops progressing. */
             if ((uint32_t)(HAL_GetTick() - alignment_start_ms) >= FOC_ALIGN_TOTAL_TIMEOUT_MS) {
                 motor_fault_trip(MOTOR_FAULT_ALIGN_TIMEOUT);
                 return HAL_TIMEOUT;
             }
         } while ((uint32_t)(dwt_get_cycles() - start_cycle) < cycles_per_ms);
-        if (motor_fault_reason != MOTOR_FAULT_NONE) return HAL_ERROR;
+        if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return HAL_ERROR;
 
         if (foc_align_max_phase_current() > FOC_ALIGN_CURRENT_LIMIT_A) {
             (*overcurrent_ms)++;
@@ -794,7 +820,7 @@ HAL_StatusTypeDef foc_alignSensor(void)
     char log_buf[128];
     uint32_t overcurrent_ms = 0U;
     uint8_t encoder_timer_stopped = 0U;
-    if (motor_fault_reason != MOTOR_FAULT_NONE || !driver_monitor_enabled) return HAL_ERROR;
+    if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled || !driver_monitor_enabled) return HAL_ERROR;
     alignment_start_ms = HAL_GetTick();
 
     /* 设置标志，防止 TIM 回调在对齐期间覆盖 PWM */
@@ -881,8 +907,9 @@ HAL_StatusTypeDef foc_alignSensor(void)
 
     /* Alignment is complete. main() initializes all control state before it
      * enables the current loop, so the ADC ISR cannot race startup writes. */
-    if (motor_fault_reason != MOTOR_FAULT_NONE) goto alignment_failed;
+    if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) goto alignment_failed;
     alignment_in_progress = 0;
+    motor_electrical_calibrated = 1U;
 
     (void)snprintf(log_buf, sizeof(log_buf),
                    "[FOC] Zero elec angle = %.3f rad\r\n",
@@ -892,14 +919,14 @@ HAL_StatusTypeDef foc_alignSensor(void)
     return HAL_OK;
 
 alignment_failed:
-    motor_fault_trip(MOTOR_FAULT_ALIGN_TIMEOUT);
+    if (!motor_startup_cancelled) motor_fault_trip(MOTOR_FAULT_ALIGN_TIMEOUT);
     if (encoder_timer_stopped != 0U) {
         AS5047P_DMA_StartRequest();
         __HAL_TIM_CLEAR_IT(&htim2, TIM_IT_UPDATE);
         HAL_TIM_Base_Start_IT(&htim2);
     }
     alignment_in_progress = 0;
-    UART2_SendString("[FOC] Alignment aborted: fault latched\r\n");
+    UART2_SendString("[FOC] Alignment aborted: fault or disarm\r\n");
     return HAL_ERROR;
 }
 
@@ -1517,7 +1544,7 @@ static int SVM(float alpha, float beta, float *tA, float *tB, float *tC)
   */
 void foc_forward(float d, float q, float angle_el)
 {
-    if (motor_fault_reason != MOTOR_FAULT_NONE) return;
+    if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return;
     if (!isfinite(d) || !isfinite(q) || !isfinite(angle_el) ||
         !isfinite(motor_config.voltage_supply) || motor_config.voltage_supply <= 0.0f) {
         motor_fault_trip(MOTOR_FAULT_NONFINITE);

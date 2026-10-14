@@ -298,11 +298,11 @@ void ADC1_2_IRQHandler(void)
 void FDCAN1_IT0_IRQHandler(void)
 {
   /* USER CODE BEGIN FDCAN1_IT0_IRQn 0 */
-
+#if APP_CAN_ENABLE
   /* USER CODE END FDCAN1_IT0_IRQn 0 */
   HAL_FDCAN_IRQHandler(&hfdcan1);
   /* USER CODE BEGIN FDCAN1_IT0_IRQn 1 */
-
+#endif
   /* USER CODE END FDCAN1_IT0_IRQn 1 */
 }
 
@@ -312,11 +312,11 @@ void FDCAN1_IT0_IRQHandler(void)
 void FDCAN1_IT1_IRQHandler(void)
 {
   /* USER CODE BEGIN FDCAN1_IT1_IRQn 0 */
-
+#if APP_CAN_ENABLE
   /* USER CODE END FDCAN1_IT1_IRQn 0 */
   HAL_FDCAN_IRQHandler(&hfdcan1);
   /* USER CODE BEGIN FDCAN1_IT1_IRQn 1 */
-
+#endif
   /* USER CODE END FDCAN1_IT1_IRQn 1 */
 }
 

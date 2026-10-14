@@ -272,6 +272,10 @@ float _calculate_zero_electric_angle(void);
 
 /* --- 安全停机 --------------------------------------------------------*/
 void  foc_safe_stop(void);
+/* Stage-one stop inhibits further startup until reset, without inventing a fault. */
+void foc_disarm(void);
+extern volatile uint8_t motor_startup_cancelled;
+extern volatile uint8_t motor_electrical_calibrated;
 
 typedef enum {
     MOTOR_FAULT_NONE = 0,
