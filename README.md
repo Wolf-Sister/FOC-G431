@@ -88,7 +88,7 @@
 **母线监测**   | I2C1: PA15(SCL) PB7(SDA)          | INA219，地址 0x40
 **调试串口**   | SWD: PA13(CLK) PA14(DIO)          | 测试点 CLK / DIO
 **状态指示灯** | PC13 → LED2                       | 低电平点亮（当前固件未驱动）
-**板载预留**   | CAN 收发器 + 120Ω 终端            | 收发器 STBY 接地，固件未启用
+**CAN 通信**   | PA11 RX、PA12 TX，收发器 + 120Ω 终端 | 收发器模式脚接地；已接入固定帧测试
 
 ### 时钟与电源
 
@@ -383,7 +383,8 @@ HB=1  | 外部控制保活（启用超时配置时续期） | `HB=1`
 - [ ] **无看门狗**: `Error_Handler` 的"等待复位"目前没有复位源，实际行为是停住（功率级已关断，安全但需人工干预）
 - [ ] **CubeMX实际再生成回归**：用户钩子已保存条件行为，但仍需在副本中实际再生成并验收
 - [ ] 参数自动保存到 Flash
-- [ ] CAN 总线通信（收发器与 120Ω 终端已在板上，但 STBY 接地且固件未启用）
+- [x] CAN 固定帧收发测试已接入（当前源码1 Mbit/s、0x124、2 秒周期；当前速率下合并后的 FOC 固件待上板验收）
+- [ ] CAN 电机控制协议
 - [ ] PC13 状态指示灯未驱动
 - [ ] DRV8323H 内置三路低边 CSA 处于闲置状态（当前用外置 INA240A2）
 
@@ -407,6 +408,34 @@ HB=1  | 外部控制保活（启用超时配置时续期） | `HB=1`
 
 ---
 
+## CAN 通信测试
+
+已将同级 `CAN-G431` 工程的过滤、启动、周期发送和接收轮询流程移植到独立的 `Core/Src/can.c`，接口与调试变量声明位于 `Core/Inc/can.h`。CubeMX 生成的 `fdcan.c/h` 管理硬件初始化；`main.c` 在 `MX_FDCAN1_Init()` 后调用 `CAN_Init()`，在主循环中调用 `CAN_Poll()`。
+
+| 项目 | 配置 |
+|------|------|
+| 引脚 | PA11 RX、PA12 TX，AF9 |
+| 时钟 | PCLK1 170 MHz，FDCAN Divider=2，得到 85 MHz |
+| Nominal Prescaler / SJW / Seg1 / Seg2 | 5 / 1 / 13 / 3 |
+| 波特率 / 采样点 | 85 MHz ÷ 5 ÷ (1+13+3) = 1 Mbit/s；82.35% |
+| 模式 | Classic CAN、Normal、自动重传开启、TX FIFO |
+| 接收 | 标准过滤器 1 个，全部标准数据帧进入 FIFO0；扩展帧与远程帧拒绝 |
+| 发送 | 标准 ID=0x124，DLC=8，数据 `11 22 33 44 55 66 77 88`，每 2000 ms 一帧 |
+
+发送 ID 和周期可在 `can.h` 中修改；数据位于 `can.c` 的 `canTestData`。每次 `CAN_Poll()` 最多提交一帧、读取一帧，不等待发送完成，也不调用串口或驱动 LED。收到的报文仅记录供调试，不修改电机目标。正常运行时主循环处理收发；启动对齐等阻塞阶段会推迟发送和接收，恢复轮询后不会补发积压周期，高流量时 FIFO0 可能溢出。
+
+在 Keil Watch 中查看 `canDebug`：`active=1`、`initStage=4` 表示模块已启动；`txAttemptCount` 记录周期发送尝试，`txQueuedCount` 只表示 HAL 接受发送请求，不能作为收到 ACK 的证据；`txBusyCount` / `txFailedCount` 记录队列满和提交失败。`rxCount`、`lastRxId`、`lastRxDlc`、`lastRxData` 用于检查最近收到的报文；`rxReadFailedCount` / `rxIgnoredCount` / `halError` 用于定位失败和不支持的帧。
+
+上板时沿用已验证的收发器接线，并将另一个活动 CAN 节点设为 1 Mbit/s、正常模式：接收端应看到 0x124 的正确数据；向本板发送例如 0x123 后，检查 `canDebug.rxCount` 及最近报文。自动重传开启后，缺少 ACK 时硬件发送请求可能持续占用 FIFO，新的周期请求只记忙计数；若进入 Bus-Off，排除故障后复位重试。当前保持参考工程的流程，没有软件取消或 Bus-Off 恢复逻辑。既有500 kbit/s构建记录不能证明修改速率后的固件已经上板通过。
+
+`APP_CAN_ENABLE` 默认为 1；设为 0 时跳过 FDCAN 初始化和收发，方便对比原有 FOC 行为。`tests/run-host-tests.ps1` 编译实际 `can.c`，覆盖发送周期、tick 回绕、队列满、收发失败、接收边界和电机状态保持；软件测试不能替代合并固件的实物验收。
+
+2026-10-14规划更新：[CAN主方案](docs/can-wheel-leg-design-2026-10-02.md)及[实施规格](docs/ai-implementation-spec-2026-10-05.md)按“禁能正式节点通信 → 单轴Iq控制 → 速度/位置、机械零点、Flash与HOME”推进。主方案第9节给出用户操作CubeMX的配置步骤：下一步保留上述位时序，标准过滤器改3个，启用两个FDCAN IRQ；实际过滤/通知及协议代码另行接入。现有轮询、固定帧及自动启动行为尚未因此改变。
+
+进入正式节点阶段时移除0x124固定测试发送（它与未来节点4目标ID冲突）及旧can_test.c/h，不增加接收指示灯或周期串口统计。保留can.c/h的Init/Poll主程序入口及FOC回归测试。文档现状按阶段交付同步更新，历史审查/修复记录保留日期；docs/tests仍按项目.gitignore忽略。
+
+---
+
 ## CubeMX 维护约定
 
 重新生成代码后，请确认以下内容未被回退（**全部位于 `USER CODE` 区间内，理论上不会被清空，但仍建议核对**）：
@@ -418,6 +447,8 @@ HB=1  | 外部控制保活（启用超时配置时续期） | `HB=1`
 | `usart.c` | 生成区 | `huart2.Init.BaudRate = 460800;` |
 | `tim.c` | `USER CODE BEGIN 0` | `extern volatile uint8_t htim1_ready;` |
 | `tim.c` | `USER CODE BEGIN TIM1_Init 2` | `htim1_ready = 1U;` |
+| `fdcan.c` | `USER CODE BEGIN FDCAN1_Init 0 / 2` | `APP_CAN_ENABLE` 的条件编译开始与结束 |
+| `main.c` | `USER CODE BEGIN Includes / 2 / WHILE` | `can.h`、`CAN_Init()` 和 `CAN_Poll()` 调用 |
 
 **CubeMX 中的关键配置**（改动后将影响固件行为）：
 
@@ -432,7 +463,7 @@ HB=1  | 外部控制保活（启用超时配置时续期） | `HB=1`
 
 > ⚠️ **不要**将 PB13/PB14/PB15 的上电电平改为低——它们必须为高才能保证 3x 模式输入级不悬空。
 
-**新增源文件时**: `uart_tx.c` 需手动加入 Keil 工程的 `Application/User/Core` 分组（CubeMX 不管理非生成文件）。
+**新增源文件时**: `uart_tx.c` 和 `can.c` 需保留在 Keil 工程的 `Application/User/Core` 分组（CubeMX 不管理非生成文件）；HAL 驱动组需包含 `stm32g4xx_hal_fdcan.c`。
 
 ---
 

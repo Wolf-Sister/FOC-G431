@@ -11,6 +11,7 @@
 #include "adc.h"
 #include "cordic.h"
 #include "dma.h"
+#include "fdcan.h"
 #include "i2c.h"
 #include "spi.h"
 #include "tim.h"
@@ -29,6 +30,7 @@
 #include "utils.h"
 #include "vofa.h"
 #include "ina219.h"
+#include "can.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -128,6 +130,7 @@ int main(void)
   MX_CORDIC_Init();
   MX_TIM3_Init();
   MX_I2C1_Init();
+  MX_FDCAN1_Init();
   /* USER CODE BEGIN 2 */
   App_DMA_DisableUnusedUART();
 #if APP_UART_ENABLE
@@ -139,6 +142,10 @@ int main(void)
   UART2_SendString("========================================\r\n");
   UART2_SendString("  STM32G431 FOC v1\r\n");
   UART2_SendString("========================================\r\n");
+
+  if (CAN_Init() != HAL_OK) {
+    UART2_SendString("[CAN] ERROR: service not started\r\n");
+  }
 
   /* INA219 母线电压/电流检测 — 母线无效时禁止使能功率级 */
   if (INA219_Init() != HAL_OK)
@@ -228,6 +235,8 @@ int main(void)
 #if APP_UART_ENABLE
     UART_TX_Pump();
 #endif
+
+    CAN_Poll();
 
     /* Slow bus supervision (5 Hz), not a substitute for fast phase protection. */
     {

@@ -12,6 +12,14 @@
 #error "APP_UART_ENABLE must be 0 or 1"
 #endif
 
+/* CAN communication test: 1=on, 0=skip FDCAN initialization and polling. */
+#ifndef APP_CAN_ENABLE
+#define APP_CAN_ENABLE 1
+#endif
+#if (APP_CAN_ENABLE != 0) && (APP_CAN_ENABLE != 1)
+#error "APP_CAN_ENABLE must be 0 or 1"
+#endif
+
 /* 0: attended bench keeps the last target. Remote integrations must choose a
  * finite lease and send valid motion commands or HB=1 before it expires. */
 #ifndef APP_COMMAND_TIMEOUT_MS
