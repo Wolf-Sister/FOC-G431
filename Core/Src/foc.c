@@ -19,6 +19,9 @@
 #include <stdio.h>
 #include <string.h>
 #include "ina219.h"
+#include "motor_supervisor.h"
+#include "motor_port.h"
+#include "encoder_bench.h"
 
 /* ========================================================================== */
 /*  全局变量                                                                   */
@@ -43,6 +46,7 @@ static volatile uint8_t adc_progress_armed = 0U;
 static volatile uint32_t adc_last_cycle = 0U;
 static volatile uint32_t calibration_start_ms = 0U;
 static volatile uint8_t driver_monitor_enabled = 0U;
+static volatile uint8_t stage2_driver_waiting;
 static uint32_t alignment_start_ms;
 
 /* 传感器对齐进行中 — TIM 回调不得覆盖 PWM */
@@ -54,6 +58,7 @@ volatile uint32_t encoder_stale_count = 0;
 
 /* PWM 占空比被限幅标志 — 供电流环做抗饱和回灌 */
 volatile uint8_t pwm_duty_clipped = 0;
+volatile uint8_t current_ref_limited;
 
 /* 电机配置 (来自 TinyFoc) */
 motor_config_t motor_config = {
@@ -219,6 +224,7 @@ void Motor_Current_Calibration(void)
     current_loop_enable = 0U;
     motor_ready = 0U;
     driver_monitor_enabled = 0U;
+    stage2_driver_waiting = 0U;
     adc_progress_armed = 0U;
     calibration_start_ms = HAL_GetTick();
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
@@ -394,11 +400,13 @@ void foc_disarm(void)
     __disable_irq();
     /* A stop received before/during alignment must prevent every later enable. */
     motor_startup_cancelled = 1U;
+    current_ref_limited = 0U;
     Motor_HardwareDisable();
     current_loop_enable = 0U;
     motor_ready = 0U;
     alignment_in_progress = 0U;
     driver_monitor_enabled = 0U;
+    stage2_driver_waiting = 0U;
     motor_control.set_torque = motor_control.id_target = motor_control.set_speed = 0.0f;
     motor_control.set_position = motor_control.pos_meas;
     motor_control.id_set = motor_control.iq_set = 0.0f;
@@ -464,9 +472,103 @@ void motor_fault_trip(motor_fault_t reason)
     motor_ready = 0U;
     alignment_in_progress = 0U;
     driver_monitor_enabled = 0U;
+    stage2_driver_waiting = 0U;
     current_loop_enable = 0U;
 
     __set_PRIMASK(primask);
+    if (first_fault && MotorSupervisor_Active()) {
+        uint16_t bits = reason == MOTOR_FAULT_ENCODER ? 1U << 6 :
+            reason == MOTOR_FAULT_ALIGN_TIMEOUT || reason == MOTOR_FAULT_ALIGN_UNSTABLE ? 1U << 9 :
+            reason == MOTOR_FAULT_ADC_RANGE ?
+                ((motor_current.Raw_A < CURRENT_ADC_MIN_CODE || motor_current.Raw_A > CURRENT_ADC_MAX_CODE ? 1U << 2 : 0U) |
+                 (motor_current.Raw_C < CURRENT_ADC_MIN_CODE || motor_current.Raw_C > CURRENT_ADC_MAX_CODE ? 1U << 3 : 0U)) :
+            reason == MOTOR_FAULT_CALIBRATION ? 1U << 4 : reason == MOTOR_FAULT_OVERCURRENT ?
+                (current_protection.soft_fault ? 1U << 1 : 1U) :
+            reason == MOTOR_FAULT_DRIVER ? 1U << 5 : reason == MOTOR_FAULT_NONFINITE ? 1U << 7 :
+            reason == MOTOR_FAULT_ADC_TIMEOUT ? 1U << 8 : 1U << 15;
+        MotorSupervisor_FaultISR(bits, (uint16_t)reason);
+    }
+}
+
+bool foc_stage2_driver_enabled(void) { return driver_monitor_enabled || stage2_driver_waiting; }
+
+bool foc_stage2_begin_driver(void)
+{
+    encoder_cache_t encoder = {0};
+    if (EncoderBench_IsActive()) return false;
+    if (motor_fault_reason != MOTOR_FAULT_NONE) return false;
+    if (!motor_current.Calibrated) { motor_fault_trip(MOTOR_FAULT_CALIBRATION); return false; }
+    if (!AS5047P_DiagnosticsHealthy() || !AS5047P_EncoderCache_Read(&encoder) || encoder.stale) {
+        motor_fault_trip(MOTOR_FAULT_ENCODER); return false;
+    }
+    if (!ina219_bus_valid || !isfinite(ina219_vbus) || ina219_vbus < FOC_BUS_MIN_VALID_V ||
+        ina219_vbus > FOC_BUS_MAX_VALID_V || HAL_GetTick() - ina219_bus_sample_ms >= FOC_BUS_MAX_AGE_MS) {
+        motor_fault_trip(MOTOR_FAULT_BUS); return false;
+    }
+    /* ADC owns this API; TIM3/CAN cannot preempt priority zero. */
+    motor_startup_cancelled = 0U;
+    current_loop_enable = 0U;
+    TIM1->CCR1 = TIM1->CCR2 = TIM1->CCR3 = TIM1->ARR / 2U;
+    stage2_driver_waiting = 1U;
+    TIM1->BDTR |= TIM_BDTR_MOE;
+    HAL_GPIO_WritePin(DRV_EN_GPIO_Port, DRV_EN_Pin, GPIO_PIN_SET);
+    return true;
+}
+
+bool foc_stage2_apply_alignment(float voltage)
+{
+    if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return false;
+    if (!isfinite(voltage) || voltage < 0.0f || voltage > FOC_ALIGN_VOLTAGE_V) {
+        motor_fault_trip(MOTOR_FAULT_NONFINITE); return false;
+    }
+    if (HAL_GPIO_ReadPin(NFAULT_GPIO_Port, NFAULT_Pin) == GPIO_PIN_RESET) {
+        motor_fault_trip(MOTOR_FAULT_DRIVER); return false;
+    }
+    driver_monitor_enabled = 1U; stage2_driver_waiting = 0U;
+    alignment_in_progress = 1U;
+    foc_forward(voltage, 0.0f, 0.0f);
+    return motor_fault_reason == MOTOR_FAULT_NONE;
+}
+
+bool foc_stage2_apply_iq(float iq, float limit, bool first)
+{
+    if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled || !motor_electrical_calibrated ||
+        !isfinite(iq) || !isfinite(limit) || limit <= 0.0f || limit > CURRENT_REF_HARD_MAX_A || fabsf(iq) > limit)
+        return false;
+    if (HAL_GPIO_ReadPin(NFAULT_GPIO_Port, NFAULT_Pin) == GPIO_PIN_RESET) {
+        motor_fault_trip(MOTOR_FAULT_DRIVER); return false;
+    }
+    if (first) {
+        encoder_cache_t encoder = {0};
+        if (!AS5047P_DiagnosticsHealthy() || !AS5047P_EncoderCache_Read(&encoder) || encoder.stale) {
+            motor_fault_trip(MOTOR_FAULT_ENCODER); return false;
+        }
+        current_loop.integral_prev = current_loop.output_prev = current_loop.error_prev = 0.0f;
+        id_current_loop.integral_prev = id_current_loop.output_prev = id_current_loop.error_prev = 0.0f;
+        motor_control.id_filter_state = motor_control.iq_filter_state = 0.0f;
+        current_loop.timestamp_prev_cycles = id_current_loop.timestamp_prev_cycles = dwt_get_cycles();
+    }
+    motor_config.speed_current_limit = limit;
+    motor_control.set_torque = iq; motor_control.id_target = 0.0f;
+    motor_control.mode = MOTOR_TORQUE;
+    driver_monitor_enabled = 1U; stage2_driver_waiting = 0U;
+    alignment_in_progress = 0U; motor_ready = current_loop_enable = 1U;
+    return true;
+}
+
+bool foc_stage2_complete_alignment(float zero)
+{
+    uint32_t primask;
+    if (!isfinite(zero) || zero < 0.0f || zero >= _2PI) return false;
+    primask = __get_PRIMASK(); __disable_irq();
+    if (!MotorSupervisor_PermitsOutput() || motor_fault_reason != MOTOR_FAULT_NONE) {
+        __set_PRIMASK(primask); return false;
+    }
+    foc_disarm();
+    motor_control.zero_elec_angle = zero;
+    motor_electrical_calibrated = 1U;
+    __set_PRIMASK(primask);
+    return true;
 }
 
 bool foc_enable_driver(void)
@@ -536,7 +638,7 @@ bool foc_enable_control(void)
     bool enabled = false;
     encoder_cache_t encoder = {0};
     __disable_irq();
-    if (motor_fault_reason == MOTOR_FAULT_NONE && !motor_startup_cancelled && motor_current.Calibrated &&
+    if (!EncoderBench_IsActive() && motor_fault_reason == MOTOR_FAULT_NONE && !motor_startup_cancelled && motor_current.Calibrated &&
         driver_monitor_enabled && !alignment_in_progress &&
         AS5047P_DiagnosticsHealthy() && AS5047P_EncoderCache_Read(&encoder) &&
         encoder.data_valid && !encoder.stale) {
@@ -551,6 +653,7 @@ bool foc_enable_control(void)
 void foc_process_current_sample(uint16_t raw_a, uint16_t raw_c)
 {
     current_sample_result_t result;
+    MotorSupervisor_OnAdcProgress(HAL_GetTick());
     motor_current.Raw_A = raw_a;
     motor_current.Raw_C = raw_c;
     adc_last_cycle = dwt_get_cycles();
@@ -595,13 +698,27 @@ void foc_process_current_sample(uint16_t raw_a, uint16_t raw_c)
     motor_current.I_B = current_protection.ib;
     motor_current.I_C = current_protection.ic;
     foc_sync_phase_currents();
+    MotorSupervisor_ApplyAtAdcBoundary(HAL_GetTick());
+    if (MotorSupervisor_Active() && !MotorPort_RunOuterLoop()) {
+        MotorSupervisor_FaultISR(MotorPort_MotionFaultBits(), MotorPort_MotionFaultDetail()); return;
+    }
     if (current_loop_enable) foc_current_loop();
+    MotorSupervisor_PublishSample(HAL_GetTick());
 }
 
 void foc_check_sampling_progress(void)
 {
-    if (motor_fault_reason == MOTOR_FAULT_NONE && adc_progress_armed &&
-        (uint32_t)(dwt_get_cycles() - adc_last_cycle) >=
+    /* TIM3 can be preempted by ADC. Snapshot the clock and ADC timestamp
+     * together: a fresh ADC timestamp paired with an older clock underflows
+     * the unsigned age and falsely trips a healthy current loop. */
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint32_t now = dwt_get_cycles();
+    uint32_t last = adc_last_cycle;
+    uint8_t armed = adc_progress_armed;
+    __set_PRIMASK(primask);
+    if (motor_fault_reason == MOTOR_FAULT_NONE && armed &&
+        (uint32_t)(now - last) >=
         (SystemCoreClock / 1000U) * CURRENT_ADC_TIMEOUT_MS) {
         motor_fault_trip(MOTOR_FAULT_ADC_TIMEOUT);
     }
@@ -981,10 +1098,10 @@ static void foc_cordic_sin_cos_current(float angle_el, float *s, float *c)
 }
 
 /**
-  * @brief  位置外环 — 1 kHz，在 TIM3 ISR 中调用
+  * @brief  位置外环 — 保留的 1 kHz 实现；当前活动运动路径由 MotorPort_RunOuterLoop 以 500 Hz 执行。
   *         P 位置控制产生速度目标，并受最大速度、加速度和
   *         剩余制动距离共同约束，避免大位置阶跃直接冲击速度环。
-  *         规划后的 motor_control.set_speed 供 2 kHz 速度环使用。
+  *         规划后的 motor_control.set_speed 供 1 kHz 速度环使用。
   *
   *         读取 TIM2 ISR (P=1) 发布的编码器一致性快照
   *         写入 motor_control.set_speed (ADC ISR 读取者, P=0)
@@ -1087,11 +1204,11 @@ static float foc_initial_speed_kp(float speed_ref)
 }
 
 /**
-  * @brief  速度外环 — 2 kHz，级联在电流环之上
-  *         滤波编码器的 4 ms 整数计数窗口速度，运行
+  * @brief  速度外环 — 1 kHz，级联在电流环之上
+  *         使用编码器的 20 间隔计数窗口速度，运行
   *         PI 控制器，并设置 motor_control.set_torque
   *
-  *         在 foc_current_loop() 中每 10 次 ADC ISR (SPEED_DECIMATION) 调用一次
+  *         在 foc_current_loop() 中每 16 次 ADC ISR (SPEED_DECIMATION) 调用一次
   */
 static void foc_speed_loop(const encoder_cache_t *encoder)
 {
@@ -1108,10 +1225,10 @@ static void foc_speed_loop(const encoder_cache_t *encoder)
         return;
     }
 
-    /* 2. 使用编码器的 4 ms 整数计数滑动窗口速度 */
+    /* 2. 使用编码器的 20 间隔整数计数滑动窗口速度 */
     float vel_raw = encoder->velocity_rad_s;
 
-    /* 3. 在 2 kHz 速度环频率下应用约 17 Hz 一阶低通滤波器 */
+    /* 3. Short 100 Hz pole after the encoder's 20-interval averaging window. */
     float vel_filt = lowPassFilter(vel_raw, SPEED_LPF_ALPHA,
                                    &motor_control.vel_filter_state);
 
@@ -1138,7 +1255,7 @@ static void foc_speed_loop(const encoder_cache_t *encoder)
 }
 
 /**
-  * @brief  电流（转矩）环 — 20 kHz，在 ADC 注入回调中执行
+  * @brief  电流（转矩）环 — 16 kHz，在 ADC 注入回调中执行
   *
   *          功能:
   *            - Iq PI 控制（转矩 / 速度 / 位置外环）
@@ -1157,7 +1274,7 @@ void foc_current_loop(void)
     encoder_cache_t encoder = {0};
     (void)AS5047P_EncoderCache_Read(&encoder);
 
-    /* ── 0. 速度环降采样: 每 10 次 ADC ISR 运行一次 @ 2 kHz ── */
+    /* ── 0. 速度环降采样: 每 16 次 ADC ISR 运行一次 @ 1 kHz ── */
     {
         static uint8_t speed_cnt = 0;
         if (motor_control.mode == MOTOR_SPEED || motor_control.mode == MOTOR_POSITION) {
@@ -1177,7 +1294,7 @@ void foc_current_loop(void)
      *       1 级 (瞬时陈旧)  : 停止外推，冻结在最后已知角度，并折减电流限幅
      *       2 级 (持续掉线)  : 锁存故障并关断功率级，需复位 MCU 恢复
      *     分级的意义在于: AS5047P 偶发单帧校验错是正常的，逐帧停机不实用;
-     *     而连续 20 帧 (1 ms @20kHz) 无有效数据已超出任何可恢复的暂态范围。  */
+     *     而连续 16 帧 (1 ms @16kHz) 无有效数据已超出任何可恢复的暂态范围。  */
     float angle_mech = encoder.angle_raw;
     float angle_age_s = dwt_cycles_to_seconds(encoder.age_cycles);
     float current_limit_scale = 1.0f;
@@ -1228,9 +1345,9 @@ void foc_current_loop(void)
     float I_d_raw = I_alpha * c + I_beta * s;
     float I_q_raw = I_beta  * c - I_alpha * s;
 
-    /* ── 3. 双轴低通滤波, alpha=0.05 → fc≈163Hz @ 20kHz ── */
-    motor_control.id_meas = lowPassFilter(I_d_raw, 0.05f, &motor_control.id_filter_state);
-    motor_control.iq_meas = lowPassFilter(I_q_raw, 0.05f, &motor_control.iq_filter_state);
+    /* ── 3. 双轴低通滤波, alpha=0.0621 → fc≈163Hz @ 16kHz ── */
+    motor_control.id_meas = lowPassFilter(I_d_raw, 0.0621f, &motor_control.id_filter_state);
+    motor_control.iq_meas = lowPassFilter(I_q_raw, 0.0621f, &motor_control.iq_filter_state);
 
     /* ── 4. 交叉耦合 + 反电动势前馈 ── */
     /*     Vd = Rs·Id + Ld·dId/dt - ω·Lq·Iq   →   Vd_ff = -ω·Lq·Iq            */
@@ -1263,11 +1380,13 @@ void foc_current_loop(void)
     }
     /* Bound each axis before squaring, including internal references; the
      * final vector clamp below retains the coupled dq limit. */
+    current_ref_limited = fabsf(iq_target) > current_limit || fabsf(id_target) > current_limit;
     iq_target = _constrain(iq_target, -current_limit, current_limit);
     id_target = _constrain(id_target, -current_limit, current_limit);
     float current_ref_sq = iq_target * iq_target + id_target * id_target;
     float current_limit_sq = current_limit * current_limit;
     if (current_ref_sq > current_limit_sq && current_ref_sq > 0.0f) {
+        current_ref_limited = 1U;
         float scale = current_limit / sqrtf(current_ref_sq);
         iq_target *= scale;
         id_target *= scale;

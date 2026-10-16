@@ -8,6 +8,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "vofa.h"
 #include "foc.h"        /* UART2_SendString(), motor_control, motor_config    */
+#include "motor_supervisor.h"
 #include "usart.h"      /* huart2, hdma_usart2_rx                             */
 #include "pid.h"        /* foc_set_current_pid(), foc_set_id_current_pid()    */
 #include <stdio.h>
@@ -16,6 +17,7 @@
 #include <math.h>
 #include <errno.h>
 #include "uart_tx.h"
+#include "encoder_bench.h"
 
 volatile uint32_t vofa_rejected_frames = 0U;
 volatile uint32_t vofa_rx_dropped = 0U;
@@ -209,6 +211,7 @@ static void vofa_parse_cmd(const char *line, uint16_t length)
         vofa_reject();
         return;
     }
+    if (EncoderBench_Command(line)) return;
     const char *p = line;
     uint8_t iq_dirty = 0, id_dirty = 0, spd_dirty = 0, pos_dirty = 0;
     uint8_t torque_dirty = 0, id_cmd_dirty = 0, speed_cmd_dirty = 0;
@@ -334,7 +337,7 @@ static void vofa_parse_cmd(const char *line, uint16_t length)
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
 
-    if (!motor_ready || motor_fault_reason != MOTOR_FAULT_NONE ||
+    if (MotorSupervisor_Active() || !motor_ready || motor_fault_reason != MOTOR_FAULT_NONE ||
         ((torque_dirty || id_cmd_dirty) &&
          set_torque * set_torque + id_target * id_target > speed_current_limit * speed_current_limit)) {
         __set_PRIMASK(primask);
@@ -460,7 +463,7 @@ void VOFA_ProcessCmd(void)
 void VOFA_CheckCommandTimeout(void)
 {
 #if APP_COMMAND_TIMEOUT_MS
-    if (!motor_ready || motor_fault_reason != MOTOR_FAULT_NONE) return;
+    if (MotorSupervisor_Active() || !motor_ready || motor_fault_reason != MOTOR_FAULT_NONE) return;
     uint32_t now = HAL_GetTick();
     if (!command_lease_started) {
         command_last_ms = now;

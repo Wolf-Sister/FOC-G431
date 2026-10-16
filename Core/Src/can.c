@@ -3,6 +3,8 @@
 #include "fdcan.h"
 #include "foc.h"
 #include <string.h>
+#include <math.h>
+#include "motor_supervisor.h"
 
 volatile CAN_DebugTypeDef canDebug;
 
@@ -12,21 +14,24 @@ volatile CAN_DebugTypeDef canDebug;
 #define CAN_TX_BUFFERS (FDCAN_TX_BUFFER0 | FDCAN_TX_BUFFER1 | FDCAN_TX_BUFFER2)
 #define CAN_FAULT_BUS_OFF (1U << 11)
 
-typedef struct { uint8_t data[8]; } CAN_Packet;
+typedef struct { uint8_t data[8]; uint32_t epoch, receivedMs; } CAN_Packet;
 typedef struct {
     uint8_t valid, request[8], reply[8];
-    uint32_t created;
+    uint32_t created, epoch;
 } CAN_CachedReply;
 
 /* Equal CAN IRQ priorities give one RX producer; main is the consumer. */
 static CAN_Packet requests[CAN_QUEUE_DEPTH], replies[CAN_QUEUE_DEPTH];
 static volatile uint32_t requestHead, requestTail;
-static uint32_t replyHead, replyTail, nextCache, lastHeartbeat;
+static volatile uint32_t replyHead, replyTail, eventHead, eventTail;
+static uint32_t nextCache, lastHeartbeat, lastFast, lastPosition;
+static CAN_Packet eventsQueue[CAN_QUEUE_DEPTH];
+static uint8_t fastPending, positionPending;
 static CAN_CachedReply cache[CAN_QUEUE_DEPTH];
 static uint8_t heartbeatPending, faultPending, recoveryPrepared, sampleDivider;
 static uint16_t lastReportedFault;
 static uint8_t lastHealthyState, faultState, busOffOriginState;
-static uint16_t firstFaultDetail;
+static uint16_t canLegacyFaultDetail;
 static volatile uint16_t canFaultBits;
 static volatile uint8_t adcProgress;
 static uint32_t recoveryTick;
@@ -66,6 +71,8 @@ static uint16_t CAN_MotorFaultBits(void)
 
 static void CAN_ReadStatus(CAN_NodeStatus *status)
 {
+    memset(status, 0, sizeof(*status));
+    status->commandAge = UINT32_MAX;
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     status->faultBits = (uint16_t)(CAN_MotorFaultBits() | canFaultBits);
@@ -84,6 +91,7 @@ static void CAN_ReadStatus(CAN_NodeStatus *status)
     status->busStatus = canDebug.tec | (canDebug.rec << 8) |
                         (canDebug.busOff << 16) | (canDebug.errorPassive << 17);
     __set_PRIMASK(primask);
+    if (MotorSupervisor_Active()) MotorSupervisor_ReadStatus(status, HAL_GetTick());
     status->firmwareVersion = APP_FIRMWARE_VERSION;
     status->uid[0] = HAL_GetUIDw0();
     status->uid[1] = HAL_GetUIDw1();
@@ -92,7 +100,7 @@ static void CAN_ReadStatus(CAN_NodeStatus *status)
 
 static void CAN_Stop(void)
 {
-    foc_disarm();
+    if (MotorSupervisor_Active()) MotorSupervisor_StopISR(); else foc_disarm();
     canDebug.stopCount++;
 }
 
@@ -102,7 +110,8 @@ static void CAN_BusOff(void)
     __disable_irq();
     if (canDebug.recoveryPhase == 0U) {
         busOffOriginState = alignment_in_progress ? CAN_STATE_ALIGNING : lastHealthyState;
-        CAN_Stop();
+        if (MotorSupervisor_Active()) MotorSupervisor_FaultISR(MOTOR_FAULT_BIT_BUS_OFF, 0U);
+        else CAN_Stop();
         canFaultBits |= CAN_FAULT_BUS_OFF;
         busOffTick = HAL_GetTick();
         canDebug.busOffCount++;
@@ -148,21 +157,29 @@ static void CAN_Receive(uint32_t fifo, uint32_t events)
             if (CAN_ProtocolIsStop(data)) CAN_Stop();
             if ((uint32_t)(requestHead - requestTail) >= CAN_QUEUE_DEPTH) canDebug.requestQueueFullCount++;
             else {
-                memcpy(requests[requestHead % CAN_QUEUE_DEPTH].data, data, 8U);
+                CAN_Packet *packet = &requests[requestHead % CAN_QUEUE_DEPTH];
+                memcpy(packet->data, data, 8U);
+                packet->epoch = MotorSupervisor_Epoch(); packet->receivedMs = HAL_GetTick();
                 __DMB();
                 requestHead++;
             }
-        } else canDebug.rxIgnoredCount++; /* Targets are unavailable in stage one. */
+        } else if (APP_CAN_NODE_ID && header.Identifier == CAN_ID_TARGET + APP_CAN_NODE_ID) {
+            if (!MotorSupervisor_TargetISR(data, HAL_GetTick())) canDebug.rxIgnoredCount++;
+        } else canDebug.rxIgnoredCount++;
     }
 }
 
-static void CAN_HandleRequest(const uint8_t request[8], const CAN_NodeStatus *status,
+static void CAN_HandleRequest(const CAN_Packet *packet, const CAN_NodeStatus *status,
                                uint32_t now, uint8_t reply[8])
 {
+    const uint8_t *request = packet->data;
     uint32_t i;
+    if (MotorSupervisor_Active() && packet->epoch != MotorSupervisor_Epoch() && !CAN_ProtocolIsStop(request)) {
+        memset(reply, 0, 8U); reply[0] = request[0]; reply[1] = request[1]; reply[2] = CAN_RESULT_BAD_SESSION; return;
+    }
     if (!CAN_ProtocolIsStop(request)) {
         for (i = 0U; i < CAN_QUEUE_DEPTH; i++) {
-            if (cache[i].valid && (uint32_t)(now - cache[i].created) < CAN_CACHE_TIME_MS &&
+            if (cache[i].valid && cache[i].epoch == packet->epoch && (uint32_t)(now - cache[i].created) < CAN_CACHE_TIME_MS &&
                 cache[i].request[1] == request[1]) {
                 if (memcmp(cache[i].request, request, 8U) == 0) memcpy(reply, cache[i].reply, 8U);
                 else {
@@ -173,12 +190,17 @@ static void CAN_HandleRequest(const uint8_t request[8], const CAN_NodeStatus *st
             }
         }
     }
-    CAN_ProtocolReply(request, status, reply);
+    if (request[0] == CAN_OP_GET_INFO || request[0] == CAN_OP_GET_STATUS || !MotorSupervisor_Active())
+        CAN_ProtocolReply(request, status, reply);
+    else if (request[0] == CAN_OP_CLEAR_FAULT &&
+             (canDebug.busOff || canDebug.recoveryPhase)) {
+        memset(reply, 0, 8U); reply[0] = request[0]; reply[1] = request[1]; reply[2] = CAN_RESULT_BAD_STATE;
+    } else MotorSupervisor_Request(request, packet->epoch, packet->receivedMs, now, reply);
     if (!CAN_ProtocolIsStop(request)) {
         CAN_CachedReply *entry = &cache[nextCache++ % CAN_QUEUE_DEPTH];
         memcpy(entry->request, request, 8U);
         memcpy(entry->reply, reply, 8U);
-        entry->created = now;
+        entry->created = now; entry->epoch = packet->epoch;
         entry->valid = 1U;
     }
 }
@@ -192,10 +214,10 @@ static bool CAN_Recover(uint32_t now, const FDCAN_ProtocolStatusTypeDef *protoco
         uint32_t primask = __get_PRIMASK();
         __disable_irq();
         requestTail = requestHead;
-        __set_PRIMASK(primask);
-        replyTail = replyHead;
+        replyTail = replyHead; eventTail = eventHead;
         memset(cache, 0, sizeof(cache));
-        heartbeatPending = faultPending = 0U;
+        __set_PRIMASK(primask);
+        heartbeatPending = faultPending = fastPending = positionPending = 0U;
         recoveryPrepared = 1U;
         if (HAL_FDCAN_AbortTxRequest(&hfdcan1, CAN_TX_BUFFERS) != HAL_OK) {
             canDebug.halError = HAL_FDCAN_GetError(&hfdcan1);
@@ -232,10 +254,10 @@ static void CAN_Send(const CAN_NodeStatus *status)
     uint8_t data[8];
     uint32_t kind;
     if (canDebug.recoveryPhase != 0U || !APP_CAN_NODE_ID ||
-        (!faultPending && replyHead == replyTail && !heartbeatPending)) return;
+        (!faultPending && replyHead == replyTail && eventHead == eventTail && !heartbeatPending && !fastPending && !positionPending)) return;
     /* At most one periodic frame in hardware; reserve room for replies/faults. */
     if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) <=
-        (uint32_t)((!faultPending && replyHead == replyTail) ? 2U : 0U)) {
+        (uint32_t)((!faultPending && replyHead == replyTail && eventHead == eventTail) ? 2U : 0U)) {
         canDebug.txBusyCount++;
         return;
     }
@@ -245,22 +267,59 @@ static void CAN_Send(const CAN_NodeStatus *status)
         data[0] = faultState; data[1] = status->mode;
         CAN_WriteU16(data + 2, status->faultBits);
         CAN_WriteU16(data + 4, 0U);
-        CAN_WriteU16(data + 6, firstFaultDetail);
+        CAN_WriteU16(data + 6, canLegacyFaultDetail);
+        if (MotorSupervisor_Active()) {
+            uint16_t seq, detail;
+            MotorSupervisor_ReadFault(&data[0], &data[1], &seq, &detail);
+            CAN_WriteU16(data + 4, seq); CAN_WriteU16(data + 6, detail);
+        }
+    } else if (eventHead != eventTail) {
+        kind = 3U; txHeader.Identifier = CAN_ID_EVENT + APP_CAN_NODE_ID;
+        __DMB(); memcpy(data, eventsQueue[eventTail % CAN_QUEUE_DEPTH].data, 8U);
     } else if (replyHead != replyTail) {
         kind = 1U;
         txHeader.Identifier = CAN_ID_REPLY + APP_CAN_NODE_ID;
         memcpy(data, replies[replyTail % CAN_QUEUE_DEPTH].data, 8U);
-    } else {
+    } else if (heartbeatPending) {
         kind = 2U;
         txHeader.Identifier = CAN_ID_HEARTBEAT + APP_CAN_NODE_ID;
         CAN_ProtocolHeartbeat(status, data);
+    }
+    else {
+        motor_snapshot_t sample;
+        if (!MotorSupervisor_ReadSample(&sample) || !sample.valid || !sample.electricalValid ||
+            (uint32_t)(HAL_GetTick() - sample.capturedMs) >= 2U) {
+            fastPending = positionPending = 0U; return;
+        }
+        if (positionPending) {
+            kind = 5U; txHeader.Identifier = CAN_ID_POSITION + APP_CAN_NODE_ID;
+            CAN_WriteU32(data, (uint32_t)sample.turns); CAN_WriteU16(data + 4, sample.rawAngle);
+            CAN_WriteU16(data + 6, (uint16_t)sample.sequence);
+        } else {
+            float speed = sample.velocity * 10.0f, iq = sample.iq * 1000.0f;
+            uint8_t saturated = speed > 32767.0f || speed < -32768.0f || iq > 32767.0f || iq < -32768.0f;
+            if (!isfinite(speed) || !isfinite(iq)) { fastPending = 0U; return; }
+            speed = fmaxf(-32768.0f, fminf(speed, 32767.0f));
+            iq = fmaxf(-32768.0f, fminf(iq, 32767.0f));
+            kind = 4U; txHeader.Identifier = CAN_ID_FEEDBACK + APP_CAN_NODE_ID;
+            data[0] = (uint8_t)sample.appliedSeq;
+            data[1] = (status->state == CAN_STATE_ENABLED ? 1U : 0U) | (status->faultBits ? 2U : 0U) | 4U |
+                (status->commandAge != UINT32_MAX && status->commandAge >= 10U ? 8U : 0U) |
+                (sample.currentLimited ? 16U : 0U) | (sample.appliedValid && status->state == CAN_STATE_ENABLED ? 64U : 0U) |
+                (saturated ? 128U : 0U);
+            CAN_WriteU16(data + 2, sample.rawAngle);
+            CAN_WriteU16(data + 4, (uint16_t)(int16_t)lroundf(speed)); CAN_WriteU16(data + 6, (uint16_t)(int16_t)lroundf(iq));
+        }
     }
     canDebug.txAttemptCount++;
     if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txHeader, data) == HAL_OK) {
         canDebug.txQueuedCount++;
         if (kind == 0U) faultPending = 0U;
         else if (kind == 1U) replyTail++;
-        else heartbeatPending = 0U;
+        else if (kind == 2U) heartbeatPending = 0U;
+        else if (kind == 3U) eventTail++;
+        else if (kind == 4U) fastPending = 0U;
+        else positionPending = 0U;
     } else {
         canDebug.txFailedCount++;
         canDebug.halError = HAL_FDCAN_GetError(&hfdcan1);
@@ -278,11 +337,12 @@ HAL_StatusTypeDef CAN_Init(void)
     canDebug.nodeId = APP_CAN_NODE_ID;
     if (hfdcan1.State != HAL_FDCAN_STATE_READY || hfdcan1.Init.StdFiltersNbr != 3U)
         return CAN_InitResult(HAL_ERROR);
-    requestHead = requestTail = replyHead = replyTail = nextCache = 0U;
+    requestHead = requestTail = replyHead = replyTail = eventHead = eventTail = nextCache = 0U;
+    fastPending = positionPending = 0U; lastFast = lastPosition = HAL_GetTick();
     heartbeatPending = faultPending = recoveryPrepared = sampleDivider = adcProgress = 0U;
     canFaultBits = lastReportedFault = 0U;
     lastHealthyState = faultState = busOffOriginState = CAN_STATE_BOOT;
-    firstFaultDetail = 0U;
+    canLegacyFaultDetail = 0U;
     memset(cache, 0, sizeof(cache));
     canDebug.initStage = 1U;
     filter.IdType = FDCAN_STANDARD_ID;
@@ -337,7 +397,7 @@ void CAN_Poll(void)
     CAN_NodeStatus status;
     FDCAN_ProtocolStatusTypeDef protocol = {0};
     FDCAN_ErrorCountersTypeDef counters = {0};
-    uint32_t now, budget;
+    uint32_t now;
     if (!canDebug.active) return;
     now = HAL_GetTick();
     if (HAL_FDCAN_GetProtocolStatus(&hfdcan1, &protocol) != HAL_OK ||
@@ -356,25 +416,19 @@ void CAN_Poll(void)
         if (lastReportedFault == 0U && status.faultBits != 0U) {
             if (motor_fault_reason != MOTOR_FAULT_NONE && motor_fault_reason != MOTOR_FAULT_STOP) {
                 faultState = motor_fault_snapshot.was_aligning ? CAN_STATE_ALIGNING : lastHealthyState;
-                firstFaultDetail = (uint16_t)motor_fault_reason;
+                canLegacyFaultDetail = (uint16_t)motor_fault_reason;
             } else {
                 faultState = busOffOriginState;
-                firstFaultDetail = 0U;
+                canLegacyFaultDetail = 0U;
             }
         }
         lastReportedFault = status.faultBits;
         if (status.faultBits != 0U) faultPending = 1U;
     }
     if (status.faultBits == 0U) lastHealthyState = status.state;
-    for (budget = 0U; budget < 4U && requestTail != requestHead &&
-         (uint32_t)(replyHead - replyTail) < CAN_QUEUE_DEPTH; budget++) {
-        uint8_t request[8];
-        __DMB();
-        memcpy(request, requests[requestTail % CAN_QUEUE_DEPTH].data, 8U);
-        __DMB();
-        requestTail++;
-        CAN_HandleRequest(request, &status, now, replies[replyHead++ % CAN_QUEUE_DEPTH].data);
-    }
+    if (!MotorSupervisor_Active()) CAN_Tick1kHz();
+    if ((uint32_t)(now - lastFast) >= CAN_FEEDBACK_PERIOD_MS) { lastFast = now; fastPending = 1U; }
+    if ((uint32_t)(now - lastPosition) >= CAN_POSITION_PERIOD_MS) { lastPosition = now; positionPending = 1U; }
     if ((uint32_t)(now - lastHeartbeat) >= CAN_HEARTBEAT_PERIOD_MS) {
         lastHeartbeat = now;
         heartbeatPending = 1U;
@@ -383,10 +437,46 @@ void CAN_Poll(void)
 #endif
 }
 
+void CAN_Tick1kHz(void)
+{
+#if APP_CAN_ENABLE
+    uint32_t now = HAL_GetTick(), budget;
+    CAN_NodeStatus status;
+    if (!canDebug.active || canDebug.recoveryPhase) return;
+    for (budget = 0U; budget < 4U && requestTail != requestHead &&
+         (uint32_t)(replyHead - replyTail) < CAN_QUEUE_DEPTH; budget++) {
+        CAN_Packet packet;
+        uint8_t reply[8];
+        __DMB(); packet = requests[requestTail % CAN_QUEUE_DEPTH]; __DMB(); requestTail++;
+        CAN_ReadStatus(&status);
+        if (packet.data[0] == CAN_OP_CAL_KEEPALIVE) {
+            MotorSupervisor_Request(packet.data, packet.epoch, packet.receivedMs, now, reply);
+            continue; /* Lease stream: no reply and no management cache. */
+        }
+        CAN_HandleRequest(&packet, &status, now, replies[replyHead % CAN_QUEUE_DEPTH].data);
+        __DMB(); replyHead++;
+    }
+    if ((uint32_t)(eventHead - eventTail) < CAN_QUEUE_DEPTH) {
+        motor_event_t event;
+        if (MotorSupervisor_TakeEvent(&event)) {
+            uint8_t *data = eventsQueue[eventHead % CAN_QUEUE_DEPTH].data;
+            uint32_t i;
+            data[0] = event.opcode; data[1] = event.requestId; data[2] = event.result; data[3] = event.detail;
+            CAN_WriteU32(data + 4, event.value);
+            for (i = 0U; i < CAN_QUEUE_DEPTH; i++) {
+                if (cache[i].valid && cache[i].request[0] == event.opcode && cache[i].request[1] == event.requestId &&
+                    cache[i].reply[2] == CAN_RESULT_ACCEPTED) memcpy(cache[i].reply, data, 8U);
+            }
+            __DMB(); eventHead++;
+        }
+    }
+#endif
+}
+
 void CAN_OnCurrentSample(void)
 {
 #if APP_CAN_ENABLE
-    if (++sampleDivider >= 20U) { sampleDivider = 0U; adcProgress++; }
+    if (++sampleDivider >= 16U) { sampleDivider = 0U; adcProgress++; }
 #endif
 }
 

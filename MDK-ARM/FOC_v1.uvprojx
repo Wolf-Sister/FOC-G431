@@ -406,6 +406,31 @@
               <FilePath>../Core/Src/can_protocol.c</FilePath>
             </File>
             <File>
+              <FileName>motor_motion.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/motor_motion.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_alignment.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/motor_alignment.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_port.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/motor_port.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_supervisor.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/motor_supervisor.c</FilePath>
+            </File>
+            <File>
+              <FileName>ina219_service.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/ina219_service.c</FilePath>
+            </File>
+            <File>
               <FileName>as5047p.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\as5047p.c</FilePath>
@@ -490,6 +515,11 @@
               <FileName>vofa.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\vofa.c</FilePath>
+            </File>
+            <File>
+              <FileName>encoder_bench.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\encoder_bench.c</FilePath>
             </File>
             <File>
               <FileName>ina219.c</FileName>

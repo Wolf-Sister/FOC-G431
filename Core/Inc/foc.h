@@ -69,10 +69,12 @@ extern "C" {
 #define FOC_DRIVER_READY_TIMEOUT_MS  50U
 
 /* 速度环 -----------------------------------------------------------------*/
-#define SPEED_DECIMATION   10         /* 20kHz / 10 = 2kHz 速度环             */
-#define SPEED_LPF_ALPHA    0.0529f    /* 约 17 Hz 低通滤波器 alpha @ 2 kHz      */
+#define SPEED_DECIMATION   16         /* 16kHz / 16 = 1kHz 速度环             */
+/* The encoder averages about 1 ms. Keep this extra pole short enough for
+ * braking during breakaway: 100 Hz at 1 kHz, alpha = 1-exp(-2*pi*100/1000). */
+#define SPEED_LPF_ALPHA    0.4665119f
 #define SPEED_GAIN_SCHEDULE_DEFAULT       1U
-#define SPEED_KP_LOW_SPEED_DEFAULT    0.090f
+#define SPEED_KP_LOW_SPEED_DEFAULT    0.040f
 #define SPEED_KP_HIGH_SPEED_DEFAULT   0.020f
 #define SPEED_KP_SWITCH_DOWN_RAD_S    8.0f
 #define SPEED_KP_SWITCH_UP_RAD_S      9.0f
@@ -97,7 +99,7 @@ extern "C" {
 
 /* 编码器数据有效性 --------------------------------------------------------*/
 /* 陈旧阈值定义在 as5047p_ext.h (AS5047P_STALE_LIMIT_S)，由缓存模块自行判定 */
-#define FOC_ENCODER_LOST_FRAMES        20U    /* 连续陈旧帧数阈值 → 掉线 @20kHz  */
+#define FOC_ENCODER_LOST_FRAMES        16U    /* 连续陈旧帧数阈值 → 约 1 ms @16kHz */
 #define FOC_ENCODER_DEGRADE_SCALE      0.3f   /* 陈旧期间电流限幅折减比例        */
 
 /* 电机电气参数 — 请根据实际电机调整! ------------------*/
@@ -228,6 +230,7 @@ extern volatile uint32_t encoder_stale_count;   /* 当前连续陈旧帧数 (诊
 
 /* PWM 占空比被限幅标志 — 供电流环做抗饱和回灌                              */
 extern volatile uint8_t pwm_duty_clipped;
+extern volatile uint8_t current_ref_limited;
 
 /* CORDIC sin/cos 缓存 — 当前帧轮询成功时更新，超时时作为安全回退                */
 extern volatile float cordic_sin_cache;
@@ -259,7 +262,7 @@ HAL_StatusTypeDef foc_alignSensor(void);
 /* --- 闭环控制 ---------------------------------------------------*/
 void  foc_current_loop(void);
 
-/* --- 位置外环 (1 kHz, TIM3 ISR) ---------------------------------*/
+/* --- 位置外环 (legacy 1 kHz implementation; active motion path runs at 500 Hz) --- */
 void  foc_position_loop(void);
 
 /* --- SVPWM 前向通道 (d,q → PWM) ----------------------------------------*/
@@ -274,6 +277,11 @@ float _calculate_zero_electric_angle(void);
 void  foc_safe_stop(void);
 /* Stage-one stop inhibits further startup until reset, without inventing a fault. */
 void foc_disarm(void);
+bool foc_stage2_driver_enabled(void);
+bool foc_stage2_begin_driver(void);
+bool foc_stage2_apply_iq(float iq, float limit, bool first);
+bool foc_stage2_apply_alignment(float voltage);
+bool foc_stage2_complete_alignment(float zero);
 extern volatile uint8_t motor_startup_cancelled;
 extern volatile uint8_t motor_electrical_calibrated;
 

@@ -2,10 +2,10 @@
 #define APP_CONFIG_H
 
 /* UART2 command reception, telemetry and logs: 1=on, 0=off.
- * Keep enabled while the CAN control interface is not implemented.
+ * Default off for CAN operation; override to 1 for encoder bench commands.
  * A compiler definition may override this default for all source files. */
 #ifndef APP_UART_ENABLE
-#define APP_UART_ENABLE 1
+#define APP_UART_ENABLE 0
 #endif
 
 #if (APP_UART_ENABLE != 0) && (APP_UART_ENABLE != 1)
@@ -30,11 +30,35 @@
 #endif
 
 #ifndef APP_FIRMWARE_VERSION
-#define APP_FIRMWARE_VERSION 0x00010100U
+#define APP_FIRMWARE_VERSION 0x00010306U
 #endif
 
-/* 0: attended bench keeps the last target. Remote integrations must choose a
- * finite lease and send valid motion commands or HB=1 before it expires. */
+/* Measured lower static noise: select CORDICANG at SPI 0x3FFF on every boot.
+ * Set 0 to restore compensated-angle startup; no OTP programming. */
+#ifndef APP_ENCODER_RAW_ANGLE
+#define APP_ENCODER_RAW_ANGLE 1
+#endif
+#if (APP_ENCODER_RAW_ANGLE != 0) && (APP_ENCODER_RAW_ANGLE != 1)
+#error "APP_ENCODER_RAW_ANGLE must be 0 or 1"
+#endif
+
+/* This board is an uninstalled bench motor: continuous-axis (WHEEL) semantics.
+ * Set 1 for an installed JOINT; ordinary JOINT ARM needs stage-three limits. */
+#ifndef APP_MOTOR_ROLE
+#define APP_MOTOR_ROLE 2U
+#endif
+#if (APP_MOTOR_ROLE < 0) || (APP_MOTOR_ROLE > 2U)
+#error "APP_MOTOR_ROLE must be 0, 1 or 2"
+#endif
+#ifndef APP_AUTO_CALIBRATE
+#define APP_AUTO_CALIBRATE 1U
+#endif
+#if (APP_AUTO_CALIBRATE != 0) && (APP_AUTO_CALIBRATE != 1)
+#error "APP_AUTO_CALIBRATE must be 0 or 1"
+#endif
+
+/* Legacy UART-only timeout. Stage-two CAN always uses a 20 ms received-target
+ * lease, independently of this setting; UART HB never renews CAN authority. */
 #ifndef APP_COMMAND_TIMEOUT_MS
 #define APP_COMMAND_TIMEOUT_MS 0U
 #endif

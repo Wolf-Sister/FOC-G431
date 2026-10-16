@@ -43,6 +43,10 @@ extern "C" {
 #define AS5047P_REG_SETTINGS1   0x0018U  /* 设置1 (ABI, 分辨率等)                  */
 #define AS5047P_REG_SETTINGS2   0x0019U  /* 设置2 (迟滞, UVW等)                   */
 
+#define AS5047P_SETTINGS1_NOISESET   0x0002U
+#define AS5047P_SETTINGS1_DAECDIS    0x0010U
+#define AS5047P_SETTINGS1_DATASELECT 0x0040U
+
 /* 错误标志位 (ERRFL 寄存器 [7:0]) ------------------------------------*/
 #define AS5047P_ERRFL_PARITY    0x04U  /* 奇偶校验错误                           */
 #define AS5047P_ERRFL_INVCOMM   0x02U  /* 无效命令                              */
@@ -70,7 +74,8 @@ typedef enum {
   AS5047P_DIAG_MAG_LOW,
   AS5047P_DIAG_MAG_HIGH,
   AS5047P_DIAG_MAG_ZERO,
-  AS5047P_DIAG_UNSTABLE
+  AS5047P_DIAG_UNSTABLE,
+  AS5047P_DIAG_CONFIG
 } as5047p_diagnostic_status_t;
 
 typedef struct {
@@ -103,6 +108,16 @@ uint8_t  AS5047P_ReadErrorFlags(void);
 HAL_StatusTypeDef AS5047P_DMA_StartRequest(void);
 uint16_t AS5047P_DMA_GetAngleCallback(uint32_t *sample_cycle);
 void     AS5047P_ConfigUVWPolePairs(uint8_t pp);
+
+typedef struct {
+    uint32_t angle, diagnostic, priming, no_sample, parity, ef, spi, unexpected;
+} as5047p_transfer_counts_t;
+void AS5047P_GetTransferCounts(as5047p_transfer_counts_t *snapshot);
+uint8_t AS5047P_DMA_ExpectedGap(void);
+uint8_t AS5047P_DMA_IsBusy(void);
+/* Main context, timer stopped and DMA idle; never writes PROG/OTP. */
+HAL_StatusTypeDef AS5047P_WriteSettings1Verified(uint16_t value);
+HAL_StatusTypeDef AS5047P_DMA_ResetPipeline(void);
 
 #ifdef __cplusplus
 }

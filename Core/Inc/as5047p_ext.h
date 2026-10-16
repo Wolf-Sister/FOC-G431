@@ -17,8 +17,8 @@ extern "C" {
 #include "main.h"
 #include <stdbool.h>
 
-/* 速度估算器：80 个有效间隔 @ 20 kHz ≈ 4 ms */
-#define AS5047P_VELOCITY_WINDOW_SIZE 80U
+/* 速度估算器：20 个有效间隔；窗口时间随 TIM2 采样周期决定 */
+#define AS5047P_VELOCITY_WINDOW_SIZE 20U
 
 /* 角度帧陈旧阈值: 超过此年龄即认为编码器数据已失效。
  * 4 个 TIM2 周期 (4 × 50 us) 尚未收到新帧，已超出任何可容忍的调度抖动。 */
@@ -43,6 +43,7 @@ typedef struct {
     uint8_t  velocity_window_index;
     uint8_t  velocity_window_count;
     uint8_t  initialized;     /* 0 = 尚未收到有效角度帧，1 = 已初始化       */
+    uint8_t  resync_pending;  /* Rebaseline time after disabled SPI maintenance. */
 } AS5047P_Sensor_T;
 
 extern AS5047P_Sensor_T AngleSensor;
@@ -51,6 +52,8 @@ extern AS5047P_Sensor_T AngleSensor;
 /*  编码器缓存 — TIM2 ISR 写入 (优先级1)，FOC 读取 (优先级0)                  */
 /* ========================================================================== */
 typedef struct {
+    uint16_t raw_angle;
+    int32_t turn_count;
     float    angle_raw;         /* 单圈机械角度 [0, 2pi)                       */
     float    velocity_rad_s;    /* 机械角速度 [rad/s]                           */
     float    total_angle_rad;   /* 多圈累积总角度 [rad]                        */
@@ -65,6 +68,8 @@ typedef struct {
 
 /* API ----------------------------------------------------------------------*/
 void     AS5047P_Sensor_Init(AS5047P_Sensor_T *s);
+/* TIM2 stopped: invalidate old cache and velocity, retaining turn coordinates. */
+void     AS5047P_Sensor_Resync(AS5047P_Sensor_T *s);
 bool     AS5047P_Sensor_Update(AS5047P_Sensor_T *s);
 void     AS5047P_EncoderCache_Publish(const AS5047P_Sensor_T *s);
 bool     AS5047P_EncoderCache_Read(encoder_cache_t *snapshot);

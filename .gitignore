@@ -1,156 +1,81 @@
-# ============================================================
-# FOC_v1 - STM32G431 FOC Motor Controller
-# Git Ignore Rules
-# ============================================================
+# Keep only the CubeMX / Keil project and its build dependencies.
+/*
+!/.gitignore
+!/README.md
+!/FOC_v1.ioc
+!/.mxproject
+!/Core/
+!/Drivers/
+!/Middlewares/
+!/MDK-ARM/
 
-# ----------------------------------------------------------
-# Keil MDK-ARM Build Outputs
-# ----------------------------------------------------------
-# Object files
+# Keil project, startup code, runtime and debugger configuration.
+/MDK-ARM/*
+!/MDK-ARM/FOC_v1.uvprojx
+!/MDK-ARM/FOC_v1.uvoptx
+!/MDK-ARM/startup_stm32g431xx.s
+!/MDK-ARM/RTE/
+!/MDK-ARM/DebugConfig/
+
+# Build outputs and intermediate files. Keep vendor .lib and .a libraries.
 *.o
 *.obj
 *.crf
-
-# Dependency files
 *.d
 *.dep
-
-# Listing files
 *.lst
 *.LST
-
-# Preprocessor output
 *.i
 *.ii
-
-# Linker output
+*.__i
 *.map
 *.htm
-*.html
-
-# Executables / binaries
 *.axf
 *.elf
 *.out
 
-# Hex / binary output (keep if you want to track release binaries)
-# *.hex
-# *.bin
+# .hex and .bin are allowed inside retained directories, except build folders.
+build/
+bin/
+obj/
+out/
+cmake-build-*/
 
-# Keil build intermediate folders
-MDK-ARM/FOC_v1/
-MDK-ARM/DebugConfig/
-MDK-ARM/RTE/
-MDK-ARM/*.uvguix.*
-MDK-ARM/*.uvguix
-MDK-ARM/JLinkLog.txt
-MDK-ARM/JLinkSettings.ini
-MDK-ARM/*.scvd
-MDK-ARM/**/*.dbgconf
-
-# Keil project backup files
-*.uvprojx.bak
-*.uvoptx.bak
-*.uvguix.bak
-
-# Keil browse info
+# Local IDE state, logs and backups.
+.vscode/
+.idea/
+.settings/
+.eide/
+.specstory/
+*.uvguix
+*.uvguix.*
 *.uvprojx_bak
 *.uvoptx_bak
-*.crf.dep
-
-# ARM Compiler specific
-*.__i
 *.scvd
-*.uvguix.*
-
-# ----------------------------------------------------------
-# STM32CubeMX generated (temporary)
-# ----------------------------------------------------------
-*.ioc.bak
-*.ioc.orig
-.mxproject
-
-# ----------------------------------------------------------
-# Debug / Trace
-# ----------------------------------------------------------
 *.JLinkLog.txt
 *.jlink
 JLinkLog.txt
 JLinkSettings.ini
+*.log
+*.bak
+*.orig
+*.base@*
+*.tmp
+*~
 
-# ----------------------------------------------------------
-# Editor / IDE
-# ----------------------------------------------------------
-# Visual Studio Code
-.vscode/
-!.vscode/extensions.json
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
+# Documentation and tests are kept locally, including vendor copies.
+docs/
+tests/
+*.docx
 
-# Eclipse / EIDE
-.settings/
-.eide/
-.eide.usr.ctx.json
-*.ept
-*.eide-template
-
-# JetBrains CLion
-.idea/
-cmake-build-*/
-
-# ----------------------------------------------------------
-# OS Files
-# ----------------------------------------------------------
-# Windows
+# OS and Python cache files.
 Thumbs.db
 Desktop.ini
-*.tmp
 $RECYCLE.BIN/
-
-# macOS
 .DS_Store
 .AppleDouble
 .LSOverride
 ._*
-
-# Linux
-*~
 .directory
-
-# ----------------------------------------------------------
-# Tests
-# ----------------------------------------------------------
-tests/
-
-# Document exports
-*.docx
-docs/
-
-# ----------------------------------------------------------
-# AI / SpecStory (conversation history - not source)
-# ----------------------------------------------------------
-.specstory/
-
-# ----------------------------------------------------------
-# Reference & Large Third-party Code
-# (Uncomment if you want to exclude reference projects)
-# ----------------------------------------------------------
-MCU_Develop-main/
-参考/
-资料/
-
-# ----------------------------------------------------------
-# Build output directories (if using custom build system)
-# ----------------------------------------------------------
-/build/
-/bin/
-/obj/
-/out/
-
-# ----------------------------------------------------------
-# Misc
-# ----------------------------------------------------------
-*.log
-*.bak
-*.tmp
+__pycache__/
+*.pyc

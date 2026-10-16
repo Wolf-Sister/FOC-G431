@@ -8,6 +8,8 @@ extern "C" {
 #endif
 
 #define CAN_HEARTBEAT_PERIOD_MS 50U
+#define CAN_FEEDBACK_PERIOD_MS 20U
+#define CAN_POSITION_PERIOD_MS 200U
 
 typedef struct {
     uint32_t initStage; /* 0: check, 1: filters, 2: global, 3: lines,
@@ -41,6 +43,8 @@ extern volatile CAN_DebugTypeDef canDebug;
 HAL_StatusTypeDef CAN_Init(void);
 /* Main-loop only: bounded management/TX/recovery. RX uses HAL callbacks. */
 void CAN_Poll(void);
+/* TIM3 supervisor context; consumes at most four management requests. */
+void CAN_Tick1kHz(void);
 /* ADC callback only; counts actual samples, not timer or main-loop activity. */
 void CAN_OnCurrentSample(void);
 

@@ -24,6 +24,7 @@
 #include <math.h>
 #include "as5047p.h"
 #include "as5047p_ext.h"
+#include "encoder_bench.h"
 #include "foc.h"
 #include "pid.h"
 #include "uart_tx.h"
@@ -31,6 +32,7 @@
 #include "vofa.h"
 #include "ina219.h"
 #include "can.h"
+#include "motor_supervisor.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -151,29 +153,16 @@ int main(void)
   UART2_SendString("  STM32G431 FOC v1\r\n");
   UART2_SendString("========================================\r\n");
 
+  DWT_Init();
+  control_pid_init();
+  motor_control_parm_init();
+  MotorSupervisor_Init(HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ HAL_GetUIDw2() ^ dwt_get_cycles(),
+                       HAL_GetTick(), APP_AUTO_CALIBRATE != 0U);
   if (CAN_Init() != HAL_OK) {
     UART2_SendString("[CAN] ERROR: service not started\r\n");
-    foc_disarm();
+    MotorSupervisor_StopISR();
   }
-#if APP_CAN_ENABLE
-  if (APP_CAN_NODE_ID == 0U) foc_disarm();
-#endif
-
-  /* TIM3 supervision is independent of startup and of the selected mode. */
-  if (HAL_TIM_Base_Start_IT(&htim3) != HAL_OK) Error_Handler();
-
-  /* INA219 母线电压/电流检测 — 母线无效时禁止使能功率级 */
-  if (INA219_Init() != HAL_OK)
-  {
-    UART2_SendString("[INA219] ERROR: device not found on I2C1\r\n");
-  }
-  else
-  {
-    UART2_SendString("[INA219] OK: bus monitor ready\r\n");
-  }
-
-  /* 1. Init DWT for PID microsecond timing */
-  DWT_Init();
+  INA219_ServiceInit();
 
   /* 2. Init encoder sensor state */
   AS5047P_Sensor_Init(&AngleSensor);
@@ -186,14 +175,14 @@ int main(void)
 
   if (motor_fault_reason == MOTOR_FAULT_NONE) {
     /* 4. Kick off first DMA encoder read (pipelined: each Update reads previous result).
-     *    TIM2 encoder ISR @ 20kHz is started later by foc_alignSensor(). */
+     *    TIM2 encoder ISR sampling frequency is configured independently of TIM1. */
     (void)AS5047P_DMA_StartRequest();
 
     /* 4. Keep the gate driver disabled while calibrating current offsets. */
     HAL_GPIO_WritePin(DRV_EN_GPIO_Port, DRV_EN_Pin, GPIO_PIN_RESET);
     Motor_Current_Calibration();
 
-    /* 5. Start TIM1 40 kHz 3-phase PWM */
+    /* 5. Start TIM1 ~32 kHz 3-phase PWM */
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
@@ -210,12 +199,15 @@ int main(void)
       Error_Handler();
     }
 
-    /* 7. Start TIM1 update interrupt @ 20 kHz → TRGO triggers ADC chain */
+    /* 7. Start TIM1 update interrupt @ ~16 kHz → TRGO triggers ADC chain */
     __HAL_TIM_CLEAR_IT(&htim1, TIM_IT_UPDATE);
-    HAL_TIM_Base_Start_IT(&htim1);
+    if (HAL_TIM_Base_Start_IT(&htim1) != HAL_OK ||
+        HAL_TIM_Base_Start_IT(&htim2) != HAL_OK) Error_Handler();
 
     UART2_SendString("[FOC] Waiting for current calibration...\r\n");
   }
+
+  if (HAL_TIM_Base_Start_IT(&htim3) != HAL_OK) Error_Handler();
 
   /* 8. Start UART2 DMA RX for VOFA+ command reception */
 #if APP_UART_ENABLE
@@ -228,6 +220,8 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    MotorSupervisor_MainProgress(HAL_GetTick());
+    INA219_ServicePoll(HAL_GetTick());
     foc_check_calibration_timeout();
     {
       static uint8_t fault_reported = 0U;
@@ -254,109 +248,36 @@ int main(void)
 
     CAN_Poll();
 
-    /* Slow bus supervision (5 Hz), not a substitute for fast phase protection. */
-    {
-      static uint32_t last_ina_time = 0;
-      if (!ina219_bus_valid || HAL_GetTick() - last_ina_time >= 200U)
-      {
-        last_ina_time = HAL_GetTick();
-
-        float vbus = 0.0f;
-        float ibus = 0.0f;
-
-        if (INA219_ReadBusVoltage(&vbus) == HAL_OK)
-        {
-          if (!isfinite(vbus) || vbus < FOC_BUS_MIN_VALID_V || vbus > FOC_BUS_MAX_VALID_V) {
-            ina219_bus_valid = 0U;
-            motor_fault_trip(MOTOR_FAULT_BUS);
-          } else {
-            motor_config.voltage_supply = vbus;
-          }
-        } else {
-          motor_fault_trip(MOTOR_FAULT_BUS);
-        }
-        if (INA219_ReadCurrent(&ibus) == HAL_OK)
-        {
-          ina219_ibus = ibus;
-        } else {
-          ina219_ibus = NAN;
-        }
-      }
-    }
-
     /* Process incoming VOFA+ commands (PC → MCU) */
 #if APP_UART_ENABLE
     VOFA_ProcessCmd();
+    EncoderBench_Poll();
     VOFA_CheckCommandTimeout();
 #endif
 
-    /* Automatic electrical calibration remains; normal closed loop is unavailable. */
-    if (motor_current.Calibrated == 1 && test_phase == 0 &&
-        motor_fault_reason == MOTOR_FAULT_NONE && !motor_startup_cancelled)
+    /* Calibration progresses in TIM3 without blocking the main loop. */
     {
-      /* Log calibration result */
-      char log_buf[128];
-      (void)snprintf(log_buf, sizeof(log_buf),
-                     "[FOC] Calibration Done! OffsetA: %.2f, OffsetC: %.2f\r\n",
-                     motor_current.Offset_A, motor_current.Offset_C);
-      UART2_SendString(log_buf);
-
-      /* Enable the gate driver before alignment. */
-      if (!foc_enable_driver() || foc_alignSensor() != HAL_OK)
-      {
-        /* Keep startup failures safe: disable the gate driver and do not
-         * enter closed loop with an invalid zero angle. */
-        if (!motor_startup_cancelled) motor_fault_trip(MOTOR_FAULT_ALIGN_TIMEOUT);
-        test_phase = 1;
-        continue;
+      static uint8_t offsetsReported, readyReported;
+      CAN_NodeStatus status = {0};
+      MotorSupervisor_ReadStatus(&status, HAL_GetTick());
+      if (motor_current.Calibrated && !offsetsReported) {
+        char log[100];
+        (void)snprintf(log, sizeof(log), "[FOC] Calibration Done! OffsetA: %.2f, OffsetC: %.2f\r\n",
+                       motor_current.Offset_A, motor_current.Offset_C);
+        UART2_SendString(log); offsetsReported = 1U;
       }
-
-      /* Alignment no longer falls through into automatic motor control. */
-      foc_disarm();
-
-      encoder_cache_t encoder_wait = {0};
-
-      /* 等待编码器缓存被填充 (至少 2 次 TIM2 更新 ≈ 200 us)。
-       * 必须有超时: 原实现是无界 do-while，若编码器 DMA 始终不产出有效帧，
-       * 主循环会永久卡在这里，而 TIM1 仍在输出 PWM。 */
-      bool encoder_ready = false;
-      uint32_t encoder_wait_start = HAL_GetTick();
-      do {
-        App_CalibrationPoll();
-        (void)AS5047P_EncoderCache_Read(&encoder_wait);
-        if (motor_fault_reason != MOTOR_FAULT_NONE) break;
-        if (encoder_wait.data_valid && !encoder_wait.stale && encoder_wait.update_count >= 2U) {
-          encoder_ready = true;
-          break;
-        }
-      } while (HAL_GetTick() - encoder_wait_start < 100U);   /* 100 ms 超时 */
-
-      if (!encoder_ready)
-      {
-        /* 编码器无响应: 关断功率级并停在安全状态，不允许进入闭环 */
-        UART2_SendString("[FOC] ERROR: encoder not responding, aborting\r\n");
-        motor_fault_trip(MOTOR_FAULT_ENCODER);
-        test_phase = 1;
-        continue;
+      test_phase = status.state == CAN_STATE_READY || status.state == CAN_STATE_ENABLED ? 2U : 0U;
+      if (motor_electrical_calibrated && !readyReported) {
+        char log[100];
+        (void)snprintf(log, sizeof(log), "[FOC] Zero elec angle = %.3f rad\r\n[FOC] Ready: output disabled; CAN Iq stage 2\r\n",
+                       motor_control.zero_elec_angle);
+        UART2_SendString(log); readyReported = 1U;
       }
-
-      /* Init motor state & PID */
-      motor_control_parm_init();
-      control_pid_init();
-
-      motor_control.set_torque = 0.0f;
-
-      motor_control.id_target  = 0.0f;
-      motor_control.set_speed  = 0.0f;
-      /* Stage one never calls foc_enable_control(), even when CAN is disabled. */
-      test_phase = 2;
-      UART2_SendString("[FOC] Ready: output disabled; CAN motion unavailable in stage 1\r\n");
-
     }
 
     /* --- Phase 2: existing UART telemetry, with the power stage disabled --- */
 #if APP_UART_ENABLE
-    if (test_phase == 2)
+    if (test_phase == 2 && !EncoderBench_IsActive())
     {
       if (HAL_GetTick() - last_print_time >= 10)
       {
@@ -455,7 +376,7 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 
 /**
-  * @brief  Dual-ADC injected conversion complete callback (triggered by TIM1_TRGO @ 20kHz).
+  * @brief  Dual-ADC injected conversion complete callback (triggered by TIM1_TRGO @ ~16kHz).
   *         Handles current offset calibration, phase current computation, encoder update,
   *         and closed-loop FOC current control.
   */
@@ -474,9 +395,9 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 
 /**
   * @brief  TIM period elapsed callback
-  *         - TIM1 update/TRGO (20 kHz, PWM carrier 40 kHz): safety no-op
+  *         - TIM1 update/TRGO (~16 kHz, PWM carrier ~32 kHz): safety no-op
   *           (FOC runs in ADC ISR)
-  *         - TIM2 (20 kHz): AS5047P encoder SPI read + angle/velocity → cache
+  *         - TIM2: AS5047P encoder SPI read + angle/velocity → cache
   */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
@@ -486,7 +407,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   }
   else if (htim->Instance == TIM2)
   {
-    /* ── 20 kHz encoder update ── */
+    /* ── Encoder TIM2 update ── */
     /* ① SPI read raw angle → parity check → angle unwrap → velocity */
     if (AS5047P_Sensor_Update(&AngleSensor))
     {
@@ -496,8 +417,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   else if (htim->Instance == TIM3)
   {
     foc_check_sampling_progress();
-    /* ── 1 kHz Position loop ── */
-    foc_position_loop();
+    MotorSupervisor_Tick(HAL_GetTick());
+    CAN_Tick1kHz();
   }
 }
 /* USER CODE END 4 */

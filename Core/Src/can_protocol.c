@@ -11,6 +11,12 @@ uint32_t CAN_ReadU32(const uint8_t *data)
            ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
 }
 
+int32_t CAN_ReadI32(const uint8_t *data)
+{
+    uint32_t raw = CAN_ReadU32(data);
+    return raw <= INT32_MAX ? (int32_t)raw : -1 - (int32_t)(UINT32_MAX - raw);
+}
+
 void CAN_WriteU16(uint8_t *data, uint16_t value)
 {
     data[0] = (uint8_t)value;
@@ -50,9 +56,12 @@ void CAN_ProtocolReply(const uint8_t request[8], const CAN_NodeStatus *status,
             case 0: value = CAN_PROTOCOL_VERSION; break;
             case 1: value = status->firmwareVersion; break;
             case 2: case 3: case 4: value = status->uid[selector - 2U]; break;
-            case 5: result = CAN_RESULT_UNSUPPORTED; break; /* No session yet. */
+            case 5:
+                value = status->challenge;
+                if (!value) result = CAN_RESULT_BUSY;
+                break;
             case 6: value = status->capabilities; break;
-            case 7: value = 0U; break; /* Compile seed, no mutable configuration. */
+            case 7: value = status->configRevision; break;
             default: result = CAN_RESULT_BAD_INDEX; break;
             }
         }
@@ -62,12 +71,14 @@ void CAN_ProtocolReply(const uint8_t request[8], const CAN_NodeStatus *status,
             result = CAN_RESULT_BAD_VALUE;
         } else {
             switch (selector) {
-            case 0: value = status->state | ((uint32_t)status->mode << 8); break;
+            case 0: value = status->state | ((uint32_t)status->mode << 8) |
+                            ((uint32_t)status->role << 16) | ((uint32_t)status->source << 24); break;
             case 1: value = status->faultBits; break;
-            case 2: value = 0U; break; /* No accepted/applied motion sequence. */
-            case 3: value = UINT32_MAX; break;
+            case 2: value = status->acceptedSeq | ((uint32_t)status->appliedSeq << 16); break;
+            case 3: value = status->commandAge; break;
             case 4: value = status->busStatus; break;
-            case 5: case 6: value = 0U; break; /* HOME/target flags invalid. */
+            case 5: value = 0U; break; /* HOME remains unavailable. */
+            case 6: value = status->flags; break;
             default: result = CAN_RESULT_BAD_INDEX; break;
             }
         }
@@ -88,7 +99,7 @@ void CAN_ProtocolHeartbeat(const CAN_NodeStatus *status, uint8_t data[8])
     data[0] = status->state;
     data[1] = status->mode;
     CAN_WriteU16(data + 2, status->faultBits);
-    CAN_WriteU16(data + 4, 0U);
+    CAN_WriteU16(data + 4, status->appliedSeq);
     data[6] = status->adcProgress;
-    data[7] = 255U; /* This stage has no valid motion authorization. */
+    data[7] = status->commandAge > 255U ? 255U : (uint8_t)status->commandAge;
 }

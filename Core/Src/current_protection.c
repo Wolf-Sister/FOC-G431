@@ -28,6 +28,8 @@ current_sample_result_t current_protection_sample(current_protection_t *state,
         return CURRENT_SAMPLE_ADC_RANGE;
     }
     if (!state->calibrated) {
+        state->square_sum_a += (uint32_t)raw_a * raw_a;
+        state->square_sum_c += (uint32_t)raw_c * raw_c;
         state->sum_a += raw_a;
         state->sum_c += raw_c;
         if (raw_a < state->min_a) state->min_a = raw_a;
@@ -42,6 +44,11 @@ current_sample_result_t current_protection_sample(current_protection_t *state,
             !current_offset_valid(state->offset_c, state->min_c, state->max_c)) {
             return CURRENT_SAMPLE_CAL_INVALID;
         }
+        if (state->square_sum_a * CURRENT_CAL_SAMPLES - (uint64_t)state->sum_a * state->sum_a >
+                (uint64_t)CURRENT_CAL_MAX_VARIANCE * CURRENT_CAL_SAMPLES * CURRENT_CAL_SAMPLES ||
+            state->square_sum_c * CURRENT_CAL_SAMPLES - (uint64_t)state->sum_c * state->sum_c >
+                (uint64_t)CURRENT_CAL_MAX_VARIANCE * CURRENT_CAL_SAMPLES * CURRENT_CAL_SAMPLES)
+            return CURRENT_SAMPLE_CAL_INVALID;
         state->calibrated = 1U;
         return CURRENT_SAMPLE_CALIBRATED;
     }
@@ -54,10 +61,13 @@ current_sample_result_t current_protection_sample(current_protection_t *state,
     for (i = 0U; i < 3U; i++) {
         float magnitude = fabsf(phase[i]);
         if (!isfinite(magnitude)) return CURRENT_SAMPLE_NONFINITE;
-        if (magnitude > CURRENT_HARD_TRIP_A) return CURRENT_SAMPLE_OVERCURRENT;
+        if (magnitude > CURRENT_HARD_TRIP_A) { state->soft_fault = 0U; return CURRENT_SAMPLE_OVERCURRENT; }
+    }
+    for (i = 0U; i < 3U; i++) {
+        float magnitude = fabsf(phase[i]);
         if (magnitude > CURRENT_SOFT_TRIP_A) {
             if (state->soft_count[i] < CURRENT_SOFT_TRIP_FRAMES) state->soft_count[i]++;
-            if (state->soft_count[i] >= CURRENT_SOFT_TRIP_FRAMES) return CURRENT_SAMPLE_OVERCURRENT;
+            if (state->soft_count[i] >= CURRENT_SOFT_TRIP_FRAMES) { state->soft_fault = 1U; return CURRENT_SAMPLE_OVERCURRENT; }
         } else {
             state->soft_count[i] = 0U;
         }

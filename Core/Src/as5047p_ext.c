@@ -14,6 +14,7 @@
 #include "as5047p_ext.h"
 #include "as5047p.h"
 #include "utils.h"
+#include "encoder_bench.h"
 
 /* 转换常数: AS5047P 14 位 (0–16383) → 0–2π 弧度 -----------*/
 #define AS5047P_RAD_SCALE     (_2PI / AS5047P_ANGLE_STEPS)
@@ -86,6 +87,7 @@ void AS5047P_Sensor_Init(AS5047P_Sensor_T *s)
     s->velocity_window_index = 0U;
     s->velocity_window_count = 0U;
     s->initialized       = 0U;
+    s->resync_pending    = 0U;
 
     for (uint8_t i = 0U; i < AS5047P_VELOCITY_WINDOW_SIZE; i++) {
         s->velocity_count_window[i] = 0;
@@ -93,8 +95,16 @@ void AS5047P_Sensor_Init(AS5047P_Sensor_T *s)
     }
 }
 
+void AS5047P_Sensor_Resync(AS5047P_Sensor_T *s)
+{
+    AS5047P_VelocityWindow_Reset(s);
+    s->resync_pending = 1U;
+    encoder_cache_buffers[0].data_valid = encoder_cache_buffers[1].data_valid = 0U;
+    __DMB();
+}
+
 /**
-  * @brief  更新传感器读数 — 以固定频率 (20kHz TIM ISR) 调用
+  * @brief  更新传感器读数 — 以固定频率 (TIM2 ISR) 调用
   *
   *         1. 读取最新的 DMA 捕获原始角度
   *         2. 检测圈数翻转，实现多圈累积
@@ -105,8 +115,10 @@ bool AS5047P_Sensor_Update(AS5047P_Sensor_T *s)
     uint32_t angle_sample_cycle = 0U;
     uint16_t raw = AS5047P_DMA_GetAngleCallback(&angle_sample_cycle);
     if (raw == 0xFFFFU) {
-        s->total_errors++;
-        s->consecutive_errors++;
+        if (!AS5047P_DMA_ExpectedGap()) {
+            s->total_errors++;
+            s->consecutive_errors++;
+        }
         (void)AS5047P_DMA_StartRequest();
         return false;
     }
@@ -123,6 +135,7 @@ bool AS5047P_Sensor_Update(AS5047P_Sensor_T *s)
         s->sample_cycle       = now_cycle;
         AS5047P_VelocityWindow_Reset(s);
         s->initialized        = 1U;
+        s->resync_pending     = 0U;
         s->consecutive_errors = 0;
         (void)AS5047P_DMA_StartRequest();
         return true;
@@ -143,17 +156,20 @@ bool AS5047P_Sensor_Update(AS5047P_Sensor_T *s)
 
     uint32_t delta_cycles = now_cycle - s->prev_cycle;
     float dt = dwt_cycles_to_seconds(delta_cycles);
-    if (dt > 0.0f && dt < AS5047P_MAX_SAMPLE_DT) {
+    if (!s->resync_pending && dt > 0.0f && dt < AS5047P_MAX_SAMPLE_DT) {
         AS5047P_VelocityWindow_Update(s, (int16_t)delta_count, delta_cycles);
     } else {
         AS5047P_VelocityWindow_Reset(s);
     }
+    s->resync_pending = 0U;
 
     s->prev_angle         = angle;
     s->prev_raw           = raw;
     s->prev_cycle         = now_cycle;
     s->sample_cycle       = now_cycle;
     s->consecutive_errors = 0;
+
+    EncoderBench_OnSample(raw, now_cycle, s->velocity_rad_s, s->velocity_window_count);
 
     (void)AS5047P_DMA_StartRequest();
     return true;
@@ -165,6 +181,8 @@ void AS5047P_EncoderCache_Publish(const AS5047P_Sensor_T *s)
     uint8_t next = current ^ 1U;
     uint32_t next_count = encoder_cache_buffers[current].update_count + 1U;
 
+    encoder_cache_buffers[next].raw_angle = (uint16_t)(s->prev_angle * (16384.0f / _2PI) + 0.5f) & 0x3FFFU;
+    encoder_cache_buffers[next].turn_count = s->turn_count;
     encoder_cache_buffers[next].angle_raw       = s->prev_angle;
     encoder_cache_buffers[next].velocity_rad_s  = s->velocity_rad_s;
     encoder_cache_buffers[next].total_angle_rad = s->total_angle;
@@ -182,9 +200,14 @@ bool AS5047P_EncoderCache_Read(encoder_cache_t *snapshot)
 
     uint8_t before;
     uint8_t after;
+    uint32_t before_count, after_count;
+    uint32_t attempt = 0U;
     do {
         before = encoder_cache_active;
+        before_count = encoder_cache_buffers[before].update_count;
         __DMB();
+        snapshot->raw_angle = encoder_cache_buffers[before].raw_angle;
+        snapshot->turn_count = encoder_cache_buffers[before].turn_count;
         snapshot->angle_raw       = encoder_cache_buffers[before].angle_raw;
         snapshot->velocity_rad_s  = encoder_cache_buffers[before].velocity_rad_s;
         snapshot->total_angle_rad = encoder_cache_buffers[before].total_angle_rad;
@@ -193,7 +216,9 @@ bool AS5047P_EncoderCache_Read(encoder_cache_t *snapshot)
         snapshot->data_valid      = encoder_cache_buffers[before].data_valid;
         __DMB();
         after = encoder_cache_active;
-    } while (before != after);
+        after_count = encoder_cache_buffers[after].update_count;
+    } while ((before != after || before_count != after_count) && ++attempt < 2U);
+    if (before != after || before_count != after_count) { snapshot->data_valid = 0U; snapshot->stale = 1U; return false; }
 
     /* ── 陈旧判定 ──
      * 缓存里保存的是"最后一次成功采集"的快照。DMA 连续失败时该快照会被

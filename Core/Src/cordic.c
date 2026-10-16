@@ -48,7 +48,7 @@ void MX_CORDIC_Init(void)
    *   Cosine function (generates both sin + cos when NBREAD=2)
    *   6 cycles × 4 iter/cycle = 24 iterations → ~6e-8 precision (exceeds float32)
    *   Q1.31 I/O, 1×32-bit write (angle), 2×32-bit read (cos then sin)
-   *   Interrupt disabled: the 20 kHz current ISR polls and reads this frame.
+   *   Interrupt disabled: the 16 kHz current ISR polls and reads this frame.
    */
   LL_CORDIC_Config(CORDIC,
                    LL_CORDIC_FUNCTION_COSINE,
