@@ -12,6 +12,12 @@ static volatile uint8_t active;
 static volatile uint8_t completion; /* 0=pending, 1=complete, 2=error */
 static uint32_t started, conversionStarted, lastSample;
 static uint16_t pendingBus;
+bool INA219_ServiceStorageReady(void) { return !active && phase == INA_IDLE; }
+void INA219_ServiceStorageResume(uint32_t now)
+{
+    ina219_bus_valid = ina219_current_valid = 0U;
+    lastSample = now - 200U;
+}
 #define INA_TRIGGER_CONFIG ((INA219_CONFIG_VALUE & ~7U) | 3U)
 
 static void service_fail(void)

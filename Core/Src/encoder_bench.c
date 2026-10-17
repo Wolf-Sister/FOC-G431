@@ -4,6 +4,7 @@
 #include "as5047p_ext.h"
 #include "foc.h"
 #include "motor_supervisor.h"
+#include "motor_calibration.h"
 #include "tim.h"
 #include "uart_tx.h"
 #include <math.h>
@@ -112,7 +113,7 @@ bool EncoderBench_Command(const char *line)
     if (strcmp(line, "ENC=BEGIN") == 0) {
         uint32_t key = __get_PRIMASK();
         __disable_irq();
-        if (bench_active || !bench_disabled() || !motor_current.Calibrated ||
+        if (MotorCalibration_Busy() || bench_active || !bench_disabled() || !motor_current.Calibrated ||
             motor_fault_reason != MOTOR_FAULT_NONE) {
             __set_PRIMASK(key);
             bench_reply("[ENC] ERR BEGIN requires calibrated disabled fault-free motor\r\n");

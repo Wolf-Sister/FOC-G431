@@ -33,6 +33,7 @@
 #include "ina219.h"
 #include "can.h"
 #include "motor_supervisor.h"
+#include "motor_calibration.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -157,8 +158,9 @@ int main(void)
   DWT_Init();
   control_pid_init();
   motor_control_parm_init();
+  MotorCalibration_Init();
   MotorSupervisor_Init(HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ HAL_GetUIDw2() ^ dwt_get_cycles(),
-                       HAL_GetTick(), APP_AUTO_CALIBRATE != 0U && !softwareResetBoot);
+                       HAL_GetTick(), APP_AUTO_CALIBRATE != 0U && !softwareResetBoot && !MotorCalibration_HasRestore());
   if (CAN_Init() != HAL_OK) {
     UART2_SendString("[CAN] ERROR: service not started\r\n");
     MotorSupervisor_StopISR();
@@ -248,6 +250,8 @@ int main(void)
 #endif
 
     CAN_Poll();
+
+    MotorCalibration_Poll();
 
     /* Process incoming VOFA+ commands (PC → MCU) */
 #if APP_UART_ENABLE

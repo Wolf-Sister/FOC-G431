@@ -21,6 +21,7 @@
 #include "ina219.h"
 #include "motor_supervisor.h"
 #include "motor_port.h"
+#include "motor_calibration.h"
 #include "encoder_bench.h"
 #include "app_config.h"
 
@@ -557,6 +558,29 @@ bool foc_stage2_apply_iq(float iq, float limit, bool first)
     return true;
 }
 
+bool foc_restore_electrical(float zero)
+{
+    motor_health_t health;
+    uint32_t key = MotorPort_Lock();
+    MotorPort_ReadHealth(&health);
+    if (!isfinite(zero) || zero < 0.0f || zero >= _2PI ||
+        !MotorSupervisor_PermitsOutput() || motor_fault_reason != MOTOR_FAULT_NONE ||
+        !health.currentCalibrated || !health.encoderValid || !health.busValid ||
+        health.driverEnabled || health.outputEnabled || alignment_in_progress) {
+        MotorPort_Unlock(key); return false;
+    }
+    foc_disarm();
+    motor_control.zero_elec_angle = zero;
+    motor_electrical_calibrated = 1U;
+    MotorPort_Unlock(key); return true;
+}
+
+void foc_storage_resume(void)
+{
+    adc_last_cycle = dwt_get_cycles();
+    adc_progress_armed = 1U;
+}
+
 bool foc_stage2_complete_alignment(float zero)
 {
     uint32_t primask;
@@ -574,6 +598,7 @@ bool foc_stage2_complete_alignment(float zero)
 
 bool foc_enable_driver(void)
 {
+    if (MotorCalibration_Busy()) return false;
     uint32_t sensor_start = HAL_GetTick();
     uint8_t sensor_ready = 0U;
     do {
@@ -635,6 +660,7 @@ bool foc_enable_driver(void)
 
 bool foc_enable_control(void)
 {
+    if (MotorCalibration_Busy()) return false;
     uint32_t primask = __get_PRIMASK();
     bool enabled = false;
     encoder_cache_t encoder = {0};
@@ -709,6 +735,7 @@ void foc_process_current_sample(uint16_t raw_a, uint16_t raw_c)
 
 void foc_check_sampling_progress(void)
 {
+    if (MotorCalibration_Busy()) return;
     /* TIM3 can be preempted by ADC. Snapshot the clock and ADC timestamp
      * together: a fresh ADC timestamp paired with an older clock underflows
      * the unsigned age and falsely trips a healthy current loop. */

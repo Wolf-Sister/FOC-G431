@@ -12,6 +12,9 @@ void MotorSupervisor_Init(uint32_t seed, uint32_t now, bool automaticCalibration
 bool MotorSupervisor_Active(void);
 /* Call with IRQs locked before accepting a main-loop software reset request. */
 bool MotorSupervisor_ResetReady(void);
+bool MotorSupervisor_RestoreElectrical(float zero);
+void MotorSupervisor_StorageProgress(uint32_t now);
+void MotorSupervisor_EndStorage(uint32_t now);
 bool MotorSupervisor_PermitsOutput(void);
 void MotorSupervisor_ReadFault(uint8_t *state, uint8_t *mode, uint16_t *seq, uint16_t *detail);
 uint32_t MotorSupervisor_Epoch(void);

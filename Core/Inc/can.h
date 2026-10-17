@@ -43,6 +43,7 @@ extern volatile CAN_DebugTypeDef canDebug;
 HAL_StatusTypeDef CAN_Init(void);
 /* Main-loop only: bounded management/TX/recovery. RX uses HAL callbacks. */
 void CAN_Poll(void);
+void CAN_StorageFlush(void);
 /* TIM3 supervisor context; consumes at most four management requests. */
 void CAN_Tick1kHz(void);
 /* ADC callback only; counts actual samples, not timer or main-loop activity. */

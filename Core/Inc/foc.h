@@ -282,6 +282,8 @@ bool foc_stage2_begin_driver(void);
 bool foc_stage2_apply_iq(float iq, float limit, bool first);
 bool foc_stage2_apply_alignment(float voltage);
 bool foc_stage2_complete_alignment(float zero);
+bool foc_restore_electrical(float zero);
+void foc_storage_resume(void);
 extern volatile uint8_t motor_startup_cancelled;
 extern volatile uint8_t motor_electrical_calibrated;
 

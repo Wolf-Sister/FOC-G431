@@ -35,6 +35,7 @@ static struct {
 uint32_t MotorPort_Lock(void) { uint32_t key = __get_PRIMASK(); __disable_irq(); return key; }
 void MotorPort_Unlock(uint32_t key) { __set_PRIMASK(key); }
 void MotorPort_Disable(void) { foc_disarm(); positionWindow.count = 0U; }
+bool MotorPort_RestoreElectrical(float zero) { return foc_restore_electrical(zero); }
 
 void MotorPort_ReadHealth(motor_health_t *health)
 {

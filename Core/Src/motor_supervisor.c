@@ -7,6 +7,7 @@
 #include "encoder_bench.h"
 #include "motor_axis.h"
 #include "motor_profile.h"
+#include "motor_calibration.h"
 #include <string.h>
 #include <math.h>
 
@@ -59,10 +60,10 @@ static uint32_t sampleSequence;
 bool MotorSupervisor_Active(void) { return supervisorInitialized != 0U; }
 bool MotorSupervisor_ResetReady(void)
 {
-    return supervisorInitialized && !pendingStop && !runtime.armPending &&
+    return supervisorInitialized && !MotorCalibration_Busy() && !pendingStop && !runtime.armPending &&
            !runtime.calibrating && !runtime.driverWaiting && !runtime.autoPending;
 }
-bool MotorSupervisor_PermitsOutput(void) { return supervisorInitialized && !pendingStop && !faultBits && !EncoderBench_IsActive(); }
+bool MotorSupervisor_PermitsOutput(void) { return supervisorInitialized && !MotorCalibration_Busy() && !pendingStop && !faultBits && !EncoderBench_IsActive(); }
 void MotorSupervisor_ReadFault(uint8_t *state, uint8_t *mode, uint16_t *seq, uint16_t *detail)
 {
     uint32_t key = MotorPort_Lock();
@@ -160,7 +161,7 @@ void MotorSupervisor_Init(uint32_t seed, uint32_t now, bool automaticCalibration
     runtime.axisStatus = runtime.axis.referencePresent ? MOTOR_AXIS_STATUS_STALE : MOTOR_AXIS_STATUS_NO_REFERENCE;
     runtime.nonce = seed;
     runtime.challenge = next_nonce();
-    runtime.autoPending = automaticCalibration && MotorProfile_Selected.alignmentAllowed &&
+    runtime.autoPending = automaticCalibration && !MotorCalibration_RecoveryRequired() && MotorProfile_Selected.alignmentAllowed &&
                           MotorProfile_Selected.nodeId != 0U && MotorProfile_Validate() &&
                           (runtime.role != MOTOR_ROLE_JOINT ||
                            (MotorProfile_Selected.installationQualified && MotorProfile_Selected.motionQualified &&
@@ -172,6 +173,7 @@ void MotorSupervisor_Init(uint32_t seed, uint32_t now, bool automaticCalibration
 
 void MotorSupervisor_StopISR(void)
 {
+    MotorCalibration_CancelRestore();
     uint32_t key = MotorPort_Lock();
     MotorPort_Disable();
     if (supervisorInitialized) { stopEpoch++; pendingStop = 1U; }
@@ -226,7 +228,7 @@ static bool target_isr(const uint8_t data[8], uint32_t now)
     motor_candidate_t candidate;
     uint16_t previous, difference;
     bool previousValid;
-    if (!supervisorInitialized || pendingStop || faultBits || !runtime.sessionValid ||
+    if (!supervisorInitialized || MotorCalibration_Busy() || pendingStop || faultBits || !runtime.sessionValid ||
         (runtime.state != CAN_STATE_READY && runtime.state != CAN_STATE_ENABLED) || runtime.calibrating ||
         data[2] != runtime.mode || data[3] != 0U) return false;
     candidate.iqMa = CAN_ReadI32(data + 4);
@@ -270,6 +272,7 @@ static void begin_driver(uint32_t now)
 
 static void begin_alignment(uint32_t now, bool remote)
 {
+    MotorCalibration_CancelRestore();
     MotorPort_InvalidateElectrical();
     runtime.state = CAN_STATE_ALIGNING;
     runtime.calibrating = 1U;
@@ -289,6 +292,7 @@ void MotorSupervisor_Tick(uint32_t now)
     tickCount++;
     if (pendingStop) finish_stop(now);
     if (faultBits) return;
+    if (MotorCalibration_Busy()) return;
     MotorPort_ReadHealth(&health);
     if (adcCount && (uint32_t)(now - adcLastMs) >= MOTOR_CONTROL_STALL_MS) {
         MotorSupervisor_FaultISR(MOTOR_FAULT_BIT_CONTROL_STALLED, 10U); finish_stop(now); return;
@@ -431,6 +435,9 @@ static uint8_t get_param(uint16_t index, uint32_t *value)
         break;
     }
     case 0x0225: *value = MotorProfile_Flags(); break;
+    case 0x0230: *value = MotorCalibration_Status(); break;
+    case 0x0231: *value = MotorCalibration_Sequence(); break;
+    case 0x0232: *value = MotorCalibration_Error(); break;
     default: return CAN_RESULT_BAD_INDEX;
     }
     return CAN_RESULT_OK;
@@ -505,7 +512,23 @@ void MotorSupervisor_Request(const uint8_t request[8], uint32_t receivedEpoch, u
     if (request[0] == CAN_OP_GET_PARAM) {
         result = argument ? CAN_RESULT_BAD_VALUE : get_param(index, &value); goto done;
     }
-    if (request[0] == CAN_OP_SET_MECHANICAL_ZERO || request[0] == CAN_OP_SAVE_CONFIG) {
+    if (MotorCalibration_Busy()) { result = CAN_RESULT_BUSY; goto done; }
+    if (request[0] == CAN_OP_SAVE_CONFIG) {
+        if (!runtime.sessionValid || !argument || argument != runtime.token) { result = CAN_RESULT_BAD_SESSION; goto done; }
+        if ((uint32_t)(now - receivedMs) >= MOTOR_TARGET_LEASE_MS) { result = CAN_RESULT_STALE; goto done; }
+        if (faultBits) { result = CAN_RESULT_FAULT_LATCHED; goto done; }
+        if (health.outputEnabled || health.driverEnabled || health.driverFault || runtime.armPending ||
+            runtime.calibrating || runtime.autoPending || runtime.driverWaiting || runtime.eventPending ||
+            EncoderBench_IsActive() || !health.currentCalibrated || !health.encoderValid || !health.busValid ||
+            (index == CAN_CAL_SAVE_CONFIRM && !health.electricalCalibrated)) { result = CAN_RESULT_BAD_STATE; goto done; }
+        result = MotorCalibration_Request(request);
+        if (result == CAN_RESULT_ACCEPTED) {
+            MotorPort_Disable(); invalidate_session();
+            publish_command(MOTOR_CMD_OFF, now, 0U, 0, 0.0f);
+        }
+        goto done;
+    }
+    if (request[0] == CAN_OP_SET_MECHANICAL_ZERO) {
         result = CAN_RESULT_UNSUPPORTED; goto done;
     }
     if ((uint32_t)(now - receivedMs) >= MOTOR_TARGET_LEASE_MS &&
@@ -567,7 +590,7 @@ void MotorSupervisor_Request(const uint8_t request[8], uint32_t receivedEpoch, u
             runtime.leaseSeq = index; runtime.leaseMs = receivedMs;
             begin_alignment(now, true); result = CAN_RESULT_ACCEPTED; goto done;
         }
-        if (runtime.state != CAN_STATE_READY || !health.electricalCalibrated) { result = CAN_RESULT_BAD_STATE; goto done; }
+        if (MotorCalibration_RecoveryRequired() || runtime.state != CAN_STATE_READY || !health.electricalCalibrated) { result = CAN_RESULT_BAD_STATE; goto done; }
         if (runtime.role == MOTOR_ROLE_JOINT &&
             (!MotorProfile_Selected.installationQualified || !MotorProfile_Selected.motionQualified ||
              !MotorProfile_Selected.iqDirectionValidated || !MotorProfile_Selected.referencePresent ||
@@ -661,7 +684,7 @@ void MotorSupervisor_ApplyAtAdcBoundary(uint32_t now)
         adcAppliedVersion = command.version; return;
     }
     uint32_t key = MotorPort_Lock();
-    if (pendingStop || faultBits || EncoderBench_IsActive() || command.epoch != stopEpoch) { MotorPort_Unlock(key); return; }
+    if (pendingStop || faultBits || MotorCalibration_Busy() || EncoderBench_IsActive() || command.epoch != stopEpoch) { MotorPort_Unlock(key); return; }
     /* The received timestamp travels with the command; apply time is no renewal. */
     if ((command.kind == MOTOR_CMD_ARM || command.kind == MOTOR_CMD_TARGET ||
          (command.kind == MOTOR_CMD_BEGIN_DRIVER && runtime.armPending)) &&
@@ -751,4 +774,39 @@ bool MotorSupervisor_ReadAxisStatus(int32_t *positionQ, uint8_t *coordinateValid
     *dirty = runtime.axisDirty;
     MotorPort_Unlock(key);
     return true;
+}
+
+bool MotorSupervisor_RestoreElectrical(float zero)
+{
+    bool ok = false;
+    uint32_t key = MotorPort_Lock();
+    if (supervisorInitialized && MotorCalibration_HasRestore() && !pendingStop && !faultBits && !runtime.calibrating &&
+        !runtime.armPending && !runtime.driverWaiting &&
+        (runtime.state == CAN_STATE_CALIBRATING || runtime.state == CAN_STATE_DISABLED)) {
+        ok = MotorPort_RestoreElectrical(zero);
+        if (ok) {
+            runtime.autoPending = 0U;
+            invalidate_session(); runtime.state = CAN_STATE_READY;
+            publish_command(MOTOR_CMD_OFF, HAL_GetTick(), 0U, 0, 0.0f);
+        }
+    }
+    MotorPort_Unlock(key); return ok;
+}
+void MotorSupervisor_StorageProgress(uint32_t now)
+{
+    adcLastMs = mainLastMs = now;
+    consumedCandidate = candidateVersion;
+    memset(&adcReport, 0, sizeof(adcReport));
+    memset(sampleSlots, 0, sizeof(sampleSlots));
+    MotorAxis_ZeroWindowReset(&runtime.zeroWindow);
+}
+void MotorSupervisor_EndStorage(uint32_t now)
+{
+    MotorPort_Disable(); invalidate_session(); stopEpoch++;
+    MotorSupervisor_StorageProgress(now);
+    publish_command(MOTOR_CMD_OFF, now, 0U, 0, 0.0f);
+    if (!faultBits) {
+        motor_health_t health; MotorPort_ReadHealth(&health);
+        runtime.state = health.electricalCalibrated ? CAN_STATE_READY : CAN_STATE_DISABLED;
+    }
 }

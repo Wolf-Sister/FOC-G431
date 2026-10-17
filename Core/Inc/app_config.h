@@ -40,7 +40,12 @@
 #endif
 
 #ifndef APP_FIRMWARE_VERSION
-#define APP_FIRMWARE_VERSION 0x00010403U
+#define APP_FIRMWARE_VERSION 0x00010405U
+#endif
+
+/* Bump on wiring, encoder installation or electrical-angle semantics changes. */
+#ifndef APP_ELECTRICAL_CAL_CONFIG_REV
+#define APP_ELECTRICAL_CAL_CONFIG_REV 1U
 #endif
 
 /* Measured lower static noise: select CORDICANG at SPI 0x3FFF on every boot.

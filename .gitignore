@@ -13,6 +13,7 @@
 # Keil project, startup code, runtime and debugger configuration.
 /MDK-ARM/*
 !/MDK-ARM/FOC_v1.uvprojx
+!/MDK-ARM/FOC_v1.sct
 !/MDK-ARM/FOC_v1.uvoptx
 !/MDK-ARM/startup_stm32g431xx.s
 !/MDK-ARM/RTE/

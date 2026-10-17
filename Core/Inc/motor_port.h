@@ -18,6 +18,7 @@ bool MotorPort_PositionReady(int32_t target, const motor_motion_config_t *config
                              uint8_t role, const motor_axis_config_t *axis);
 bool MotorPort_ApplyAlignment(float voltage);
 bool MotorPort_CompleteAlignment(float zero);
+bool MotorPort_RestoreElectrical(float zero);
 void MotorPort_InvalidateElectrical(void);
 void MotorPort_CaptureSample(motor_snapshot_t *sample, uint32_t now);
 void MotorPort_GetElectricalConfig(int *direction, int *polePairs);

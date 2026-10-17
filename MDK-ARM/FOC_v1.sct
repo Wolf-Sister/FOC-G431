@@ -1,0 +1,15 @@
+; Shared by uVision and tests/build-arm.ps1. Last two 2 KiB pages are NVM.
+LR_IROM1 0x08000000 0x0001F000 {
+  ER_IROM1 0x08000000 0x0001F000 {
+    *.o (RESET, +First)
+    *(InRoot$$Sections)
+    .ANY (+RO)
+    .ANY (+XO)
+  }
+  ER_RAM_FLASH 0x20000000 0x00000800 {
+    motor_calibration_port.o (.ram_flash)
+  }
+  RW_IRAM1 0x20000800 0x00007800 {
+    .ANY (+RW +ZI)
+  }
+}

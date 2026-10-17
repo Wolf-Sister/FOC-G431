@@ -18,6 +18,7 @@ extern "C" {
 
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include <stdbool.h>
 
 /* ========================================================================== */
 /*  寄存器地址                                                                 */
@@ -66,6 +67,8 @@ HAL_StatusTypeDef INA219_Init(void);
 /* Main-loop service; requires I2C1 Event/Error IRQs. */
 void INA219_ServiceInit(void);
 void INA219_ServicePoll(uint32_t now);
+bool INA219_ServiceStorageReady(void);
+void INA219_ServiceStorageResume(uint32_t now);
 HAL_StatusTypeDef INA219_ReadBusVoltage(float *voltage);
 HAL_StatusTypeDef INA219_ReadCurrent(float *current);
 
