@@ -14,7 +14,8 @@ uint16_t MotorPort_MotionFaultBits(void);
 uint16_t MotorPort_MotionFaultDetail(void);
 /* First outer-loop failure, latched before disarm resets PI state. Keil watch. */
 extern volatile motor_motion_fault_snapshot_t motor_motion_fault;
-bool MotorPort_PositionReady(int32_t target, const motor_motion_config_t *config);
+bool MotorPort_PositionReady(int32_t target, const motor_motion_config_t *config,
+                             uint8_t role, const motor_axis_config_t *axis);
 bool MotorPort_ApplyAlignment(float voltage);
 bool MotorPort_CompleteAlignment(float zero);
 void MotorPort_InvalidateElectrical(void);

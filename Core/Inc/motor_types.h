@@ -3,13 +3,16 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "motor_motion.h"
+#include "motor_axis.h"
 
 typedef struct {
     uint32_t sequence, capturedMs, encoderSequence;
     int32_t turns;
+    int32_t jointPositionQ;
     uint16_t rawAngle, appliedSeq, rawA, rawC;
     float velocity, iq, id, maxPhaseCurrent;
     uint8_t valid, electricalValid, outputEnabled, appliedValid, currentLimited;
+    uint8_t jointCoordinateValid;
 } motor_snapshot_t;
 
 typedef struct {
@@ -34,6 +37,9 @@ typedef struct {
     uint32_t currentLimitMa;
     float alignmentVoltage;
     uint8_t mode;
+    uint8_t role;
+    int8_t iqDirection;
+    motor_axis_config_t axis;
     motor_motion_config_t motion;
 } motor_command_t;
 #endif

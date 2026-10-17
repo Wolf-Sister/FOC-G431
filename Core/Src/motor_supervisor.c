@@ -5,6 +5,8 @@
 #include "app_config.h"
 #include "cmsis_compiler.h"
 #include "encoder_bench.h"
+#include "motor_axis.h"
+#include "motor_profile.h"
 #include <string.h>
 #include <math.h>
 
@@ -18,6 +20,10 @@ typedef struct {
     uint8_t driverWaiting, driverConfirmed;
     motor_event_t event;
     motor_motion_config_t motion;
+    motor_axis_config_t axis;
+    motor_axis_zero_window_t zeroWindow;
+    uint8_t axisDirty, axisStatus, axisCoordinateValid;
+    int32_t axisPositionQ;
 } motor_runtime_t;
 typedef struct {
     uint32_t version, epoch, receivedMs;
@@ -51,6 +57,11 @@ static uint8_t motorSampleDivider;
 static uint32_t sampleSequence;
 
 bool MotorSupervisor_Active(void) { return supervisorInitialized != 0U; }
+bool MotorSupervisor_ResetReady(void)
+{
+    return supervisorInitialized && !pendingStop && !runtime.armPending &&
+           !runtime.calibrating && !runtime.driverWaiting && !runtime.autoPending;
+}
 bool MotorSupervisor_PermitsOutput(void) { return supervisorInitialized && !pendingStop && !faultBits && !EncoderBench_IsActive(); }
 void MotorSupervisor_ReadFault(uint8_t *state, uint8_t *mode, uint16_t *seq, uint16_t *detail)
 {
@@ -86,6 +97,8 @@ static void publish_command(uint8_t kind, uint32_t received, uint16_t seq, int32
     command.currentLimitMa = runtime.currentLimitMa;
     command.alignmentVoltage = voltage;
     command.mode = runtime.mode; command.motion = runtime.motion;
+    command.role = runtime.role; command.iqDirection = MotorProfile_Selected.iqDirection;
+    command.axis = runtime.axis;
     commands[next] = command;
     __DMB();
     commandIndex = next;
@@ -131,16 +144,27 @@ void MotorSupervisor_Init(uint32_t seed, uint32_t now, bool automaticCalibration
     adcReportGuard = sampleGuard = sampleSequence = 0U;
     adcLastMs = mainLastMs = now;
     runtime.state = CAN_STATE_CALIBRATING;
-    runtime.role = APP_MOTOR_ROLE;
-    runtime.currentLimitMa = BOARD_INITIAL_IQ_LIMIT_MA;
-    runtime.motion.speedLimit = BOARD_DEFAULT_SPEED_LIMIT_MRAD_S;
-    runtime.motion.positionSpeed = BOARD_DEFAULT_POSITION_SPEED_MRAD_S;
-    runtime.motion.acceleration = BOARD_DEFAULT_ACCEL_MRAD_S2;
-    runtime.motion.positionMin = BOARD_DEFAULT_POSITION_MIN;
-    runtime.motion.positionMax = BOARD_DEFAULT_POSITION_MAX;
+    runtime.role = MotorProfile_Selected.role;
+    runtime.currentLimitMa = MotorProfile_Selected.initialCurrentMa;
+    runtime.motion.speedLimit = MotorProfile_Selected.speedDefaultMradS;
+    runtime.motion.positionSpeed = MotorProfile_Selected.positionSpeedDefaultMradS;
+    runtime.motion.acceleration = MotorProfile_Selected.accelerationDefaultMradS2;
+    runtime.motion.positionMin = MotorProfile_Selected.minimumQ;
+    runtime.motion.positionMax = MotorProfile_Selected.maximumQ;
+    runtime.axis.direction = MotorProfile_Selected.axisDirection;
+    runtime.axis.referenceRaw = MotorProfile_Selected.referenceRaw;
+    runtime.axis.referenceQ = MotorProfile_Selected.referenceQ;
+    runtime.axis.referencePresent = MotorProfile_Selected.referencePresent;
+    runtime.axis.minimumQ = MotorProfile_Selected.minimumQ;
+    runtime.axis.maximumQ = MotorProfile_Selected.maximumQ;
+    runtime.axisStatus = runtime.axis.referencePresent ? MOTOR_AXIS_STATUS_STALE : MOTOR_AXIS_STATUS_NO_REFERENCE;
     runtime.nonce = seed;
     runtime.challenge = next_nonce();
-    runtime.autoPending = automaticCalibration && APP_CAN_NODE_ID != 0U;
+    runtime.autoPending = automaticCalibration && MotorProfile_Selected.alignmentAllowed &&
+                          MotorProfile_Selected.nodeId != 0U && MotorProfile_Validate() &&
+                          (runtime.role != MOTOR_ROLE_JOINT ||
+                           (MotorProfile_Selected.installationQualified && MotorProfile_Selected.motionQualified &&
+                            MotorProfile_Selected.iqDirectionValidated && MotorAxis_ConfigValid(&runtime.axis)));
     publish_command(MOTOR_CMD_OFF, now, 0U, 0, 0.0f);
     supervisorInitialized = 1U;
     MotorPort_Unlock(key);
@@ -274,6 +298,14 @@ void MotorSupervisor_Tick(uint32_t now)
         MotorSupervisor_FaultISR(MOTOR_FAULT_BIT_CONTROL_STALLED, 0U); finish_stop(now); return;
     }
     if (EncoderBench_IsActive()) return;
+    if (runtime.role == 1U && MotorSupervisor_ReadSample(&sample)) {
+        MotorAxis_ZeroWindowAdd(&runtime.zeroWindow, sample.capturedMs, sample.encoderSequence,
+                                sample.rawAngle, sample.valid && !sample.outputEnabled);
+        if ((uint32_t)(now - sample.capturedMs) > 2U) {
+            runtime.axisStatus = MOTOR_AXIS_STATUS_STALE;
+            runtime.axisCoordinateValid = 0U;
+        }
+    }
     if (read_report(&report) && report.epoch == stopEpoch && report.outputEnabled) {
         if ((uint32_t)(now - report.receivedMs) >= MOTOR_TARGET_LEASE_MS) {
             MotorSupervisor_FaultISR(MOTOR_FAULT_BIT_COMM_TIMEOUT, 0U); finish_stop(now); return;
@@ -356,7 +388,7 @@ static uint8_t get_param(uint16_t index, uint32_t *value)
     switch (index) {
     case 0x0001: case 0x0205: *value = APP_CAN_NODE_ID; break;
     case 0x0002: *value = runtime.role; break;
-    case 0x0003: *value = 1U; break; /* Configurable logic coordinates deferred to stage four. */
+    case 0x0003: *value = (uint32_t)runtime.axis.direction; break;
     case 0x0004: *value = 0U; break;
     case 0x0005: *value = runtime.mode; break;
     case 0x0010: *value = runtime.currentLimitMa; break;
@@ -367,9 +399,38 @@ static uint8_t get_param(uint16_t index, uint32_t *value)
     case 0x0015: *value = runtime.motion.acceleration; break;
     case 0x0200: *value = (uint32_t)(MotorPort_GetElectricalZero() * 1000000.0f + 0.5f); break;
     case 0x0202: {
+        uint32_t key = MotorPort_Lock();
+        uint8_t coordinateValid = runtime.axisCoordinateValid;
+        MotorPort_Unlock(key);
         motor_health_t health; MotorPort_ReadHealth(&health);
-        *value = health.electricalCalibrated ? 1U : 0U; break;
+        *value = (health.electricalCalibrated ? 1U : 0U) |
+                 (coordinateValid ? 2U : 0U); break;
     }
+    case 0x0206: {
+        uint32_t key = MotorPort_Lock(); *value = (uint32_t)runtime.axisPositionQ; MotorPort_Unlock(key); break;
+    }
+    case 0x0207: {
+        uint32_t key = MotorPort_Lock(); *value = runtime.axisStatus; MotorPort_Unlock(key); break;
+    }
+    case 0x0210: *value = MotorProfile_Selected.currentMaxMa; break;
+    case 0x0211: *value = MotorProfile_Selected.speedMaxMradS; break;
+    case 0x0212: *value = MotorProfile_Selected.positionSpeedMaxMradS; break;
+    case 0x0213: *value = MotorProfile_Selected.accelerationMaxMradS2; break;
+    case 0x0220: *value = MotorProfile_Selected.profileId; break;
+    case 0x0221: *value = MotorProfile_Selected.revision; break;
+    case 0x0222: *value = MotorProfile_Selected.referenceRaw; break;
+    case 0x0223: *value = (uint32_t)MotorProfile_Selected.referenceQ; break;
+    case 0x0224: {
+        motor_snapshot_t sample;
+        uint16_t meanRaw;
+        if (!MotorSupervisor_ReadSample(&sample) || !sample.valid) return CAN_RESULT_BUSY;
+        if (sample.outputEnabled) return CAN_RESULT_BAD_STATE;
+        if ((uint32_t)(HAL_GetTick() - sample.capturedMs) > 2U) return CAN_RESULT_STALE;
+        if (!MotorAxis_ZeroWindowRead(&runtime.zeroWindow, HAL_GetTick(), &meanRaw)) return CAN_RESULT_BUSY;
+        *value = ((sample.encoderSequence & 0xFFFFU) << 16) | meanRaw;
+        break;
+    }
+    case 0x0225: *value = MotorProfile_Flags(); break;
     default: return CAN_RESULT_BAD_INDEX;
     }
     return CAN_RESULT_OK;
@@ -381,8 +442,12 @@ static uint8_t set_param(uint16_t index, uint32_t value)
     if (!runtime.sessionValid) return CAN_RESULT_BAD_SESSION;
     switch (index) {
     case 0x0002:
-        if (value != 1U && value != 2U) return CAN_RESULT_BAD_VALUE;
-        runtime.role = (uint8_t)value; break;
+        /* Role is a build-time hardware configuration, never a live setting. */
+        return CAN_RESULT_UNSUPPORTED;
+    case 0x0003: {
+        (void)value;
+        return CAN_RESULT_UNSUPPORTED;
+    }
     case 0x0004:
         if (value > 1U) return CAN_RESULT_BAD_VALUE;
         if (value != 0U) return CAN_RESULT_UNSUPPORTED;
@@ -391,25 +456,31 @@ static uint8_t set_param(uint16_t index, uint32_t value)
         if (value > 2U) return CAN_RESULT_BAD_VALUE;
         runtime.mode = (uint8_t)value; break;
     case 0x0010:
-        if (!value || value > BOARD_REF_MAX_MA || (float)value * 0.001f > CURRENT_REF_HARD_MAX_A)
+        if (!value || value > MotorProfile_Selected.currentMaxMa || (float)value * 0.001f > CURRENT_REF_HARD_MAX_A)
             return CAN_RESULT_BAD_VALUE;
         runtime.currentLimitMa = value; break;
     case 0x0011:
-        if (!value || value > BOARD_SPEED_MAX_MRAD_S) return CAN_RESULT_BAD_VALUE;
+        if (!value || value > MotorProfile_Selected.speedMaxMradS) return CAN_RESULT_BAD_VALUE;
         runtime.motion.speedLimit = value;
         break;
     case 0x0014:
-        if (!value || value > BOARD_POSITION_SPEED_MAX_MRAD_S) return CAN_RESULT_BAD_VALUE;
+        if (!value || value > MotorProfile_Selected.positionSpeedMaxMradS) return CAN_RESULT_BAD_VALUE;
         runtime.motion.positionSpeed = value;
         break;
     case 0x0015:
-        if (!value || value > BOARD_ACCEL_MAX_MRAD_S2) return CAN_RESULT_BAD_VALUE;
+        if (!value || value > MotorProfile_Selected.accelerationMaxMradS2) return CAN_RESULT_BAD_VALUE;
         runtime.motion.acceleration = value; break;
     case 0x0012: case 0x0013: {
+        if (runtime.role == MOTOR_ROLE_JOINT) return CAN_RESULT_UNSUPPORTED;
         uint8_t bytes[4]; CAN_WriteU32(bytes, value);
         int32_t signedValue = CAN_ReadI32(bytes);
         if (index == 0x0012U) runtime.motion.positionMin = signedValue;
         else runtime.motion.positionMax = signedValue;
+        runtime.axis.minimumQ = runtime.motion.positionMin;
+        runtime.axis.maximumQ = runtime.motion.positionMax;
+        runtime.axisStatus = MotorAxis_ConfigValid(&runtime.axis) ? MOTOR_AXIS_STATUS_VALID :
+                             (runtime.axis.referencePresent ? MOTOR_AXIS_STATUS_LIMITS_INVALID : MOTOR_AXIS_STATUS_NO_REFERENCE);
+        runtime.axisDirty = 1U;
         break;
     }
     default: return CAN_RESULT_BAD_INDEX;
@@ -433,6 +504,9 @@ void MotorSupervisor_Request(const uint8_t request[8], uint32_t receivedEpoch, u
     if (receivedEpoch != stopEpoch || pendingStop) { result = CAN_RESULT_BAD_SESSION; goto done; }
     if (request[0] == CAN_OP_GET_PARAM) {
         result = argument ? CAN_RESULT_BAD_VALUE : get_param(index, &value); goto done;
+    }
+    if (request[0] == CAN_OP_SET_MECHANICAL_ZERO || request[0] == CAN_OP_SAVE_CONFIG) {
+        result = CAN_RESULT_UNSUPPORTED; goto done;
     }
     if ((uint32_t)(now - receivedMs) >= MOTOR_TARGET_LEASE_MS &&
         (request[0] == CAN_OP_CAL_KEEPALIVE || request[0] == CAN_OP_ARM || request[0] == CAN_OP_CALIBRATE)) { result = CAN_RESULT_STALE; goto done; }
@@ -479,16 +553,29 @@ void MotorSupervisor_Request(const uint8_t request[8], uint32_t receivedEpoch, u
         if (EncoderBench_IsActive()) { result = CAN_RESULT_BAD_STATE; goto done; }
         if (!runtime.sessionValid || argument != runtime.token) { result = CAN_RESULT_BAD_SESSION; goto done; }
         if (health.outputEnabled || runtime.armPending || runtime.calibrating || runtime.eventPending) { result = CAN_RESULT_BAD_STATE; goto done; }
-        if (!BOARD_SAFETY_PROFILE_VALIDATED || !health.currentCalibrated || !health.busValid || !health.encoderValid) {
+        if (!MotorProfile_Validate() || !BOARD_SAFETY_PROFILE_VALIDATED ||
+            !health.currentCalibrated || !health.busValid || !health.encoderValid) {
             result = CAN_RESULT_NOT_CONFIGURED; goto done;
         }
         if (request[0] == CAN_OP_CALIBRATE) {
+            if (runtime.role == MOTOR_ROLE_JOINT &&
+                (!MotorProfile_Selected.installationQualified || !MotorProfile_Selected.motionQualified ||
+                 !MotorProfile_Selected.alignmentAllowed)) {
+                result = CAN_RESULT_NOT_CONFIGURED; goto done;
+            }
             runtime.event.opcode = request[0]; runtime.event.requestId = request[1];
             runtime.leaseSeq = index; runtime.leaseMs = receivedMs;
             begin_alignment(now, true); result = CAN_RESULT_ACCEPTED; goto done;
         }
         if (runtime.state != CAN_STATE_READY || !health.electricalCalibrated) { result = CAN_RESULT_BAD_STATE; goto done; }
-        if (runtime.role != 2U || !MotorMotion_ConfigValid(&runtime.motion, runtime.mode)) {
+        if (runtime.role == MOTOR_ROLE_JOINT &&
+            (!MotorProfile_Selected.installationQualified || !MotorProfile_Selected.motionQualified ||
+             !MotorProfile_Selected.iqDirectionValidated || !MotorProfile_Selected.referencePresent ||
+             !MotorAxis_ConfigValid(&runtime.axis))) {
+            result = CAN_RESULT_NOT_CONFIGURED; goto done;
+        }
+        if ((runtime.role != MOTOR_ROLE_WHEEL && runtime.role != MOTOR_ROLE_JOINT) ||
+            !MotorMotion_ConfigValid(&runtime.motion, runtime.mode)) {
             result = CAN_RESULT_NOT_CONFIGURED; goto done;
         }
         if (!runtime.initialValid || index != runtime.acceptedSeq ||
@@ -496,7 +583,8 @@ void MotorSupervisor_Request(const uint8_t request[8], uint32_t receivedEpoch, u
             result = CAN_RESULT_STALE; goto done;
         }
         if ((runtime.mode == 1U && runtime.initialIqMa != 0) ||
-            (runtime.mode == 2U && !MotorPort_PositionReady(runtime.initialIqMa, &runtime.motion))) {
+            (runtime.mode == 2U && !MotorPort_PositionReady(runtime.initialIqMa, &runtime.motion,
+                                                             runtime.role, &runtime.axis))) {
             result = CAN_RESULT_BAD_VALUE; goto done;
         }
         runtime.armPending = 1U;
@@ -536,7 +624,9 @@ void MotorSupervisor_ReadStatus(CAN_NodeStatus *status, uint32_t now)
     status->adcProgress = (uint8_t)(adcCount / 16U);
     status->capabilities = 1U | ((uint32_t)APP_UART_ENABLE << 2) |
                            ((uint32_t)BOARD_SAFETY_PROFILE_VALIDATED << 3) |
-                           ((uint32_t)health.electricalCalibrated << 5);
+                           ((uint32_t)health.electricalCalibrated << 5) |
+                           ((uint32_t)(runtime.axisCoordinateValid &&
+                             runtime.axisStatus != MOTOR_AXIS_STATUS_STALE) << 6);
     MotorPort_Unlock(key);
 }
 
@@ -596,7 +686,11 @@ void MotorSupervisor_ApplyAtAdcBoundary(uint32_t now)
         __DMB(); adcReportGuard++;
         adcAppliedVersion = command.version;
     }
-    if (!success && !pendingStop && !faultBits) MotorSupervisor_FaultISR(MOTOR_FAULT_BIT_INTERNAL, 0U);
+    if (!success && !pendingStop && !faultBits) {
+        uint16_t detail = (command.kind == MOTOR_CMD_ARM || command.kind == MOTOR_CMD_TARGET) ?
+                          MotorPort_MotionFaultDetail() : 0U;
+        MotorSupervisor_FaultISR(MOTOR_FAULT_BIT_INTERNAL, detail);
+    }
 }
 
 void MotorSupervisor_PublishSample(uint32_t now)
@@ -606,6 +700,25 @@ void MotorSupervisor_PublishSample(uint32_t now)
     uint8_t next = sampleIndex ^ 1U;
     motor_snapshot_t sample = {0};
     MotorPort_CaptureSample(&sample, now);
+    if (runtime.role == 1U) {
+        int32_t jointQ;
+        runtime.axisCoordinateValid = 0U;
+        runtime.axisStatus = runtime.axis.referencePresent ? MOTOR_AXIS_STATUS_STALE : MOTOR_AXIS_STATUS_NO_REFERENCE;
+        if (runtime.axis.referencePresent && !MotorAxis_ConfigValid(&runtime.axis))
+            runtime.axisStatus = MOTOR_AXIS_STATUS_LIMITS_INVALID;
+        if (sample.valid && (uint32_t)(now - sample.capturedMs) <= 2U &&
+            MotorAxis_ConfigValid(&runtime.axis)) {
+            motor_axis_result_t mapped = MotorAxis_MapRaw(&runtime.axis, sample.rawAngle, &jointQ, NULL);
+            if (mapped == MOTOR_AXIS_OK || mapped == MOTOR_AXIS_OUTSIDE_RANGE) {
+                sample.jointPositionQ = jointQ;
+                sample.jointCoordinateValid = 1U;
+                runtime.axisCoordinateValid = 1U;
+                runtime.axisPositionQ = jointQ;
+                runtime.axisStatus = mapped == MOTOR_AXIS_OK ? MOTOR_AXIS_STATUS_VALID : MOTOR_AXIS_STATUS_OUTSIDE_RANGE;
+            } else runtime.axisStatus = mapped == MOTOR_AXIS_AMBIGUOUS ? MOTOR_AXIS_STATUS_AMBIGUOUS :
+                                        MOTOR_AXIS_STATUS_OUTSIDE_RANGE;
+        }
+    }
     sample.sequence = ++sampleSequence;
     sample.appliedSeq = adcReport.seq;
     sample.appliedValid = adcReport.appliedValid && adcReport.epoch == stopEpoch && !pendingStop && !faultBits;
@@ -625,4 +738,17 @@ bool MotorSupervisor_ReadSample(motor_snapshot_t *sample)
         if (before == sampleGuard) return sample->sequence != 0U;
     }
     return false;
+}
+
+bool MotorSupervisor_ReadAxisStatus(int32_t *positionQ, uint8_t *coordinateValid,
+                                    uint8_t *reason, uint8_t *dirty)
+{
+    if (!positionQ || !coordinateValid || !reason || !dirty || !supervisorInitialized) return false;
+    uint32_t key = MotorPort_Lock();
+    *positionQ = runtime.axisPositionQ;
+    *coordinateValid = runtime.axisCoordinateValid && runtime.axisStatus != MOTOR_AXIS_STATUS_STALE;
+    *reason = runtime.axisStatus;
+    *dirty = runtime.axisDirty;
+    MotorPort_Unlock(key);
+    return true;
 }

@@ -109,7 +109,8 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  const uint8_t softwareResetBoot = __HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST) != RESET;
+  __HAL_RCC_CLEAR_RESET_FLAGS();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -157,7 +158,7 @@ int main(void)
   control_pid_init();
   motor_control_parm_init();
   MotorSupervisor_Init(HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ HAL_GetUIDw2() ^ dwt_get_cycles(),
-                       HAL_GetTick(), APP_AUTO_CALIBRATE != 0U);
+                       HAL_GetTick(), APP_AUTO_CALIBRATE != 0U && !softwareResetBoot);
   if (CAN_Init() != HAL_OK) {
     UART2_SendString("[CAN] ERROR: service not started\r\n");
     MotorSupervisor_StopISR();

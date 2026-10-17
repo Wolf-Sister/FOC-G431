@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define CAN_PROTOCOL_VERSION 0x00010000U
+#define CAN_PROTOCOL_VERSION 0x00010100U
 #define CAN_ID_DISARM        0x001U
 #define CAN_ID_FAULT         0x080U
 #define CAN_ID_TARGET        0x120U
@@ -13,6 +13,7 @@
 #define CAN_ID_REPLY         0x380U
 #define CAN_ID_EVENT         0x400U
 #define CAN_ID_POSITION      0x500U
+#define CAN_ID_JOINT_POSITION 0x200U
 #define CAN_ID_HEARTBEAT     0x700U
 #define CAN_OP_GET_INFO      0x01U
 #define CAN_OP_GET_STATUS    0x02U
@@ -25,8 +26,13 @@
 #define CAN_OP_GET_PARAM     0x13U
 #define CAN_OP_SET_PARAM     0x14U
 #define CAN_OP_SET_IQ_LIMIT  0x15U
+#define CAN_OP_SET_MECHANICAL_ZERO 0x16U
+#define CAN_OP_SAVE_CONFIG   0x17U
 #define CAN_OP_CAL_KEEPALIVE 0x1BU
 #define CAN_OP_CLEAR_FAULT   0x1CU
+#define CAN_OP_SOFTWARE_RESET 0x1DU
+#define CAN_RESET_CONFIRM    0xA55AU
+#define CAN_CAP_SOFTWARE_RESET (1UL << 8)
 #define CAN_OP_HOME_ABORT    0x1AU
 #define CAN_RESULT_OK          0U
 #define CAN_RESULT_ACCEPTED    1U

@@ -10,6 +10,8 @@
 
 void MotorSupervisor_Init(uint32_t seed, uint32_t now, bool automaticCalibration);
 bool MotorSupervisor_Active(void);
+/* Call with IRQs locked before accepting a main-loop software reset request. */
+bool MotorSupervisor_ResetReady(void);
 bool MotorSupervisor_PermitsOutput(void);
 void MotorSupervisor_ReadFault(uint8_t *state, uint8_t *mode, uint16_t *seq, uint16_t *detail);
 uint32_t MotorSupervisor_Epoch(void);
@@ -26,4 +28,6 @@ void MotorSupervisor_ApplyAtAdcBoundary(uint32_t now);
 void MotorSupervisor_PublishSample(uint32_t now);
 bool MotorSupervisor_ReadSample(motor_snapshot_t *sample);
 void MotorSupervisor_MainProgress(uint32_t now);
+bool MotorSupervisor_ReadAxisStatus(int32_t *positionQ, uint8_t *coordinateValid,
+                                    uint8_t *reason, uint8_t *dirty);
 #endif

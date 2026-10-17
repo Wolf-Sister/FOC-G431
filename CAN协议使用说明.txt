@@ -1,0 +1,415 @@
+FOC-G431 CAN 协议使用说明
+更新日期：2026-10-17
+适用固件：0x00010403；协议版本：0x00010100
+依据：当前 Core/Inc/can_protocol.h、Core/Src/can.c、motor_supervisor.c。
+
+一、通信设置与当前配置
+======================
+1. CAN Classic，1 Mbit/s，标准11位ID，数据帧，DLC固定8。
+   不使用CAN FD、BRS、扩展帧或远程帧；不符合上述格式的接收帧会被忽略。
+2. 所有多字节字段均为小端序；有符号整数使用二进制补码。
+   本文B0～B7表示CAN数据区的8个字节，十六进制字节从左到右发送。
+3. 节点ID N有效范围1～63，同一总线不能重复；0为未配置节点。
+   节点ID在编译时确定，不能通过CAN修改，不保存到Flash。
+4. 当前默认：WHEEL角色、node1、profile0、USART2业务关闭、AUTO0。
+   上电先采集电流零偏，然后保持禁能；必须显式电气对准，再显式ARM。
+5. 编译初始Iq限流为1500 mA；当前profile命令上限2500 mA。
+   这些是台架软件配置，不是电机额定值。已验证的小电流操作先设100 mA并读回。
+   软件/硬件复位会恢复编译默认值，不能假定上次的100 mA仍然有效。
+6. 当前profile1、profile2为JOINT禁能诊断配置，不能照搬WHEEL运动例程使能。
+
+设置节点ID：Keil → Options for Target → C/C++ → Define，保留原定义并追加
+APP_MOTOR_NODE_ID=2，Rebuild后烧录，即为节点2。
+也可在 Core/Inc/motor_profile.h 的 #ifndef APP_MOTOR_NODE_ID 内设置默认值。
+修改后无需调整CubeMX；上位机的节点选择也要同步。
+
+二、CAN ID分配
+=============
+类型                  方向        ID              N=1示例    名义周期
+广播禁能              主机→板端   0x001           0x001      按需
+故障上报              板端→主机   0x080+N         0x081      故障变化时
+运行目标              主机→板端   0x120+N         0x121      主机建议5 ms
+快速反馈              板端→主机   0x180+N         0x181      20 ms
+关节逻辑位置          板端→主机   0x200+N         0x201      JOINT时50 ms
+管理请求              主机→板端   0x300+N         0x301      按需
+管理应答              板端→主机   0x380+N         0x381      对应请求
+异步完成事件          板端→主机   0x400+N         0x401      ARM/对准完成时
+原始多圈位置          板端→主机   0x500+N         0x501      200 ms
+心跳                  板端→主机   0x700+N         0x701      50 ms
+
+例：节点2的请求/应答/心跳分别为0x302、0x382、0x702。
+周期是调度周期，不保证总线拥塞时逐帧必达；不会补发所有错过的周期帧。
+WHEEL快速反馈及原始位置通常在电气对准成功后才发送；启动诊断先看心跳/查询。
+JOINT诊断配置可在未对准时发送原始位置和逻辑位置。
+
+三、管理请求、应答和请求ID
+========================
+请求ID为0x300+N：
+  B0       opcode，操作码，u8
+  B1       request_id，请求编号，u8
+  B2～B3   index/selector，u16小端
+  B4～B7   argument，u32或i32小端，具体解释由操作决定
+
+应答ID为0x380+N：
+  B0       原opcode
+  B1       原request_id
+  B2       result，返回码
+  B3       detail，普通管理应答当前通常为0
+  B4～B7   value，u32或i32小端
+
+异步事件ID为0x400+N：布局与应答相同。
+CALIBRATE成功事件value为电气零角，单位0.000001 rad。
+ARM成功事件value为实际应用的目标序号，使用低16位。
+异步事件也可能返回失败，必须同时检查opcode、request_id、result和detail。
+
+请求编号与目标序号不是同一个字段：
+- request_id建议使用1～255，按请求分配；0留给校准保活。
+- 板端最多缓存8条管理应答，缓存期2秒，同一停机epoch内按request_id匹配。
+- 同一request_id、完全相同的数据可以命中缓存；相同ID但内容不同会返回CONFLICT。
+- 上位机应避免在2秒内重用同一管理request_id。不要用固定ID反复换参数。
+- 禁能请求不受管理缓存冲突阻挡。停机、复位等会使旧控制会话失效。
+- 正常单节点由一个控制端维护会话，不要让多个上位机交替建立会话。
+
+返回码（B2，十进制 / 十六进制）：
+  0 / 00 OK               成功
+  1 / 01 ACCEPTED         已受理，尚不代表动作完成
+  2 / 02 BAD_STATE        当前状态不允许
+  3 / 03 BAD_VALUE        参数值/保留字段不合法
+  4 / 04 BAD_INDEX        未知索引
+  5 / 05 NOT_CONFIGURED   保护/profile/传感器等前置资格不满足
+  6 / 06 FAULT_LATCHED    故障锁存
+  7 / 07 BAD_SESSION      会话/令牌/停机epoch无效
+  8 / 08 BUSY             忙或尚未准备好
+  9 / 09 CONFLICT         管理request_id冲突
+ 10 / 0A STALE            初始目标、序号或请求过旧
+ 11 / 0B UNSUPPORTED      当前功能不支持
+ 12 / 0C INTERNAL         内部失败，需要结合故障详情
+
+四、操作码
+==========
+opcode  名称                 index                      argument
+01      GET_INFO             见第五节                    必须0
+02      GET_STATUS           见第五节                    必须0
+03      OPEN_SESSION         初始目标/保活序号baseSeq    刚读到的challenge
+04      SET_MODE             必须0                      0=Iq，1=速度，2=位置
+05      SET_SOURCE           必须0                      仅支持0=CAN
+10      CALIBRATE            校准保活起始序号            当前session token
+11      ARM                  对应初始目标的seq           当前session token
+12      DISARM               必须0                      必须0
+13      GET_PARAM            参数编号                    必须0
+14      SET_PARAM            参数编号                    参数值
+15      SET_IQ_LIMIT         必须0                      限流，mA
+16      SET_MECHANICAL_ZERO  当前已停用                  返回UNSUPPORTED
+17      SAVE_CONFIG          当前已停用                  返回UNSUPPORTED
+1A      HOME_ABORT           必须0                      必须0；目前等效禁能
+1B      CAL_KEEPALIVE        递增序号                    当前session token；B1必须0
+1C      CLEAR_FAULT          允许清除的故障位掩码        当前session token
+1D      SOFTWARE_RESET       必须0xA55A                 刚读到的challenge
+
+GET_INFO、GET_STATUS、GET_PARAM不需要建立会话。
+SET_MODE、SET_SOURCE、SET_PARAM、SET_IQ_LIMIT需要先建立会话，且节点禁能、非校准。
+这些设置命令的argument是设置值，不是token；token用于ARM、CALIBRATE、保活和清故障。
+软件复位使用challenge，不使用session token，具体见第十一节。
+任何设置都要检查返回码；运动配置组合是否合法会在ARM时再次检查。
+
+五、信息和状态查询
+==================
+GET_INFO（opcode=01）：
+ selector  value
+ 0000      协议版本，当前0x00010100
+ 0001      固件版本，当前0x00010403
+ 0002      MCU UID word0
+ 0003      MCU UID word1
+ 0004      MCU UID word2
+ 0005      当前challenge，建立会话/软件复位前重新读取；0时BUSY
+ 0006      capabilities位图
+ 0007      RAM配置revision，用于识别参数修改，不是profile版本号
+
+capabilities：bit0基础服务，bit2 USART2业务启用，bit3板级保护配置已核定，
+bit5电气对准有效，bit6关节坐标有效，bit8支持软件复位。其他位不要自行赋予含义。
+能力位不替代ARM资格检查；JOINT仍需其profile的安装/运动等资格。
+
+GET_STATUS（opcode=02）：
+ selector  value
+ 0000      B4=state、B5=mode、B6=role、B7=source
+ 0001      faultBits，低16位故障位图
+ 0002      低16位acceptedSeq，高16位appliedSeq
+ 0003      当前指令年龄，ms；无有效运行租约时为0xFFFFFFFF
+ 0004      bit0～7 TEC，bit8～15 REC，bit16 BusOff，bit17 ErrorPassive
+ 0005      HOME状态，当前固定0，不表示已完成回零
+ 0006      状态flags：bit0初始目标仍有效；bit1 ADC应用序号有效
+
+state：0 BOOT，1 DISABLED，2 CALIBRATING（电流零偏），3 ALIGNING，
+       4 READY，5 ENABLED，7 FAULT，8 COMM_LOST。没有定义的状态不要当READY。
+mode：0 Iq，1速度，2位置。
+role：0未配置，1 JOINT，2 WHEEL。source当前仅0 CAN。
+注意：GET_STATUS的flags与快速反馈flags不是同一位定义。
+
+六、参数表（GET_PARAM=13；可写项用SET_PARAM=14）
+==============================================
+编号   名称                         读写         单位/说明
+0001   node ID                      只读         编译节点ID
+0002   role                         只读         编译角色
+0003   axisDirection                只读/i32     逻辑轴方向±1，不是电气方向dir
+0004   source                       可写         仅0 CAN
+0005   mode                         可写         0/1/2；等效SET_MODE
+0010   Iq电流限值                   可写         mA；等效SET_IQ_LIMIT
+0011   速度上限                     可写         0.001 rad/s；同时用于目标及实测速率保护
+0012   最小位置                     WHEEL可写    i32，0.0001 rad；JOINT只读
+0013   最大位置                     WHEEL可写    i32，0.0001 rad；JOINT只读
+0014   位置模式速度上限             可写         0.001 rad/s
+0015   加速度                       可写         0.001 rad/s²
+0200   电气零角                     只读         0.000001 rad
+0202   校准/坐标flags               只读         bit0电气对准有效，bit1关节坐标有效
+0205   node ID                      只读         同0001
+0206   关节逻辑位置q                只读/i32     0.0001 rad；先检查0207/有效标志
+0207   关节坐标状态                 只读         0有效、1无参考、2配置无效、3过旧、4越界、5歧义
+0210   profile最大电流              只读         mA
+0211   profile最大速度              只读         0.001 rad/s
+0212   profile最大位置速度          只读         0.001 rad/s
+0213   profile最大加速度            只读         0.001 rad/s²
+0220   profile ID                   只读         当前WHEEL为0x0001
+0221   profile revision             只读         当前为1，与GET_INFO/0007不同
+0222   机械参考raw                  只读         编码器计数0～16383
+0223   机械参考q                    只读/i32     0.0001 rad
+0224   静止参考只读采样             只读         低16位raw，高16位采样序号；需JOINT窗口有效
+0225   profile资格flags             只读         见下文
+
+0225：bit0存在机械参考，bit1 Iq方向已核定，bit2安装资格，bit3运动资格，
+      bit4使用原始角，bit5允许电气对准。当前WHEEL为0x30；两个JOINT诊断profile不允许运动。
+
+当前WHEEL编译默认/最大值：
+  0010 默认1500 mA，最大2500 mA，不能写0。
+  0011 默认100000（100 rad/s），最大150000（150 rad/s）。
+  0012/0013 默认-327670000 / +327670000，即±32767 rad。
+  0014 默认100000（100 rad/s），最大100000。
+  0015 默认25000（25 rad/s²），最大50000（50 rad/s²）。
+这些上限不是运行目标，也不是已验证的性能指标；实际接入时先读取profile上限。
+位置模式还要求min<max、positionSpeed<=speedLimit等组合条件满足。
+本轮台架采用：限流100，速度上限5000，位置速度500，加速度1000。
+近静止原始速度会有波动，不能把速度上限降到低于反馈波动再据此判断真实超速。
+参数仅在RAM生效；复位恢复编译值。修改参数会使已有初始目标失效，ARM前重新发送。
+
+七、运行目标帧：ID=0x120+N
+==========================
+  B0～B1   seq，u16，按65536回绕
+  B2       mode，必须与板端当前模式一致
+  B3       保留，必须0
+  B4～B7   target，i32
+
+target单位：
+  mode0：mA，+30表示+0.030 A；不得超过当前Iq限流。
+  mode1：0.001 rad/s，+500表示+0.5 rad/s，-500表示-0.5 rad/s。
+  mode2：0.0001 rad，10000表示绝对位置1 rad；不是相对步进！
+
+序号规则：建立会话指定baseSeq后，第一个目标seq必须等于baseSeq。
+之后每次seq差值按u16计算，必须为1～64，允许65535→0回绕。
+重复、倒退或跳跃太大的目标被忽略，不续期。目标帧不带token，靠有效会话、模式及序号校验。
+运动/等待ADC使能确认期间建议每5 ms发新seq，即使目标数值不变也要继续发送。
+达到20 ms未收到可用目标会禁能并锁存通信故障；查询、心跳和重复seq都不能续期。
+
+Iq与运动方向：当前台架正电气Iq对应原始编码器角减小；正速度/正位置目标对应WHEEL原始坐标增加。
+速度环内部已经按电气方向补偿。不要为了匹配这个现象随意对位置/速度目标再取反。
+
+WHEEL绝对坐标：
+  counts = turns*16384 + raw
+  radians = counts*2*pi/16384
+  初始位置target = round(radians*10000)
+  相对+0.05 rad由上位机换算为“当前绝对target+500”，不是直接写500。
+JOINT使用编译机械参考映射的逻辑坐标，当前诊断profile不允许ARM。
+
+八、首次接入及控制顺序
+======================
+A. 只读接入
+  1. 设置CAN 1 Mbit/s，观察0x700+N心跳。
+  2. GET_INFO读取协议、固件、UID、能力；GET_STATUS读取state/faults。
+  3. GET_PARAM读取profile、角色、当前限流和运动参数。
+  4. 如果为FAULT/COMM_LOST，先查原因，不能直接开始控制。
+
+B. 建立禁能会话并设置参数
+  1. GET_INFO selector5取得challenge C。
+  2. OPEN_SESSION：index=选定的baseSeq，argument=C，成功value返回token T。
+  3. 在同一会话中设置模式和限流等，逐项检查应答并读回。
+  OPEN_SESSION本身不会使能。DISARM、对准完成和复位都会使token失效。
+
+C. 显式电气对准（每次重启后需要；不是机械回零）
+  1. 用当前token发CALIBRATE，index为校准保活起始序号。
+  2. 应答ACCEPTED后立即开始CAL_KEEPALIVE，建议5 ms一次：
+     B0=1B，B1=00，B2～B3=每次递增的seq，B4～B7=token T。
+     第一次保活相对起始序号增加1，之后每次增加1；差值须在1～64。
+  3. 该保活流不回复、不进入普通请求缓存；超过20 ms失联会中止。
+  4. 等待0x400+N上opcode10、相同request_id、result00完成事件。
+  5. 停止保活，读回READY及0202 bit0=1；校准完成后输出关闭、会话失效。
+  电气对准会产生定位转矩，不等于静止无输出；其电流保护沿用原1 A门限，
+  不能把SET_IQ_LIMIT=100 mA理解为对准阶段也被限制在100 mA。
+
+D. ARM及运行
+  1. 对准后重新读challenge、建立新会话、读取/设置并确认限流与当前mode。
+  2. 位置模式先读取新鲜位置，初始目标必须贴近当前位置（最大误差0.05 rad）。
+     当前还要求连续50 ms角度窗口稳定，并在ADC最终应用时再次检查。
+  3. 发送第一个运行目标，seq=新baseSeq：
+     Iq/速度以0开始；位置以当前绝对位置开始。
+  4. 紧接着发送ARM：index=刚发目标的seq，argument=token T。
+     ARM处理时初始目标不得超过10 ms；避免在处理完成前先发下一seq使引用不一致。
+  5. 收到ARM的ACCEPTED后立即按5 ms递增seq持续发送同一初始目标，等待ADC最终确认。
+  6. 收到opcode11、相同request_id、result00的异步完成事件，并观察ENABLED/有效反馈后，
+     再开始更新实际运行目标。ACCEPTED只表示受理，不代表已经输出成功。
+  7. 管理请求超时应停止控制，不要自动重试ARM或自动恢复非零目标。
+
+E. 停机及切换模式
+  发DISARM（index=0、argument=0），停止发目标，等待输出关闭。
+  会话随停机失效；切换模式、重新设置和再次ARM需要新会话。
+  位置模式“写0目标”会去绝对零点，不是停止，停机应发DISARM。
+  广播禁能：ID=001，数据必须为00 00 00 00 00 00 00 00。
+  单播DISARM/HOME_ABORT和广播禁能不需要token，接收侧优先处理停止。
+
+九、板端反馈格式
+================
+1. 心跳：0x700+N，每50 ms
+   B0 state，B1 mode，B2～B3 faultBits，B4～B5 appliedSeq，
+   B6 ADC进度计数低8位，B7指令年龄ms（最大饱和到255）。
+   255可能表示年龄>=255 ms，也可能表示无有效租约；精确判断查询GET_STATUS/0003。
+   心跳不是校准保活，也不代替运行目标。
+
+2. 快速反馈：0x180+N，每20 ms
+   B0 appliedSeq低8位；B1 flags；B2～B3 raw（u16，0～16383）；
+   B4～B5 speed（i16，每单位0.1 rad/s）；B6～B7 Iq（i16，mA）。
+   speed为编码器原始速度反馈，并非位置目标或恒定的滤波速度。
+   flags：bit0 ENABLED，bit1存在故障，bit2有效帧标识，bit3目标年龄>=10 ms，
+          bit4当前参考被限流，bit6 ADC应用序号有效且ENABLED，bit7数值打包饱和。
+   未定义bit5。不要把“收到帧”本身当作输出已使能，需检查状态/flags。
+   应用序号只取低8位，需完整序号时看心跳/GET_STATUS。
+
+3. 原始多圈位置：0x500+N，每200 ms
+   B0～B3 turns（i32），B4～B5 raw（u16），B6～B7 sampleSequence（u16）。
+   sampleSequence是位置采样序号，不是目标seq。
+   WHEEL断电或复位后多圈累积重新开始，不能据此恢复断电前的累计圈数。
+
+4. JOINT逻辑位置：0x200+N，JOINT时每50 ms
+   B0～B1 appliedSeq，B2～B3 flags，B4～B7 q（i32，0.0001 rad）。
+   flags：bit0存在参考，bit1坐标有效，bit2窗口内有效，bit3坐标配置dirty，
+          bit4靠近负侧余量，bit5靠近正侧余量，bit7 ADC应用序号有效。
+   先检查bit1/bit2和0207；坐标无效时填0不代表物理零位。
+   越界但坐标可计算时仍报告实际q。当前profile2的±90°是诊断窗口，非真实限位。
+
+5. 故障：0x080+N，故障变化时
+   B0 首次故障发生前的state，B1首次故障mode，B2～B3 faultBits，
+   B4～B5首次故障相关seq，B6～B7 detail（u16）。
+   B0不是当前状态；当前状态看心跳/GET_STATUS。
+
+十、故障位与诊断
+================
+faultBits低16位，多个故障可同时存在：
+ bit0 硬过流       bit1 软过流          bit2 ADC A越界      bit3 ADC C越界
+ bit4 零偏失败     bit5 驱动器故障      bit6 编码器异常     bit7 非有限数
+ bit8 控制停滞     bit9 电气对准失败    bit10 指令超时      bit11 Bus-off
+ bit12 HOME预留    bit13 配置无效       bit14 运动限位/超速 bit15 母线/内部故障
+
+bit14不一定是位置撞限位：运动detail1=原始速度超限，2=位置越界，3=运动配置无效，
+4=非有限数，5=编码器无效；需同时结合故障位和触发路径解释。
+
+当前ADC目标应用失败的内部详情码（配合bit15）：
+ 80 目标/运动配置非法       81 编码器缓存读取失败      82 编码器数据过旧
+ 83 速度非有限数           84 瞬时速度绝对值>5 rad/s  85 坐标映射失败
+ 86 当前位置越界           87 初始目标误差过大        88 JOINT目标余量不满足
+ 89 底层电流应用拒绝       8A 50 ms静止窗口不足、过旧或角度范围超过24 counts
+上述编号为十六进制，故障帧detail小端存放，如84 00。
+旧0x00010401的84门限为1 rad/s；本说明按0x00010403解释。
+其他故障的detail按其故障来源解释，不要把任意detail都套用到这张表。
+
+CLEAR_FAULT只允许bit10/bit11，即掩码0x0400、0x0800或0x0C00。
+需禁能、结束校准、建立会话；Bus-off必须先完成总线恢复。
+其他硬故障不能用CLEAR_FAULT清除；记录原因并排查后，再明确执行复位。
+复位清除RAM故障和运行参数，不会修复持续存在的电气或传感器问题。
+
+十一、软件复位
+==============
+1. 先确认固件支持：GET_INFO/0006的bit8=1，当前0x00010403支持。
+2. 输出及驱动器必须关闭，无待处理停机/ARM/校准/驱动启动。
+   允许DISABLED、READY或已停机的FAULT/COMM_LOST；运行中不接受复位。
+3. 重新读取GET_INFO/0005取得challenge C。
+4. 发送op=1D，index=A55A，argument=C。
+5. 应答ACCEPTED后会话撤销，控制请求冻结。固件等待该确认帧在CAN上实际发送完成，
+   再等待20 ms，由主循环复位；不是收到请求或HAL入队就立即复位。
+   500 ms内未确认发送则取消复位，继续保持禁能；ACCEPTED不等同于已完成重启。
+6. 重启后保持禁能、不自动电气对准；重新读版本、状态和参数，再按需建立新会话。
+   运行目标、RAM参数和token不会保留；节点/profile由烧录配置保持。
+7. CAN-Console提供“软件复位（禁能）”按钮。并行版接受后保留适配器连接，等待被复位节点重启，再重新读取状态；不自动使能，其他节点继续独立运行。双击节点只切换当前查看对象，不停止其他电机。“多电机控制”页可勾选多台，批量启动、分别填写目标后一起应用、禁能所选；每节点独立会话与5 ms目标周期。批量启动中任一成员失败会撤销本批次；广播停止或共享串口故障撤销全部控制。
+
+十二、节点1十六进制例子
+======================
+以下ID均为十六进制，数据区均为8字节。RID不重复；运行例子不是完整的自动控制程序。
+带C0～C3/T0～T3的行是动态字段模板，必须换成实际应答中的4个字节，不能直接照抄。
+
+只读及禁能，可用cangaroo手动发送：
+  ID301  01 01 00 00 00 00 00 00   查询协议
+  ID381  01 01 00 00 00 01 01 00   对应成功应答，value=0x00010100
+  ID301  01 02 01 00 00 00 00 00   查询固件
+  ID381  01 02 00 00 03 04 01 00   当前固件0x00010403
+  ID301  02 03 00 00 00 00 00 00   查询state/mode/role/source
+  ID381  02 03 00 00 01 00 02 00   示例：禁能、Iq模式、WHEEL、CAN
+  ID301  13 04 10 00 00 00 00 00   读取Iq限流
+  ID381  13 04 00 00 DC 05 00 00   示例：1500 mA，按当前实际值解释
+  ID301  12 05 00 00 00 00 00 00   单播禁能，无token要求
+  ID001  00 00 00 00 00 00 00 00   广播禁能
+
+建立会话，baseSeq=0x1000：
+  ID301  01 06 05 00 00 00 00 00   读取challenge
+  ID381  01 06 00 00 C0 C1 C2 C3   challenge的小端字节
+  ID301  03 07 00 10 C0 C1 C2 C3   OPEN_SESSION
+  ID381  03 07 00 00 T0 T1 T2 T3   成功返回session token
+
+同一有效禁能会话内：
+  ID301  04 08 00 00 00 00 00 00   设置Iq模式0
+  ID301  15 09 00 00 64 00 00 00   设置限流100 mA
+  ID301  14 0A 11 00 88 13 00 00   设置速度上限5000，即5 rad/s
+  ID301  14 0B 14 00 F4 01 00 00   设置位置速度500，即0.5 rad/s
+  ID301  14 0C 15 00 E8 03 00 00   设置加速度1000，即1 rad/s²
+  应逐项等待OK并GET_PARAM读回，不能假定写入成功。
+
+电气对准模板，使用上述token（期间禁止用手动点击代替5 ms保活）：
+  ID301  10 10 00 10 T0 T1 T2 T3   校准起始seq=0x1000，RID=0x10
+  ID381  10 10 01 00 00 00 00 00   受理应答
+  ID301  1B 00 01 10 T0 T1 T2 T3   第一次保活，seq=0x1001，RID固定0
+  ID301  1B 00 02 10 T0 T1 T2 T3   下一次保活，之后继续递增
+  ID401  10 10 00 00 Z0 Z1 Z2 Z3   完成事件，Z为电气零角，单位微弧度
+  完成后停止保活，旧token失效，重新建立会话。
+
+运行目标编码示例（仅在已正确建立/使能的相应模式下有效）：
+  ID121  01 20 00 00 1E 00 00 00   seq=0x2001，Iq=+30 mA
+  ID121  02 20 00 00 E2 FF FF FF   seq=0x2002，Iq=-30 mA
+  ID121  03 20 01 00 F4 01 00 00   seq=0x2003，速度=+0.5 rad/s
+  ID121  04 20 01 00 0C FE FF FF   seq=0x2004，速度=-0.5 rad/s
+  ID121  05 20 02 00 10 27 00 00   seq=0x2005，绝对位置=1 rad
+  ID121  06 20 02 00 04 29 00 00   seq=0x2006，绝对位置=1.05 rad
+  不可直接连续发送这些不同mode的例子：必须先禁能、建会话、切换模式并重新ARM。
+
+ARM模板：假设已对准、已建新会话，baseSeq=0x2000，token为U0～U3：
+  ID121  00 20 00 00 00 00 00 00   Iq模式初始零目标
+  ID301  11 21 00 20 U0 U1 U2 U3   引用seq=0x2000请求ARM
+  ID381  11 21 01 00 00 00 00 00   受理；开始5 ms递增序号发送零目标
+  ID121  01 20 00 00 00 00 00 00   seq=0x2001，继续零目标
+  ID121  02 20 00 00 00 00 00 00   seq=0x2002，继续零目标
+  ID401  11 21 00 00 S0 S1 00 00   ADC最终成功，S为实际应用序号
+  事件实际到达次序以接收为准；等待期间持续发送初始目标，完成后才改非零目标。
+
+软件复位模板，节点已禁能：
+  ID301  01 40 05 00 00 00 00 00   重新读challenge
+  ID381  01 40 00 00 C0 C1 C2 C3
+  ID301  1D 41 5A A5 C0 C1 C2 C3   软件复位确认索引0xA55A
+  ID381  1D 41 01 00 00 00 00 00   ACCEPTED，随后观察重启心跳并重新读取状态
+
+十三、接入工具与排查
+==================
+1. cangaroo适合手动查询、禁能和软件复位；完整校准/运行需要可靠周期发送器或CAN-Console。
+   CAN-Console当前运行目标和校准保活周期5 ms、普通查询5秒且运行时暂停。
+2. 本机USB-CAN采用SLCAN：COM16串口1,000,000 baud，S8表示CAN 1 Mbit/s。
+   这是适配器串口，不是板上已关闭的USART2。其他适配器按自身驱动设置。
+   例如查询协议的SLCAN文本为 t30180101000000000000 后追加CR；
+   cangaroo的普通CAN发送栏填ID和8字节数据即可，不填这段SLCAN文本。
+3. 没有快速反馈时先看心跳及0202，不要因此判断CAN一定没连上。
+4. ACCEPTED后没收到ADC最终成功，不要认为已使能；读取故障及当前状态。
+5. 模式、单位、目标seq、保留字节、request_id重复和会话是否已被DISARM撤销，优先逐项核对。
+6. 板端心跳50 ms不意味着目标也能50 ms才发送；20 ms租约是独立的运行保护。
+7. 位置偏移且仍处于正常位置闭环时，控制器按限流/速度/限位约束追踪原目标；
+   发生故障或已禁能时不会自动重新ARM回位。外力测试不代表真实关节带载/限位验收。

@@ -22,6 +22,7 @@
 #include "motor_supervisor.h"
 #include "motor_port.h"
 #include "encoder_bench.h"
+#include "app_config.h"
 
 /* ========================================================================== */
 /*  全局变量                                                                   */
@@ -63,7 +64,7 @@ volatile uint8_t current_ref_limited;
 /* 电机配置 (来自 TinyFoc) */
 motor_config_t motor_config = {
     .voltage_supply         = MOTOR_VBUS,
-    .dir                    = -1,
+    .dir                    = APP_MOTOR_ELECTRICAL_DIRECTION,
     .pairs                  = 11,
     .iq_p_gain              = IQ_CURRENT_KP_DEFAULT,
     .iq_i_gain              = IQ_CURRENT_KI_DEFAULT,

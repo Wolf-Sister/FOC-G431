@@ -2,6 +2,7 @@
 /*
 !/.gitignore
 !/README.md
+!/CAN协议使用说明.txt
 !/FOC_v1.ioc
 !/.mxproject
 !/Core/

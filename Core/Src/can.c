@@ -5,6 +5,8 @@
 #include <string.h>
 #include <math.h>
 #include "motor_supervisor.h"
+#include "motor_port.h"
+#include "motor_axis.h"
 
 volatile CAN_DebugTypeDef canDebug;
 
@@ -24,9 +26,9 @@ typedef struct {
 static CAN_Packet requests[CAN_QUEUE_DEPTH], replies[CAN_QUEUE_DEPTH];
 static volatile uint32_t requestHead, requestTail;
 static volatile uint32_t replyHead, replyTail, eventHead, eventTail;
-static uint32_t nextCache, lastHeartbeat, lastFast, lastPosition;
+static uint32_t nextCache, lastHeartbeat, lastFast, lastPosition, lastRawPosition;
 static CAN_Packet eventsQueue[CAN_QUEUE_DEPTH];
-static uint8_t fastPending, positionPending;
+static uint8_t fastPending, positionPending, rawPositionPending;
 static CAN_CachedReply cache[CAN_QUEUE_DEPTH];
 static uint8_t heartbeatPending, faultPending, recoveryPrepared, sampleDivider;
 static uint16_t lastReportedFault;
@@ -37,6 +39,10 @@ static volatile uint8_t adcProgress;
 static uint32_t recoveryTick;
 static volatile uint32_t busOffTick;
 static FDCAN_TxHeaderTypeDef txHeader;
+/* Accepted in TIM3, but hardware reset is performed only from main CAN_Poll. */
+static volatile uint8_t resetPhase;
+static uint8_t resetRequest[8];
+static uint32_t resetStarted, resetTxBuffer, resetAcknowledged;
 
 static HAL_StatusTypeDef CAN_InitResult(HAL_StatusTypeDef result)
 {
@@ -92,6 +98,7 @@ static void CAN_ReadStatus(CAN_NodeStatus *status)
                         (canDebug.busOff << 16) | (canDebug.errorPassive << 17);
     __set_PRIMASK(primask);
     if (MotorSupervisor_Active()) MotorSupervisor_ReadStatus(status, HAL_GetTick());
+    if (MotorSupervisor_Active()) status->capabilities |= CAN_CAP_SOFTWARE_RESET;
     status->firmwareVersion = APP_FIRMWARE_VERSION;
     status->uid[0] = HAL_GetUIDw0();
     status->uid[1] = HAL_GetUIDw1();
@@ -164,7 +171,7 @@ static void CAN_Receive(uint32_t fifo, uint32_t events)
                 requestHead++;
             }
         } else if (APP_CAN_NODE_ID && header.Identifier == CAN_ID_TARGET + APP_CAN_NODE_ID) {
-            if (!MotorSupervisor_TargetISR(data, HAL_GetTick())) canDebug.rxIgnoredCount++;
+            if (resetPhase || !MotorSupervisor_TargetISR(data, HAL_GetTick())) canDebug.rxIgnoredCount++;
         } else canDebug.rxIgnoredCount++;
     }
 }
@@ -174,6 +181,12 @@ static void CAN_HandleRequest(const CAN_Packet *packet, const CAN_NodeStatus *st
 {
     const uint8_t *request = packet->data;
     uint32_t i;
+    if (resetPhase && !CAN_ProtocolIsStop(request) && request[0] != CAN_OP_GET_INFO &&
+        request[0] != CAN_OP_GET_STATUS && request[0] != CAN_OP_GET_PARAM) {
+        memset(reply, 0, 8U); reply[0] = request[0]; reply[1] = request[1];
+        reply[2] = memcmp(request, resetRequest, 8U) == 0 ? CAN_RESULT_ACCEPTED : CAN_RESULT_BUSY;
+        return;
+    }
     if (MotorSupervisor_Active() && packet->epoch != MotorSupervisor_Epoch() && !CAN_ProtocolIsStop(request)) {
         memset(reply, 0, 8U); reply[0] = request[0]; reply[1] = request[1]; reply[2] = CAN_RESULT_BAD_SESSION; return;
     }
@@ -190,7 +203,28 @@ static void CAN_HandleRequest(const CAN_Packet *packet, const CAN_NodeStatus *st
             }
         }
     }
-    if (request[0] == CAN_OP_GET_INFO || request[0] == CAN_OP_GET_STATUS || !MotorSupervisor_Active())
+    if (request[0] == CAN_OP_SOFTWARE_RESET && MotorSupervisor_Active()) {
+        motor_health_t health;
+        uint32_t key = MotorPort_Lock();
+        MotorPort_ReadHealth(&health);
+        memset(reply, 0, 8U); reply[0] = request[0]; reply[1] = request[1];
+        if (CAN_ReadU16(request + 2) != CAN_RESET_CONFIRM) reply[2] = CAN_RESULT_BAD_VALUE;
+        else if (!CAN_ReadU32(request + 4) || CAN_ReadU32(request + 4) != status->challenge)
+            reply[2] = CAN_RESULT_BAD_SESSION;
+        else if ((uint32_t)(now - packet->receivedMs) >= 100U) reply[2] = CAN_RESULT_STALE;
+        else if (!MotorSupervisor_ResetReady() || health.outputEnabled || health.driverEnabled || alignment_in_progress ||
+                 (status->state != CAN_STATE_DISABLED && status->state != CAN_STATE_READY &&
+                  status->state != CAN_STATE_FAULT && status->state != CAN_STATE_COMM_LOST))
+            reply[2] = CAN_RESULT_BAD_STATE;
+        else {
+            memcpy(resetRequest, request, 8U);
+            resetStarted = now; resetTxBuffer = 0U;
+            CAN_Stop(); /* Revoke the session and all queued target authority. */
+            __DMB(); resetPhase = 1U;
+            reply[2] = CAN_RESULT_ACCEPTED;
+        }
+        MotorPort_Unlock(key);
+    } else if (request[0] == CAN_OP_GET_INFO || request[0] == CAN_OP_GET_STATUS || !MotorSupervisor_Active())
         CAN_ProtocolReply(request, status, reply);
     else if (request[0] == CAN_OP_CLEAR_FAULT &&
              (canDebug.busOff || canDebug.recoveryPhase)) {
@@ -217,7 +251,7 @@ static bool CAN_Recover(uint32_t now, const FDCAN_ProtocolStatusTypeDef *protoco
         replyTail = replyHead; eventTail = eventHead;
         memset(cache, 0, sizeof(cache));
         __set_PRIMASK(primask);
-        heartbeatPending = faultPending = fastPending = positionPending = 0U;
+        heartbeatPending = faultPending = fastPending = positionPending = rawPositionPending = 0U;
         recoveryPrepared = 1U;
         if (HAL_FDCAN_AbortTxRequest(&hfdcan1, CAN_TX_BUFFERS) != HAL_OK) {
             canDebug.halError = HAL_FDCAN_GetError(&hfdcan1);
@@ -253,8 +287,8 @@ static void CAN_Send(const CAN_NodeStatus *status)
 {
     uint8_t data[8];
     uint32_t kind;
-    if (canDebug.recoveryPhase != 0U || !APP_CAN_NODE_ID ||
-        (!faultPending && replyHead == replyTail && eventHead == eventTail && !heartbeatPending && !fastPending && !positionPending)) return;
+    if (resetPhase >= 2U || canDebug.recoveryPhase != 0U || !APP_CAN_NODE_ID ||
+        (!faultPending && replyHead == replyTail && eventHead == eventTail && !heartbeatPending && !fastPending && !positionPending && !rawPositionPending)) return;
     /* At most one periodic frame in hardware; reserve room for replies/faults. */
     if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) <=
         (uint32_t)((!faultPending && replyHead == replyTail && eventHead == eventTail) ? 2U : 0U)) {
@@ -287,15 +321,37 @@ static void CAN_Send(const CAN_NodeStatus *status)
     }
     else {
         motor_snapshot_t sample;
-        if (!MotorSupervisor_ReadSample(&sample) || !sample.valid || !sample.electricalValid ||
+        if (!MotorSupervisor_ReadSample(&sample) || !sample.valid ||
+            (!sample.electricalValid && !(APP_MOTOR_ROLE == MOTOR_ROLE_JOINT && (positionPending || rawPositionPending))) ||
             (uint32_t)(HAL_GetTick() - sample.capturedMs) >= 2U) {
-            fastPending = positionPending = 0U; return;
+            fastPending = positionPending = rawPositionPending = 0U; return;
         }
-        if (positionPending) {
-            kind = 5U; txHeader.Identifier = CAN_ID_POSITION + APP_CAN_NODE_ID;
-            CAN_WriteU32(data, (uint32_t)sample.turns); CAN_WriteU16(data + 4, sample.rawAngle);
-            CAN_WriteU16(data + 6, (uint16_t)sample.sequence);
+        if (positionPending && APP_MOTOR_ROLE == MOTOR_ROLE_JOINT) {
+                int32_t positionQ = 0;
+                uint8_t coordinateValid = 0U, reason = 0U, dirty = 0U;
+                uint16_t flags = 0U;
+                kind = 6U; txHeader.Identifier = CAN_ID_JOINT_POSITION + APP_CAN_NODE_ID;
+                (void)MotorSupervisor_ReadAxisStatus(&positionQ, &coordinateValid, &reason, &dirty);
+                if (reason != MOTOR_AXIS_STATUS_NO_REFERENCE) flags |= 1U;
+                if (coordinateValid) flags |= 1U << 1;
+                if (reason == MOTOR_AXIS_STATUS_VALID) flags |= 1U << 2;
+                if (dirty) flags |= 1U << 3;
+                if (coordinateValid && MotorProfile_Selected.positionMarginQ != 0U &&
+                    (int64_t)positionQ - MotorProfile_Selected.minimumQ <= MotorProfile_Selected.positionMarginQ)
+                    flags |= 1U << 4;
+                if (coordinateValid && MotorProfile_Selected.positionMarginQ != 0U &&
+                    (int64_t)MotorProfile_Selected.maximumQ - positionQ <= MotorProfile_Selected.positionMarginQ)
+                    flags |= 1U << 5;
+                if (sample.appliedValid) flags |= 1U << 7;
+                CAN_WriteU16(data, sample.appliedSeq);
+                CAN_WriteU16(data + 2, flags);
+                CAN_WriteU32(data + 4, coordinateValid ? (uint32_t)positionQ : 0U);
+        } else if ((positionPending && APP_MOTOR_ROLE != MOTOR_ROLE_JOINT) || rawPositionPending) {
+                kind = 5U; txHeader.Identifier = CAN_ID_POSITION + APP_CAN_NODE_ID;
+                CAN_WriteU32(data, (uint32_t)sample.turns); CAN_WriteU16(data + 4, sample.rawAngle);
+                CAN_WriteU16(data + 6, (uint16_t)sample.sequence);
         } else {
+            if (!sample.electricalValid) { fastPending = 0U; return; }
             float speed = sample.velocity * 10.0f, iq = sample.iq * 1000.0f;
             uint8_t saturated = speed > 32767.0f || speed < -32768.0f || iq > 32767.0f || iq < -32768.0f;
             if (!isfinite(speed) || !isfinite(iq)) { fastPending = 0U; return; }
@@ -314,12 +370,20 @@ static void CAN_Send(const CAN_NodeStatus *status)
     canDebug.txAttemptCount++;
     if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txHeader, data) == HAL_OK) {
         canDebug.txQueuedCount++;
+        if (resetPhase == 1U && kind == 1U && data[0] == CAN_OP_SOFTWARE_RESET &&
+            data[1] == resetRequest[1] && data[2] == CAN_RESULT_ACCEPTED) {
+            resetTxBuffer = HAL_FDCAN_GetLatestTxFifoQRequestBuffer(&hfdcan1);
+            resetPhase = 2U;
+        }
         if (kind == 0U) faultPending = 0U;
         else if (kind == 1U) replyTail++;
         else if (kind == 2U) heartbeatPending = 0U;
         else if (kind == 3U) eventTail++;
         else if (kind == 4U) fastPending = 0U;
-        else positionPending = 0U;
+        else if (kind == 5U) {
+            if (APP_MOTOR_ROLE == MOTOR_ROLE_JOINT) rawPositionPending = 0U;
+            else positionPending = 0U;
+        } else if (kind == 6U) positionPending = 0U;
     } else {
         canDebug.txFailedCount++;
         canDebug.halError = HAL_FDCAN_GetError(&hfdcan1);
@@ -338,7 +402,9 @@ HAL_StatusTypeDef CAN_Init(void)
     if (hfdcan1.State != HAL_FDCAN_STATE_READY || hfdcan1.Init.StdFiltersNbr != 3U)
         return CAN_InitResult(HAL_ERROR);
     requestHead = requestTail = replyHead = replyTail = eventHead = eventTail = nextCache = 0U;
-    fastPending = positionPending = 0U; lastFast = lastPosition = HAL_GetTick();
+    resetPhase = 0U; resetTxBuffer = resetStarted = resetAcknowledged = 0U;
+    fastPending = positionPending = rawPositionPending = 0U;
+    lastFast = lastPosition = lastRawPosition = HAL_GetTick();
     heartbeatPending = faultPending = recoveryPrepared = sampleDivider = adcProgress = 0U;
     canFaultBits = lastReportedFault = 0U;
     lastHealthyState = faultState = busOffOriginState = CAN_STATE_BOOT;
@@ -400,6 +466,31 @@ void CAN_Poll(void)
     uint32_t now;
     if (!canDebug.active) return;
     now = HAL_GetTick();
+    if (resetPhase) {
+        if ((uint32_t)(now - resetStarted) >= 500U) {
+            /* No confirmed reply means no reset. Keep the node stopped and
+             * require a new challenge/request after failed transmission. */
+            uint32_t key = MotorPort_Lock();
+            if (resetTxBuffer) (void)HAL_FDCAN_AbortTxRequest(&hfdcan1, resetTxBuffer);
+            memset(cache, 0, sizeof(cache)); replyTail = replyHead;
+            resetPhase = 0U;
+            MotorPort_Unlock(key);
+        } else if (resetPhase == 2U && resetTxBuffer &&
+                   (hfdcan1.Instance->TXBTO & resetTxBuffer) != 0U &&
+                   (hfdcan1.Instance->TXBRP & resetTxBuffer) == 0U) {
+            resetAcknowledged = now; resetPhase = 3U;
+        } else if (resetPhase == 3U && (uint32_t)(now - resetAcknowledged) >= 20U) {
+            motor_health_t health;
+            uint32_t key = MotorPort_Lock();
+            MotorPort_ReadHealth(&health);
+            if (!health.outputEnabled && !health.driverEnabled && !alignment_in_progress) {
+                Motor_HardwareDisable();
+                NVIC_SystemReset();
+            }
+            resetPhase = 0U; /* Host model can return; hardware reset cannot. */
+            MotorPort_Unlock(key);
+        }
+    }
     if (HAL_FDCAN_GetProtocolStatus(&hfdcan1, &protocol) != HAL_OK ||
         HAL_FDCAN_GetErrorCounters(&hfdcan1, &counters) != HAL_OK) {
         canDebug.halError = HAL_FDCAN_GetError(&hfdcan1);
@@ -428,7 +519,13 @@ void CAN_Poll(void)
     if (status.faultBits == 0U) lastHealthyState = status.state;
     if (!MotorSupervisor_Active()) CAN_Tick1kHz();
     if ((uint32_t)(now - lastFast) >= CAN_FEEDBACK_PERIOD_MS) { lastFast = now; fastPending = 1U; }
-    if ((uint32_t)(now - lastPosition) >= CAN_POSITION_PERIOD_MS) { lastPosition = now; positionPending = 1U; }
+    if ((uint32_t)(now - lastPosition) >= (APP_MOTOR_ROLE == MOTOR_ROLE_JOINT ? 50U : CAN_POSITION_PERIOD_MS)) {
+        lastPosition = now; positionPending = 1U;
+    }
+    if (APP_MOTOR_ROLE == MOTOR_ROLE_JOINT &&
+        (uint32_t)(now - lastRawPosition) >= CAN_POSITION_PERIOD_MS) {
+        lastRawPosition = now; rawPositionPending = 1U;
+    }
     if ((uint32_t)(now - lastHeartbeat) >= CAN_HEARTBEAT_PERIOD_MS) {
         lastHeartbeat = now;
         heartbeatPending = 1U;

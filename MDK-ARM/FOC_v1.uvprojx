@@ -411,6 +411,16 @@
               <FilePath>../Core/Src/motor_motion.c</FilePath>
             </File>
             <File>
+              <FileName>motor_axis.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/motor_axis.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_profile.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/motor_profile.c</FilePath>
+            </File>
+            <File>
               <FileName>motor_alignment.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/motor_alignment.c</FilePath>
@@ -1861,9 +1871,6 @@
           </Files>
         </Group>
         <Group>
-          <GroupName>::CMSIS</GroupName>
-        </Group>
-        <Group>
           <GroupName>Middlewares/Library/DSP Library/DSP Library</GroupName>
           <GroupOption>
             <CommonProperty>
@@ -1960,6 +1967,9 @@
               </FileOption>
             </File>
           </Files>
+        </Group>
+        <Group>
+          <GroupName>::CMSIS</GroupName>
         </Group>
       </Groups>
     </Target>
