@@ -40,7 +40,7 @@
 #endif
 
 #ifndef APP_FIRMWARE_VERSION
-#define APP_FIRMWARE_VERSION 0x00010405U
+#define APP_FIRMWARE_VERSION 0x00010406U
 #endif
 
 /* Bump on wiring, encoder installation or electrical-angle semantics changes. */

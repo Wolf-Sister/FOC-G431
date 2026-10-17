@@ -33,9 +33,6 @@ extern "C" {
 /*  传感器 / 电流参数                                                          */
 /* ========================================================================== */
 
-/* 角度滤波器 --------------------------------------------------------------*/
-#define FOC_LPF_ALPHA  0.15f
-
 /* 电流采样 -----------------------------------------------------------*/
 #define ADC_VOLTAGE_RANGE   3.3f
 #define ADC_RESOLUTION      4096.0f
@@ -88,7 +85,6 @@ extern "C" {
 #define POS_RELATIVE_STEP_MAX_RAD      6.2831853f
 #define POS_ACCEL_LIMIT_DEFAULT       40.0f /* 位置轨迹加减速度 (rad/s^2)           */
 #define POS_ACCEL_LIMIT_MAX         2000.0f
-#define POSITION_LOOP_DT_S             0.001f
 
 /* PWM 占空比限幅 ----------------------------------------------------------*/
 /* DRV8323H 集成电荷泵并支持 100% 占空比，故上限只需留少量余量给最小脉宽，
@@ -243,9 +239,12 @@ extern volatile float cordic_cos_cache;
 /* ========================================================================== */
 
 /* --- 现有（保留） -------------------------------------------------------*/
-void  SVPWM_Update(float Ud, float Uq, float angle, uint32_t period);
 void  Motor_Current_Calibration(void);
+#if APP_UART_ENABLE
 void  UART2_SendString(const char *str);
+#else
+static inline void UART2_SendString(const char *str) { (void)str; }
+#endif
 
 /* --- 电机控制 ---------------------------------------------------------*/
 void  motor_control_parm_init(void);
@@ -253,25 +252,11 @@ void  foc_set_loop_limits(float current_voltage_limit,
                           float speed_current_limit,
                           float position_speed_limit);
 
-/* --- Clarke + Park 变换 -----------------------------------------------*/
-float cal_Iq_Id(float cur_b, float cur_c, float angle_el);
-
-/* --- 传感器对齐 ------------------------------------------------------*/
-HAL_StatusTypeDef foc_alignSensor(void);
-
 /* --- 闭环控制 ---------------------------------------------------*/
 void  foc_current_loop(void);
 
-/* --- 位置外环 (legacy 1 kHz implementation; active motion path runs at 500 Hz) --- */
-void  foc_position_loop(void);
-
 /* --- SVPWM 前向通道 (d,q → PWM) ----------------------------------------*/
 void  foc_forward(float d, float q, float angle_el);
-
-/* --- 电气角度辅助函数 ----------------------------------------------*/
-float _electricalAngle(void);
-float _electricalVelocity(void);
-float _calculate_zero_electric_angle(void);
 
 /* --- 安全停机 --------------------------------------------------------*/
 void  foc_safe_stop(void);
@@ -313,15 +298,20 @@ typedef struct {
 } motor_fault_snapshot_t;
 extern volatile motor_fault_snapshot_t motor_fault_snapshot;
 void motor_fault_trip(motor_fault_t reason);
-/* Check and enable are atomic relative to software protection interrupts. */
-bool foc_enable_driver(void);
-bool foc_enable_control(void);
 void foc_process_current_sample(uint16_t raw_a, uint16_t raw_c);
 void foc_check_sampling_progress(void);
 void foc_check_calibration_timeout(void);
+void foc_sync_phase_currents(void);
 
-/* --- ADC → 相电流同步 ----------------------------------------------*/
-void  foc_sync_phase_currents(void);
+#if APP_UART_ENABLE
+/* Historical UART bench API. The active CAN path uses MotorSupervisor and
+ * MotorPort; blocking alignment helpers are excluded from CAN-only builds. */
+void SVPWM_Update(float Ud, float Uq, float angle, uint32_t period);
+HAL_StatusTypeDef foc_alignSensor(void);
+float _calculate_zero_electric_angle(void);
+bool foc_enable_driver(void);
+bool foc_enable_control(void);
+#endif
 
 #ifdef __cplusplus
 }

@@ -4,12 +4,14 @@
 
 CAN接入请先阅读根目录[CAN协议使用说明](CAN协议使用说明.txt)：包含节点ID、报文定义、查询、对准、ARM、运行、禁能及软件复位流程。
 
-上一版 `0x00010403` 裸电机台架验收已收尾，历史镜像和实物记录保留在本地[收尾基线](build/closeout-20261017/README.md)。Flash版本 `0x00010404` 已完成节点1保存/重复保存/逻辑失效及三次软件复位35项、两轮正常断电各9项、Keil重烧保留9项、一写两控隔离14项实物检查；该轮结束时节点1保存序号5。当前源码 `0x00010405` 补充校准页ECC受控读取、坏页隔离及人工重新对准/保存修复，已通过638组主机检查与ARM编译；节点1已烧录，重烧记录保留、同值保存、软件复位等15项禁能实物检查通过，真实ECC恢复尚未验收，见[ECC修复说明](docs/flash-ecc-recovery-2026-10-17.md)。此前实物记录见[Flash集成验证](docs/flash-calibration-integration-2026-10-17.md)，原设备实施记录见[Flash实施说明](docs/flash-calibration-implementation-2026-10-17.md)。docs/tests/build继续仅保留本地，工作区未提交或推送。
+当前源码为整理版 `0x00010406`：移除无调用的旧位置环/辅助函数，将旧阻塞调试入口集中到UART可选区，关闭串口时不再生成日志格式化和显示状态轮询。638组主机检查及UART开/关ARM构建通过，CAN-only加载区减少5600字节；控制参数、CAN协议和Flash格式保持，默认节点保留用户当前的node3配置。新版尚未烧录，见[清理记录](docs/code-cleanup-2026-10-17.md)。
+
+上一版 `0x00010403` 裸电机台架验收已收尾，历史镜像和实物记录保留在本地[收尾基线](build/closeout-20261017/README.md)。Flash版本 `0x00010404` 已完成节点1保存/重复保存/逻辑失效及三次软件复位35项、两轮正常断电各9项、Keil重烧保留9项、一写两控隔离14项实物检查；该轮结束时节点1保存序号5。`0x00010405` 补充校准页ECC受控读取、坏页隔离及人工重新对准/保存修复，节点1已烧录，重烧记录保留、同值保存、软件复位等15项禁能实物检查通过，真实ECC恢复未做实物验收，用户已决定暂不测试，见[ECC修复说明](docs/flash-ecc-recovery-2026-10-17.md)。此前实物记录见[Flash集成验证](docs/flash-calibration-integration-2026-10-17.md)，原设备实施记录见[Flash实施说明](docs/flash-calibration-implementation-2026-10-17.md)。docs/tests/build继续仅保留本地，工作区未提交或推送。
 
 | 配置 | 当前值及入口 |
 | --- | --- |
-| 源码固件 / CAN协议 | 0x00010405 / 0x00010100 |
-| 默认角色与节点 | WHEEL / node1，`Core/Inc/motor_profile.h` 的 `APP_MOTOR_PROFILE=0`；各板用 `APP_MOTOR_NODE_ID` 指定独立节点号 |
+| 源码固件 / CAN协议 | 0x00010406 / 0x00010100 |
+| 默认角色与节点 | WHEEL / node3，`Core/Inc/motor_profile.h` 的 `APP_MOTOR_PROFILE=0`；各板用 `APP_MOTOR_NODE_ID` 指定独立节点号 |
 | 其他编译profile | 1为无参考JOINT模板，2为实测参考JOINT坐标诊断；均禁止输出 |
 | 启动 | `APP_AUTO_CALIBRATE=0`；每次采集电流零偏，有效 Flash 电气校准通过健康检查后恢复 READY，否则需显式对准；运行均需新会话和显式 ARM |
 | 通信 | CAN Classic 1 Mbit/s开启，`APP_UART_ENABLE=0`关闭USART2业务 |
@@ -18,7 +20,7 @@ CAN接入请先阅读根目录[CAN协议使用说明](CAN协议使用说明.txt)
 
 最新实物已确认0x00010403：三次CAN软件复位、一次物理复位、9次零目标启停/切换、13项禁能命令边界及双向外力回位通过。外力实测峰值+16.28°/−14.81°，最终平均回位误差约+0.040°；末态READY、输出关闭、fault=0、TEC/REC=0/0、COM16释放。此前主机失联、超行程和反向速度跟踪失败记录保留，速度精度、持续运行及真实关节安装/带载/限位/制动继续暂缓。固件6组主机回归、控制台60项和台架脚本15项检查通过，完整ARMCC编译通过；本轮约定范围完成，见[最终记录](docs/can-stage4-closeout-2026-10-17.md)。
 
-ECC修复版node1测试镜像在 `build/ecc-recovery-20261017/arm/arm-uart0/FOC_v1.hex`，读回版本应为 `0x00010405`；不得给同一总线多块板烧录同一个节点号。能力bit9仍表示支持存储。旧Flash版本的三节点镜像保留在 `build/flash-calibration-integration/firmware/`，版本仍为 `0x00010404`。**复位会恢复1.5 A初始限流，台架脚本须重新设置并读回100 mA后才能ARM。** CubeMX不需调整。
+整理版默认node3镜像在 `build/cleanup-20261017/arm/arm-uart0/FOC_v1.hex`，版本 `0x00010406`，尚未烧录。历史ECC修复版node1镜像在 `build/ecc-recovery-20261017/arm/arm-uart0/FOC_v1.hex`，版本仍为 `0x00010405`；各板须使用独立节点号。能力bit9仍表示支持存储。旧Flash版本三节点镜像保留在 `build/flash-calibration-integration/firmware/`，版本仍为 `0x00010404`。**复位会恢复1.5 A初始限流，台架脚本须重新设置并读回100 mA后才能ARM。** CubeMX不需调整。
 
 Flash使用步骤：显式电气对准并禁能 → 在控制台保存 → 等待最终成功事件 → 复位后检查READY、已从Flash恢复且输出关闭。每次仍采集电流零偏；仅无有效记录时需要重新电气对准。换电机、相线或磁铁/编码器安装前先废弃记录或提升 `APP_ELECTRICAL_CAL_CONFIG_REV`。校准页受控读取发生双位ECC时保持禁能、报告0232=12且不恢复旧值；人工重新对准并保存成功后才解除ARM限制。程序区、系统区、时钟或无法归因的NMI仍硬禁能死循环。真实ECC/写入中掉电尚未验收。
 

@@ -54,8 +54,10 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-/* Main-context service only; never call from ADC/TIM/CAN interrupts. */
+#if APP_UART_ENABLE
+/* Legacy bench waits only; never call from ADC/TIM/CAN interrupts. */
 void App_CalibrationPoll(void);
+#endif
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

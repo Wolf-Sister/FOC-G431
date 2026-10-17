@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body for AS5047P and Dual ADC FOC Testing
+  * @brief          : CAN motor service with interrupt-driven dual-ADC FOC
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -20,8 +20,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#if APP_UART_ENABLE
 #include <stdio.h>
-#include <math.h>
+#endif
 #include "as5047p.h"
 #include "as5047p_ext.h"
 #include "encoder_bench.h"
@@ -43,8 +44,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define VEL_LIMIT      600.0f   /* Velocity clamp ±600 rad/s (~5700 RPM)       */
-#define VEL_LPF_ALPHA  0.3f     /* 1st-order LPF coefficient (fc≈2.5Hz @100Hz) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -56,8 +55,10 @@
 
 /* USER CODE BEGIN PV */
 
-/* Control state globals — accessible from TIM/ADC callbacks */
-uint8_t  test_phase  = 0;   /* 0=auto calibration, 1=stopped/fault, 2=ready disabled */
+#if APP_UART_ENABLE
+/* UART telemetry gate; motor state is owned by MotorSupervisor. */
+static uint8_t test_phase;
+#endif
 
 /* 外设就绪标志 — Error_Handler() 据此判断哪些寄存器可以安全操作。
  * 必须在 MX_TIM1_Init() / MX_USART2_UART_Init() 的 USER CODE 区置位，
@@ -76,17 +77,15 @@ void SystemClock_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+#if APP_UART_ENABLE
 void App_CalibrationPoll(void)
 {
   CAN_Poll();
-#if APP_UART_ENABLE
   UART_TX_Pump();
-#endif
 }
 
 static void App_ReportEncoderDiagnostics(void)
 {
-#if APP_UART_ENABLE
   as5047p_diagnostics_t snapshot;
   char log[128];
   AS5047P_GetDiagnostics(&snapshot);
@@ -97,8 +96,8 @@ static void App_ReportEncoderDiagnostics(void)
                  (unsigned)snapshot.diagnostic_spi_status, (unsigned)snapshot.magnitude_spi_status,
                  (unsigned)snapshot.error_raw, (unsigned)snapshot.error_valid, (unsigned)snapshot.attempts);
   UART2_SendString(log);
-#endif
 }
+#endif
 
 /* USER CODE END 0 */
 
@@ -173,7 +172,9 @@ int main(void)
   if (!AS5047P_CheckDiagnostics()) {
     motor_fault_trip(MOTOR_FAULT_ENCODER);
   } else {
+#if APP_UART_ENABLE
     App_ReportEncoderDiagnostics();
+#endif
   }
 
   if (motor_fault_reason == MOTOR_FAULT_NONE) {
@@ -226,6 +227,7 @@ int main(void)
     MotorSupervisor_MainProgress(HAL_GetTick());
     INA219_ServicePoll(HAL_GetTick());
     foc_check_calibration_timeout();
+#if APP_UART_ENABLE
     {
       static uint8_t fault_reported = 0U;
       if (motor_fault_reason != MOTOR_FAULT_NONE && !fault_reported) {
@@ -245,7 +247,6 @@ int main(void)
     /* UART2 发送泵 — 必须放在循环最前面且不做节流。
      * 它自身只在 DMA 空闲时工作，开销仅一次状态判断；若放在遥测节流之后，
      * 队列排空速率会被遥测周期限制。 */
-#if APP_UART_ENABLE
     UART_TX_Pump();
 #endif
 
@@ -258,7 +259,6 @@ int main(void)
     VOFA_ProcessCmd();
     EncoderBench_Poll();
     VOFA_CheckCommandTimeout();
-#endif
 
     /* Calibration progresses in TIM3 without blocking the main loop. */
     {
@@ -280,8 +280,7 @@ int main(void)
       }
     }
 
-    /* --- Phase 2: existing UART telemetry, with the power stage disabled --- */
-#if APP_UART_ENABLE
+    /* Optional UART telemetry; control authority stays with MotorSupervisor. */
     if (test_phase == 2 && !EncoderBench_IsActive())
     {
       if (HAL_GetTick() - last_print_time >= 10)
@@ -400,7 +399,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 
 /**
   * @brief  TIM period elapsed callback
-  *         - TIM1 update/TRGO (~16 kHz, PWM carrier ~32 kHz): safety no-op
+  *         - TIM1 update/TRGO (~16 kHz, PWM carrier ~32 kHz): sampling watchdog
   *           (FOC runs in ADC ISR)
   *         - TIM2: AS5047P encoder SPI read + angle/velocity → cache
   */
@@ -449,12 +448,14 @@ void Error_Handler(void)
     TIM1->CR1  &= ~TIM_CR1_CEN;
   }
 
+#if APP_UART_ENABLE
   /* 3. 尽力上报一次 (环形缓冲非阻塞，满则丢弃) */
   if (huart2_ready != 0U)
   {
     (void)UART_TX_PutString("[FATAL] Error_Handler: power stage disabled\r\n");
     UART_TX_Pump();
   }
+#endif
 
   /* IWDG is not configured; remain disabled until an external reset. */
   for (;;)

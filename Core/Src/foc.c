@@ -16,7 +16,9 @@
 #include "pid.h"
 #include <math.h>
 #include "arm_math.h"
+#if APP_UART_ENABLE
 #include <stdio.h>
+#endif
 #include <string.h>
 #include "ina219.h"
 #include "motor_supervisor.h"
@@ -49,7 +51,7 @@ static volatile uint32_t adc_last_cycle = 0U;
 static volatile uint32_t calibration_start_ms = 0U;
 static volatile uint8_t driver_monitor_enabled = 0U;
 static volatile uint8_t stage2_driver_waiting;
-static uint32_t alignment_start_ms;
+
 
 /* 传感器对齐进行中 — TIM 回调不得覆盖 PWM */
 volatile uint8_t alignment_in_progress = 0;
@@ -118,104 +120,13 @@ motor_control_t motor_control = {
     .latest_ic_raw     = 0,
 };
 
-/* CORDIC sin/cos 缓存 — CORDIC ISR 写入, foc_current_loop() 读取              */
+/* Current ADC frame updates these caches; CORDIC timeout reuses the last result. */
 volatile float cordic_sin_cache = 0.0f;
 volatile float cordic_cos_cache = 1.0f;  /* cos(0)=1 安全初始值                  */
 
-/* ========================================================================== */
-/*  现有 SVPWM（保留用于向后兼容 / 开环测试）                                  */
-/* ========================================================================== */
-
-/**
-  * @brief  11 段 SVPWM 更新 — 写入 TIM1 CCR1/2/3
-  */
-void SVPWM_Update(float Ud, float Uq, float angle, uint32_t period)
-{
-    if (motor_fault_reason != MOTOR_FAULT_NONE) return;
-    if (!isfinite(Ud) || !isfinite(Uq) || !isfinite(angle) || period > 65535U ||
-        period > htim1.Instance->ARR) {
-        motor_fault_trip(MOTOR_FAULT_NONFINITE);
-        return;
-    }
-    float sin_angle, cos_angle;
-    arm_sin_cos_f32(angle * RAD_TO_DEG, &sin_angle, &cos_angle);
-    float Ualpha = Ud * cos_angle - Uq * sin_angle;
-    float Ubeta  = Ud * sin_angle + Uq * cos_angle;
-
-    uint8_t sector = 0;
-    float v1 = Ubeta;
-    float v2 = (SQRT3 * Ualpha - Ubeta) / 2.0f;
-    float v3 = (-SQRT3 * Ualpha - Ubeta) / 2.0f;
-
-    if (v1 > 0) sector += 1;
-    if (v2 > 0) sector += 2;
-    if (v3 > 0) sector += 4;
-
-    switch (sector) {
-        case 3: sector = 1; break;
-        case 1: sector = 2; break;
-        case 5: sector = 3; break;
-        case 4: sector = 4; break;
-        case 6: sector = 5; break;
-        case 2: sector = 6; break;
-        default: return;
-    }
-
-    float Tlow = (float)period;
-    float X = SQRT3 * Tlow * Ubeta;
-    float Y = (3.0f * Ualpha + SQRT3 * Ubeta) * Tlow / 2.0f;
-    float Z = (-3.0f * Ualpha + SQRT3 * Ubeta) * Tlow / 2.0f;
-
-    float t1 = 0.0f, t2 = 0.0f;
-    switch (sector) {
-        case 1: t1 = -Z; t2 =  X; break;
-        case 2: t1 =  Y; t2 =  Z; break;
-        case 3: t1 =  X; t2 = -Y; break;
-        case 4: t1 =  Z; t2 = -X; break;
-        case 5: t1 = -Y; t2 = -Z; break;
-        case 6: t1 = -X; t2 =  Y; break;
-    }
-
-    float sum = t1 + t2;
-    if (sum > Tlow) {
-        t1 = t1 * Tlow / sum;
-        t2 = t2 * Tlow / sum;
-    }
-
-    float ta = (Tlow - t1 - t2) / 4.0f;
-    float tb = ta + t1 / 2.0f;
-    float tc = tb + t2 / 2.0f;
-    if (!isfinite(ta) || !isfinite(tb) || !isfinite(tc) ||
-        ta < 0.0f || tb < 0.0f || tc < 0.0f ||
-        ta > 65535.0f || tb > 65535.0f || tc > 65535.0f) {
-        motor_fault_trip(MOTOR_FAULT_NONFINITE);
-        return;
-    }
-
-    uint16_t ccr1 = 0, ccr2 = 0, ccr3 = 0;
-    switch (sector) {
-        case 1: ccr1 = (uint16_t)ta; ccr2 = (uint16_t)tb; ccr3 = (uint16_t)tc; break;
-        case 2: ccr1 = (uint16_t)tb; ccr2 = (uint16_t)ta; ccr3 = (uint16_t)tc; break;
-        case 3: ccr1 = (uint16_t)tc; ccr2 = (uint16_t)ta; ccr3 = (uint16_t)tb; break;
-        case 4: ccr1 = (uint16_t)tc; ccr2 = (uint16_t)tb; ccr3 = (uint16_t)ta; break;
-        case 5: ccr1 = (uint16_t)tb; ccr2 = (uint16_t)tc; ccr3 = (uint16_t)ta; break;
-        case 6: ccr1 = (uint16_t)ta; ccr2 = (uint16_t)tc; ccr3 = (uint16_t)tb; break;
-    }
-
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-    if (motor_fault_reason != MOTOR_FAULT_NONE) {
-        __set_PRIMASK(primask);
-        return;
-    }
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr1);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ccr2);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, ccr3);
-    __set_PRIMASK(primask);
-}
 
 /* ========================================================================== */
-/*  校准 & 角度滤波器（保留）                                                   */
+/*  电流采样零偏校准                                                          */
 /* ========================================================================== */
 
 void Motor_Current_Calibration(void)
@@ -252,19 +163,17 @@ void Motor_Current_Calibration(void)
   *         现由 uart_tx 模块统一排队，实际搬运只在主循环 UART_TX_Pump()
   *         中进行；日志生产者必须串行调用，运行期统一由主循环输出。
   */
+#if APP_UART_ENABLE
 void UART2_SendString(const char *str)
 {
     (void)UART_TX_PutString(str);
 }
+#endif
 
 /* ========================================================================== */
 /*  相电流同步 — 将 ADC 采集电流复制到 motor_control                           */
 /* ========================================================================== */
 
-/**
-  * @brief  将相电流从双 ADC 缓冲区同步到 motor_control 结构体
-  *         在 ADC 注入回调中、电流环之前调用
-  */
 void foc_sync_phase_currents(void)
 {
     motor_control.IphA = motor_current.I_A;
@@ -596,86 +505,6 @@ bool foc_stage2_complete_alignment(float zero)
     return true;
 }
 
-bool foc_enable_driver(void)
-{
-    if (MotorCalibration_Busy()) return false;
-    uint32_t sensor_start = HAL_GetTick();
-    uint8_t sensor_ready = 0U;
-    do {
-        App_CalibrationPoll();
-        if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return false;
-        if (AS5047P_Sensor_Update(&AngleSensor) &&
-            (uint32_t)(dwt_get_cycles() - AngleSensor.sample_cycle) <
-            (uint32_t)((float)SystemCoreClock * AS5047P_STALE_LIMIT_S)) {
-            sensor_ready = 1U;
-            break;
-        }
-    } while ((uint32_t)(HAL_GetTick() - sensor_start) < FOC_ALIGN_SAMPLE_TIMEOUT_MS);
-    if (!sensor_ready) {
-        motor_fault_trip(MOTOR_FAULT_ENCODER);
-        return false;
-    }
-    uint32_t primask = __get_PRIMASK();
-    uint32_t start, stable_since;
-    __disable_irq();
-    if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled || !motor_current.Calibrated ||
-        !AS5047P_DiagnosticsHealthy()) {
-        __set_PRIMASK(primask);
-        return false;
-    }
-    if (!ina219_bus_valid || !isfinite(motor_config.voltage_supply) ||
-        motor_config.voltage_supply < FOC_BUS_MIN_VALID_V ||
-        motor_config.voltage_supply > FOC_BUS_MAX_VALID_V ||
-        (uint32_t)(HAL_GetTick() - ina219_bus_sample_ms) >= FOC_BUS_MAX_AGE_MS) {
-        __set_PRIMASK(primask);
-        motor_fault_trip(MOTOR_FAULT_BUS);
-        return false;
-    }
-    TIM1->BDTR |= TIM_BDTR_MOE;
-    HAL_GPIO_WritePin(DRV_EN_GPIO_Port, DRV_EN_Pin, GPIO_PIN_SET);
-    __set_PRIMASK(primask);
-    start = HAL_GetTick();
-    stable_since = start;
-    do {
-        App_CalibrationPoll();
-        if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return false;
-        if (HAL_GPIO_ReadPin(NFAULT_GPIO_Port, NFAULT_Pin) == GPIO_PIN_RESET) {
-            stable_since = HAL_GetTick();
-        } else if ((uint32_t)(HAL_GetTick() - stable_since) >= 5U) {
-            primask = __get_PRIMASK();
-            __disable_irq();
-            if (motor_fault_reason == MOTOR_FAULT_NONE && !motor_startup_cancelled &&
-                HAL_GPIO_ReadPin(NFAULT_GPIO_Port, NFAULT_Pin) == GPIO_PIN_SET) {
-                driver_monitor_enabled = 1U;
-                __set_PRIMASK(primask);
-                return true;
-            }
-            __set_PRIMASK(primask);
-        }
-        HAL_Delay(1U);
-    } while ((uint32_t)(HAL_GetTick() - start) < FOC_DRIVER_READY_TIMEOUT_MS);
-    motor_fault_trip(MOTOR_FAULT_DRIVER);
-    return false;
-}
-
-bool foc_enable_control(void)
-{
-    if (MotorCalibration_Busy()) return false;
-    uint32_t primask = __get_PRIMASK();
-    bool enabled = false;
-    encoder_cache_t encoder = {0};
-    __disable_irq();
-    if (!EncoderBench_IsActive() && motor_fault_reason == MOTOR_FAULT_NONE && !motor_startup_cancelled && motor_current.Calibrated &&
-        driver_monitor_enabled && !alignment_in_progress &&
-        AS5047P_DiagnosticsHealthy() && AS5047P_EncoderCache_Read(&encoder) &&
-        encoder.data_valid && !encoder.stale) {
-        current_loop_enable = 1U;
-        motor_ready = 1U;
-        enabled = true;
-    }
-    __set_PRIMASK(primask);
-    return enabled;
-}
 
 void foc_process_current_sample(uint16_t raw_a, uint16_t raw_c)
 {
@@ -760,320 +589,7 @@ void foc_check_calibration_timeout(void)
     }
 }
 
-/* ========================================================================== */
-/*  电气角度辅助函数 (来自 TinyFoc utils.c)                                    */
-/* ========================================================================== */
 
-/**
-  * @brief  在传感器对齐过程中计算零电角偏移量
-  */
-static HAL_StatusTypeDef foc_calculate_zero(float *zero)
-{
-    float sum_sin = 0.0f;
-    float sum_cos = 0.0f;
-    uint8_t valid_samples = 0U;
-    uint32_t start = HAL_GetTick();
-
-    while (valid_samples < 10U) {
-        App_CalibrationPoll();
-        if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return HAL_ERROR;
-        if ((uint32_t)(HAL_GetTick() - start) >= FOC_ALIGN_SAMPLE_TIMEOUT_MS ||
-            (alignment_in_progress && (uint32_t)(HAL_GetTick() - alignment_start_ms) >=
-             FOC_ALIGN_TOTAL_TIMEOUT_MS)) {
-            motor_fault_trip(MOTOR_FAULT_ALIGN_TIMEOUT);
-            return HAL_TIMEOUT;
-        }
-        if (AS5047P_Sensor_Update(&AngleSensor) &&
-            (uint32_t)(dwt_get_cycles() - AngleSensor.sample_cycle) <
-            (uint32_t)((float)SystemCoreClock * AS5047P_STALE_LIMIT_S)) {
-            float angle = AS5047P_GetAngle(&AngleSensor);
-            if (!isfinite(angle)) {
-                motor_fault_trip(MOTOR_FAULT_NONFINITE);
-                return HAL_ERROR;
-            }
-            float s;
-            float c;
-            arm_sin_cos_f32(angle * RAD_TO_DEG, &s, &c);
-            sum_sin += s;
-            sum_cos += c;
-            valid_samples++;
-            /* Spread accepted samples in time; poll discarded/old pipeline
-             * responses without adding another 1 ms of sample latency. */
-            HAL_Delay(1U);
-        }
-    }
-
-    if (sum_sin * sum_sin + sum_cos * sum_cos <
-        100.0f * FOC_ALIGN_MIN_RESULTANT * FOC_ALIGN_MIN_RESULTANT) {
-        motor_fault_trip(MOTOR_FAULT_ALIGN_UNSTABLE);
-        return HAL_ERROR;
-    }
-
-    float mech_angle = atan2f(sum_sin, sum_cos);
-    if (mech_angle < 0.0f) mech_angle += _2PI;
-
-    float raw_elec_angle = (float)(motor_config.dir * motor_config.pairs) * mech_angle;
-    *zero = _normalizeAngle(raw_elec_angle);
-    return HAL_OK;
-}
-
-float _calculate_zero_electric_angle(void)
-{
-    float zero;
-    if (foc_calculate_zero(&zero) != HAL_OK) return NAN;
-    return zero;
-}
-
-/**
-  * @brief  获取瞬时电角度 [0, 2π)
-  */
-float _electricalAngle(void)
-{
-    encoder_cache_t encoder = {0};
-    (void)AS5047P_EncoderCache_Read(&encoder);
-    float mech_angle = encoder.angle_raw;
-    float elec_angle = (float)(motor_config.dir * motor_config.pairs)
-                       * mech_angle
-                       - motor_control.zero_elec_angle;
-    return _normalizeAngle(elec_angle);
-}
-
-/**
-  * @brief  获取电角速度 [rad/s]
-  */
-float _electricalVelocity(void)
-{
-    encoder_cache_t encoder = {0};
-    (void)AS5047P_EncoderCache_Read(&encoder);
-    float mech_vel = encoder.velocity_rad_s;
-    return (float)(motor_config.dir * motor_config.pairs) * mech_vel;
-}
-
-/* ========================================================================== */
-/*  Clarke + Park 变换 (来自 TinyFoc motor.c)                                  */
-/* ========================================================================== */
-
-/**
-  * @brief  从 B、C 相电流通过 Clarke + Park 变换计算 Iq
-  * @param  cur_b    B 相电流 (A)
-  * @param  cur_c    C 相电流 (A)
-  * @param  angle_el 电角度 [rad]
-  * @return Iq (产生转矩的电流分量)
-  */
-float cal_Iq_Id(float cur_b, float cur_c, float angle_el)
-{
-    /* Clarke 变换 */
-    float I_alpha = -(cur_b + cur_c);
-    float I_beta  = _1_SQRT3 * (cur_b - cur_c);
-
-    /* Park 变换 */
-    float s, c;
-    arm_sin_cos_f32(angle_el * RAD_TO_DEG, &s, &c);
-    float I_q = I_beta * c - I_alpha * s;
-    return I_q;
-}
-
-/* Return the largest absolute phase-current value during alignment. */
-static float foc_align_max_phase_current(void)
-{
-    float max_current = fabsf(motor_current.I_A);
-    float phase_current = fabsf(motor_current.I_B);
-
-    if (phase_current > max_current) {
-        max_current = phase_current;
-    }
-
-    phase_current = fabsf(motor_current.I_C);
-    if (phase_current > max_current) {
-        max_current = phase_current;
-    }
-
-    return max_current;
-}
-
-/* Wait for real 1 ms intervals. HAL_Delay(1) adds a SysTick interval, which
- * accumulates across ramps and can exhaust the total alignment budget. */
-static HAL_StatusTypeDef foc_align_wait(uint32_t delay_ms,
-                                        uint32_t *overcurrent_ms)
-{
-    uint32_t elapsed_ms;
-    const uint32_t cycles_per_ms = SystemCoreClock / 1000U;
-
-    for (elapsed_ms = 0U; elapsed_ms < delay_ms; elapsed_ms++) {
-        uint32_t start_cycle = dwt_get_cycles();
-        App_CalibrationPoll();
-        do {
-            if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return HAL_ERROR;
-            /* SysTick remains a separate deadline if DWT stops progressing. */
-            if ((uint32_t)(HAL_GetTick() - alignment_start_ms) >= FOC_ALIGN_TOTAL_TIMEOUT_MS) {
-                motor_fault_trip(MOTOR_FAULT_ALIGN_TIMEOUT);
-                return HAL_TIMEOUT;
-            }
-        } while ((uint32_t)(dwt_get_cycles() - start_cycle) < cycles_per_ms);
-        if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return HAL_ERROR;
-
-        if (foc_align_max_phase_current() > FOC_ALIGN_CURRENT_LIMIT_A) {
-            (*overcurrent_ms)++;
-            if (*overcurrent_ms >= FOC_ALIGN_OVERCURRENT_MS) {
-                motor_fault_trip(MOTOR_FAULT_OVERCURRENT);
-                return HAL_ERROR;
-            }
-        } else {
-            *overcurrent_ms = 0U;
-        }
-    }
-
-    return HAL_OK;
-}
-
-/* Change the static alignment voltage smoothly in 1 ms steps. */
-static HAL_StatusTypeDef foc_align_ramp(float start_voltage,
-                                        float end_voltage,
-                                        uint32_t ramp_ms,
-                                        uint32_t *overcurrent_ms)
-{
-    uint32_t step;
-
-    if (ramp_ms == 0U) {
-        foc_forward(end_voltage, 0.0f, 0.0f);
-        return foc_align_wait(1U, overcurrent_ms);
-    }
-
-    for (step = 1U; step <= ramp_ms; step++) {
-        float ratio = (float)step / (float)ramp_ms;
-        float voltage = start_voltage + ((end_voltage - start_voltage) * ratio);
-
-        foc_forward(voltage, 0.0f, 0.0f);
-        if (foc_align_wait(1U, overcurrent_ms) != HAL_OK) {
-            return HAL_ERROR;
-        }
-    }
-
-    return HAL_OK;
-}
-
-/* ========================================================================== */
-/*  传感器对齐 (来自 TinyFoc motor.c)                                          */
-/* ========================================================================== */
-
-/**
-  * @brief  通过注入静态电压矢量将转子对齐到已知电角度，记录零角偏移量
-  * @retval HAL_OK 对齐完成；HAL_ERROR 对齐阶段持续过流
-  */
-HAL_StatusTypeDef foc_alignSensor(void)
-{
-    char log_buf[128];
-    uint32_t overcurrent_ms = 0U;
-    uint8_t encoder_timer_stopped = 0U;
-    if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled || !driver_monitor_enabled) return HAL_ERROR;
-    alignment_start_ms = HAL_GetTick();
-
-    /* 设置标志，防止 TIM 回调在对齐期间覆盖 PWM */
-    alignment_in_progress = 1;
-
-    /* 从零开始渐升静态电压矢量，避免阶跃激发机械啸叫。 */
-    foc_forward(0.0f, 0.0f, 0.0f);
-    if (foc_align_ramp(0.0f,
-                       FOC_ALIGN_VOLTAGE_V,
-                       FOC_ALIGN_RAMP_UP_MS,
-                       &overcurrent_ms) != HAL_OK) {
-        goto alignment_failed;
-    }
-
-    if (foc_align_wait(FOC_ALIGN_HOLD_MS, &overcurrent_ms) != HAL_OK) {
-        goto alignment_failed;
-    }
-
-    /* Lower the holding torque before sampling the encoder zero point. */
-    if (foc_align_ramp(FOC_ALIGN_VOLTAGE_V,
-                       FOC_ALIGN_HOLD_VOLTAGE_V,
-                       FOC_ALIGN_RAMP_DOWN_MS,
-                       &overcurrent_ms) != HAL_OK) {
-        goto alignment_failed;
-    }
-
-    /* ── 停止 TIM2 编码器 ISR：主线程独占编码器访问 ── */
-    HAL_TIM_Base_Stop_IT(&htim2);
-    encoder_timer_stopped = 1U;
-
-    /* 多次读取编码器，等待转子稳定 */
-    AS5047P_Sensor_Update(&AngleSensor);
-    if (foc_align_wait(10U, &overcurrent_ms) != HAL_OK) {
-        goto alignment_failed;
-    }
-    AS5047P_Sensor_Update(&AngleSensor);
-    if (foc_align_wait(10U, &overcurrent_ms) != HAL_OK) {
-        goto alignment_failed;
-    }
-    AS5047P_Sensor_Update(&AngleSensor);
-    if (foc_align_wait(100U, &overcurrent_ms) != HAL_OK) {
-        goto alignment_failed;
-    }
-
-    /* 通过平均多次读数计算零电角 */
-    float zero;
-    if (foc_calculate_zero(&zero) != HAL_OK) goto alignment_failed;
-    motor_control.zero_elec_angle = zero;
-
-    /* Remove the holding voltage smoothly after zero-angle sampling. */
-    if (foc_align_ramp(FOC_ALIGN_HOLD_VOLTAGE_V,
-                       0.0f,
-                       FOC_ALIGN_RAMP_DOWN_MS,
-                       &overcurrent_ms) != HAL_OK) {
-        goto alignment_failed;
-    }
-    foc_forward(0.0f, 0.0f, 0.0f);
-
-    /* ── 启动 DMA 流水线并重启 TIM2 编码器 ISR ── */
-    AS5047P_DMA_StartRequest();
-    __HAL_TIM_CLEAR_IT(&htim2, TIM_IT_UPDATE);
-    HAL_TIM_Base_Start_IT(&htim2);
-    encoder_timer_stopped = 0U;
-
-    /* 重置两个电流环 PID，使其从 0V 平滑启动 */
-    current_loop.integral_prev   = 0.0f;
-    current_loop.output_prev     = 0.0f;
-    current_loop.error_prev      = 0.0f;
-    current_loop.timestamp_prev_cycles  = dwt_get_cycles();
-
-    id_current_loop.integral_prev   = 0.0f;
-    id_current_loop.output_prev     = 0.0f;
-    id_current_loop.error_prev      = 0.0f;
-    id_current_loop.timestamp_prev_cycles  = dwt_get_cycles();
-
-    speed_loop.integral_prev   = 0.0f;
-    speed_loop.output_prev     = 0.0f;
-    speed_loop.error_prev      = 0.0f;
-    speed_loop.timestamp_prev_cycles  = dwt_get_cycles();
-
-    /* 重置滤波器状态，避免残余值干扰 */
-    motor_control.id_filter_state = 0.0f;
-    motor_control.iq_filter_state = 0.0f;
-
-    /* Alignment is complete. main() initializes all control state before it
-     * enables the current loop, so the ADC ISR cannot race startup writes. */
-    if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) goto alignment_failed;
-    alignment_in_progress = 0;
-    motor_electrical_calibrated = 1U;
-
-    (void)snprintf(log_buf, sizeof(log_buf),
-                   "[FOC] Zero elec angle = %.3f rad\r\n",
-                   motor_control.zero_elec_angle);
-    UART2_SendString(log_buf);
-    UART2_SendString("[FOC] Encoder Calibration Done!\r\n");
-    return HAL_OK;
-
-alignment_failed:
-    if (!motor_startup_cancelled) motor_fault_trip(MOTOR_FAULT_ALIGN_TIMEOUT);
-    if (encoder_timer_stopped != 0U) {
-        AS5047P_DMA_StartRequest();
-        __HAL_TIM_CLEAR_IT(&htim2, TIM_IT_UPDATE);
-        HAL_TIM_Base_Start_IT(&htim2);
-    }
-    alignment_in_progress = 0;
-    UART2_SendString("[FOC] Alignment aborted: fault or disarm\r\n");
-    return HAL_ERROR;
-}
 
 /* ========================================================================== */
 /*  闭环: 电流控制                                                             */
@@ -1125,66 +641,6 @@ static void foc_cordic_sin_cos_current(float angle_el, float *s, float *c)
     }
 }
 
-/**
-  * @brief  位置外环 — 保留的 1 kHz 实现；当前活动运动路径由 MotorPort_RunOuterLoop 以 500 Hz 执行。
-  *         P 位置控制产生速度目标，并受最大速度、加速度和
-  *         剩余制动距离共同约束，避免大位置阶跃直接冲击速度环。
-  *         规划后的 motor_control.set_speed 供 1 kHz 速度环使用。
-  *
-  *         读取 TIM2 ISR (P=1) 发布的编码器一致性快照
-  *         写入 motor_control.set_speed (ADC ISR 读取者, P=0)
-  *         如果 mode != MOTOR_POSITION 则立即返回
-  */
-void foc_position_loop(void)
-{
-    if (motor_fault_reason != MOTOR_FAULT_NONE || !current_loop_enable) return;
-    if (motor_control.mode != MOTOR_POSITION) return;
-
-    /* 1. 读取当前多圈位置 */
-    encoder_cache_t encoder = {0};
-    (void)AS5047P_EncoderCache_Read(&encoder);
-    float curr_pos = encoder.total_angle_rad;
-
-    /* 2. P 位置控制给出期望速度 */
-    float pos_error = motor_control.set_position - curr_pos;
-    float speed_cmd = pos_error * motor_config.pos_p_gain;
-
-    /* 3. 用户指定的硬速度上限 */
-    float speed_limit = motor_config.pos_speed_limit;
-    if (speed_cmd >  speed_limit) speed_cmd =  speed_limit;
-    if (speed_cmd < -speed_limit) speed_cmd = -speed_limit;
-
-    /* 4. 按剩余距离计算可制动速度，形成梯形/三角形速度轨迹 */
-    float accel_limit = motor_config.pos_accel_limit;
-    if (!(accel_limit > 0.0f)) accel_limit = POS_ACCEL_LIMIT_DEFAULT;
-    float braking_speed = sqrtf(2.0f * accel_limit * fabsf(pos_error));
-    if (speed_cmd >  braking_speed) speed_cmd =  braking_speed;
-    if (speed_cmd < -braking_speed) speed_cmd = -braking_speed;
-
-    /* 5. 1 kHz 速度指令斜率限制，避免速度目标瞬时跳变 */
-    float max_speed_delta = accel_limit * POSITION_LOOP_DT_S;
-    float planned_speed = motor_control.set_speed;
-    if (speed_cmd > planned_speed + max_speed_delta) {
-        planned_speed += max_speed_delta;
-    } else if (speed_cmd < planned_speed - max_speed_delta) {
-        planned_speed -= max_speed_delta;
-    } else {
-        planned_speed = speed_cmd;
-    }
-
-    /* 6. 馈入速度环 */
-    if (!isfinite(planned_speed) || !isfinite(curr_pos)) {
-        motor_fault_trip(MOTOR_FAULT_NONFINITE);
-        return;
-    }
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-    if (motor_fault_reason == MOTOR_FAULT_NONE) {
-        motor_control.set_speed = planned_speed;
-        motor_control.pos_meas = curr_pos;
-    }
-    __set_PRIMASK(primask);
-}
 
 static float foc_select_speed_kp(float speed_ref)
 {
@@ -1721,3 +1177,436 @@ void foc_forward(float d, float q, float angle_el)
     /* 写入 PWM 寄存器 */
     set_pwm_duty(d_u, d_v, d_w);
 }
+
+#if APP_UART_ENABLE
+/* Historical blocking UART bench helpers. Production CAN control uses
+ * MotorSupervisor/MotorPort and the nonblocking MotorAlignment state machine.
+ * Keep these helpers together for the optional bench and its regression tests. */
+static uint32_t alignment_start_ms;
+
+/**
+  * @brief  11 段 SVPWM 更新 — 写入 TIM1 CCR1/2/3
+  */
+void SVPWM_Update(float Ud, float Uq, float angle, uint32_t period)
+{
+    if (motor_fault_reason != MOTOR_FAULT_NONE) return;
+    if (!isfinite(Ud) || !isfinite(Uq) || !isfinite(angle) || period > 65535U ||
+        period > htim1.Instance->ARR) {
+        motor_fault_trip(MOTOR_FAULT_NONFINITE);
+        return;
+    }
+    float sin_angle, cos_angle;
+    arm_sin_cos_f32(angle * RAD_TO_DEG, &sin_angle, &cos_angle);
+    float Ualpha = Ud * cos_angle - Uq * sin_angle;
+    float Ubeta  = Ud * sin_angle + Uq * cos_angle;
+
+    uint8_t sector = 0;
+    float v1 = Ubeta;
+    float v2 = (SQRT3 * Ualpha - Ubeta) / 2.0f;
+    float v3 = (-SQRT3 * Ualpha - Ubeta) / 2.0f;
+
+    if (v1 > 0) sector += 1;
+    if (v2 > 0) sector += 2;
+    if (v3 > 0) sector += 4;
+
+    switch (sector) {
+        case 3: sector = 1; break;
+        case 1: sector = 2; break;
+        case 5: sector = 3; break;
+        case 4: sector = 4; break;
+        case 6: sector = 5; break;
+        case 2: sector = 6; break;
+        default: return;
+    }
+
+    float Tlow = (float)period;
+    float X = SQRT3 * Tlow * Ubeta;
+    float Y = (3.0f * Ualpha + SQRT3 * Ubeta) * Tlow / 2.0f;
+    float Z = (-3.0f * Ualpha + SQRT3 * Ubeta) * Tlow / 2.0f;
+
+    float t1 = 0.0f, t2 = 0.0f;
+    switch (sector) {
+        case 1: t1 = -Z; t2 =  X; break;
+        case 2: t1 =  Y; t2 =  Z; break;
+        case 3: t1 =  X; t2 = -Y; break;
+        case 4: t1 =  Z; t2 = -X; break;
+        case 5: t1 = -Y; t2 = -Z; break;
+        case 6: t1 = -X; t2 =  Y; break;
+    }
+
+    float sum = t1 + t2;
+    if (sum > Tlow) {
+        t1 = t1 * Tlow / sum;
+        t2 = t2 * Tlow / sum;
+    }
+
+    float ta = (Tlow - t1 - t2) / 4.0f;
+    float tb = ta + t1 / 2.0f;
+    float tc = tb + t2 / 2.0f;
+    if (!isfinite(ta) || !isfinite(tb) || !isfinite(tc) ||
+        ta < 0.0f || tb < 0.0f || tc < 0.0f ||
+        ta > 65535.0f || tb > 65535.0f || tc > 65535.0f) {
+        motor_fault_trip(MOTOR_FAULT_NONFINITE);
+        return;
+    }
+
+    uint16_t ccr1 = 0, ccr2 = 0, ccr3 = 0;
+    switch (sector) {
+        case 1: ccr1 = (uint16_t)ta; ccr2 = (uint16_t)tb; ccr3 = (uint16_t)tc; break;
+        case 2: ccr1 = (uint16_t)tb; ccr2 = (uint16_t)ta; ccr3 = (uint16_t)tc; break;
+        case 3: ccr1 = (uint16_t)tc; ccr2 = (uint16_t)ta; ccr3 = (uint16_t)tb; break;
+        case 4: ccr1 = (uint16_t)tc; ccr2 = (uint16_t)tb; ccr3 = (uint16_t)ta; break;
+        case 5: ccr1 = (uint16_t)tb; ccr2 = (uint16_t)tc; ccr3 = (uint16_t)ta; break;
+        case 6: ccr1 = (uint16_t)ta; ccr2 = (uint16_t)tc; ccr3 = (uint16_t)tb; break;
+    }
+
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (motor_fault_reason != MOTOR_FAULT_NONE) {
+        __set_PRIMASK(primask);
+        return;
+    }
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr1);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ccr2);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, ccr3);
+    __set_PRIMASK(primask);
+}
+
+bool foc_enable_driver(void)
+{
+    if (MotorCalibration_Busy()) return false;
+    uint32_t sensor_start = HAL_GetTick();
+    uint8_t sensor_ready = 0U;
+    do {
+        App_CalibrationPoll();
+        if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return false;
+        if (AS5047P_Sensor_Update(&AngleSensor) &&
+            (uint32_t)(dwt_get_cycles() - AngleSensor.sample_cycle) <
+            (uint32_t)((float)SystemCoreClock * AS5047P_STALE_LIMIT_S)) {
+            sensor_ready = 1U;
+            break;
+        }
+    } while ((uint32_t)(HAL_GetTick() - sensor_start) < FOC_ALIGN_SAMPLE_TIMEOUT_MS);
+    if (!sensor_ready) {
+        motor_fault_trip(MOTOR_FAULT_ENCODER);
+        return false;
+    }
+    uint32_t primask = __get_PRIMASK();
+    uint32_t start, stable_since;
+    __disable_irq();
+    if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled || !motor_current.Calibrated ||
+        !AS5047P_DiagnosticsHealthy()) {
+        __set_PRIMASK(primask);
+        return false;
+    }
+    if (!ina219_bus_valid || !isfinite(motor_config.voltage_supply) ||
+        motor_config.voltage_supply < FOC_BUS_MIN_VALID_V ||
+        motor_config.voltage_supply > FOC_BUS_MAX_VALID_V ||
+        (uint32_t)(HAL_GetTick() - ina219_bus_sample_ms) >= FOC_BUS_MAX_AGE_MS) {
+        __set_PRIMASK(primask);
+        motor_fault_trip(MOTOR_FAULT_BUS);
+        return false;
+    }
+    TIM1->BDTR |= TIM_BDTR_MOE;
+    HAL_GPIO_WritePin(DRV_EN_GPIO_Port, DRV_EN_Pin, GPIO_PIN_SET);
+    __set_PRIMASK(primask);
+    start = HAL_GetTick();
+    stable_since = start;
+    do {
+        App_CalibrationPoll();
+        if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return false;
+        if (HAL_GPIO_ReadPin(NFAULT_GPIO_Port, NFAULT_Pin) == GPIO_PIN_RESET) {
+            stable_since = HAL_GetTick();
+        } else if ((uint32_t)(HAL_GetTick() - stable_since) >= 5U) {
+            primask = __get_PRIMASK();
+            __disable_irq();
+            if (motor_fault_reason == MOTOR_FAULT_NONE && !motor_startup_cancelled &&
+                HAL_GPIO_ReadPin(NFAULT_GPIO_Port, NFAULT_Pin) == GPIO_PIN_SET) {
+                driver_monitor_enabled = 1U;
+                __set_PRIMASK(primask);
+                return true;
+            }
+            __set_PRIMASK(primask);
+        }
+        HAL_Delay(1U);
+    } while ((uint32_t)(HAL_GetTick() - start) < FOC_DRIVER_READY_TIMEOUT_MS);
+    motor_fault_trip(MOTOR_FAULT_DRIVER);
+    return false;
+}
+
+bool foc_enable_control(void)
+{
+    if (MotorCalibration_Busy()) return false;
+    uint32_t primask = __get_PRIMASK();
+    bool enabled = false;
+    encoder_cache_t encoder = {0};
+    __disable_irq();
+    if (!EncoderBench_IsActive() && motor_fault_reason == MOTOR_FAULT_NONE && !motor_startup_cancelled && motor_current.Calibrated &&
+        driver_monitor_enabled && !alignment_in_progress &&
+        AS5047P_DiagnosticsHealthy() && AS5047P_EncoderCache_Read(&encoder) &&
+        encoder.data_valid && !encoder.stale) {
+        current_loop_enable = 1U;
+        motor_ready = 1U;
+        enabled = true;
+    }
+    __set_PRIMASK(primask);
+    return enabled;
+}
+
+/**
+  * @brief  在传感器对齐过程中计算零电角偏移量
+  */
+static HAL_StatusTypeDef foc_calculate_zero(float *zero)
+{
+    float sum_sin = 0.0f;
+    float sum_cos = 0.0f;
+    uint8_t valid_samples = 0U;
+    uint32_t start = HAL_GetTick();
+
+    while (valid_samples < 10U) {
+        App_CalibrationPoll();
+        if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return HAL_ERROR;
+        if ((uint32_t)(HAL_GetTick() - start) >= FOC_ALIGN_SAMPLE_TIMEOUT_MS ||
+            (alignment_in_progress && (uint32_t)(HAL_GetTick() - alignment_start_ms) >=
+             FOC_ALIGN_TOTAL_TIMEOUT_MS)) {
+            motor_fault_trip(MOTOR_FAULT_ALIGN_TIMEOUT);
+            return HAL_TIMEOUT;
+        }
+        if (AS5047P_Sensor_Update(&AngleSensor) &&
+            (uint32_t)(dwt_get_cycles() - AngleSensor.sample_cycle) <
+            (uint32_t)((float)SystemCoreClock * AS5047P_STALE_LIMIT_S)) {
+            float angle = AS5047P_GetAngle(&AngleSensor);
+            if (!isfinite(angle)) {
+                motor_fault_trip(MOTOR_FAULT_NONFINITE);
+                return HAL_ERROR;
+            }
+            float s;
+            float c;
+            arm_sin_cos_f32(angle * RAD_TO_DEG, &s, &c);
+            sum_sin += s;
+            sum_cos += c;
+            valid_samples++;
+            /* Spread accepted samples in time; poll discarded/old pipeline
+             * responses without adding another 1 ms of sample latency. */
+            HAL_Delay(1U);
+        }
+    }
+
+    if (sum_sin * sum_sin + sum_cos * sum_cos <
+        100.0f * FOC_ALIGN_MIN_RESULTANT * FOC_ALIGN_MIN_RESULTANT) {
+        motor_fault_trip(MOTOR_FAULT_ALIGN_UNSTABLE);
+        return HAL_ERROR;
+    }
+
+    float mech_angle = atan2f(sum_sin, sum_cos);
+    if (mech_angle < 0.0f) mech_angle += _2PI;
+
+    float raw_elec_angle = (float)(motor_config.dir * motor_config.pairs) * mech_angle;
+    *zero = _normalizeAngle(raw_elec_angle);
+    return HAL_OK;
+}
+
+float _calculate_zero_electric_angle(void)
+{
+    float zero;
+    if (foc_calculate_zero(&zero) != HAL_OK) return NAN;
+    return zero;
+}
+
+/* Return the largest absolute phase-current value during alignment. */
+static float foc_align_max_phase_current(void)
+{
+    float max_current = fabsf(motor_current.I_A);
+    float phase_current = fabsf(motor_current.I_B);
+
+    if (phase_current > max_current) {
+        max_current = phase_current;
+    }
+
+    phase_current = fabsf(motor_current.I_C);
+    if (phase_current > max_current) {
+        max_current = phase_current;
+    }
+
+    return max_current;
+}
+
+/* Use real 1 ms intervals; HAL_Delay(1) adds an extra SysTick interval. */
+static HAL_StatusTypeDef foc_align_wait(uint32_t delay_ms,
+                                        uint32_t *overcurrent_ms)
+{
+    uint32_t elapsed_ms;
+    const uint32_t cycles_per_ms = SystemCoreClock / 1000U;
+
+    for (elapsed_ms = 0U; elapsed_ms < delay_ms; elapsed_ms++) {
+        uint32_t start_cycle = dwt_get_cycles();
+        App_CalibrationPoll();
+        do {
+            if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return HAL_ERROR;
+            /* SysTick remains a separate deadline if DWT stops progressing. */
+            if ((uint32_t)(HAL_GetTick() - alignment_start_ms) >= FOC_ALIGN_TOTAL_TIMEOUT_MS) {
+                motor_fault_trip(MOTOR_FAULT_ALIGN_TIMEOUT);
+                return HAL_TIMEOUT;
+            }
+        } while ((uint32_t)(dwt_get_cycles() - start_cycle) < cycles_per_ms);
+        if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return HAL_ERROR;
+
+        if (foc_align_max_phase_current() > FOC_ALIGN_CURRENT_LIMIT_A) {
+            (*overcurrent_ms)++;
+            if (*overcurrent_ms >= FOC_ALIGN_OVERCURRENT_MS) {
+                motor_fault_trip(MOTOR_FAULT_OVERCURRENT);
+                return HAL_ERROR;
+            }
+        } else {
+            *overcurrent_ms = 0U;
+        }
+    }
+
+    return HAL_OK;
+}
+
+/* Change the static alignment voltage smoothly in 1 ms steps. */
+static HAL_StatusTypeDef foc_align_ramp(float start_voltage,
+                                        float end_voltage,
+                                        uint32_t ramp_ms,
+                                        uint32_t *overcurrent_ms)
+{
+    uint32_t step;
+
+    if (ramp_ms == 0U) {
+        foc_forward(end_voltage, 0.0f, 0.0f);
+        return foc_align_wait(1U, overcurrent_ms);
+    }
+
+    for (step = 1U; step <= ramp_ms; step++) {
+        float ratio = (float)step / (float)ramp_ms;
+        float voltage = start_voltage + ((end_voltage - start_voltage) * ratio);
+
+        foc_forward(voltage, 0.0f, 0.0f);
+        if (foc_align_wait(1U, overcurrent_ms) != HAL_OK) {
+            return HAL_ERROR;
+        }
+    }
+
+    return HAL_OK;
+}
+
+/**
+  * @brief  通过注入静态电压矢量将转子对齐到已知电角度，记录零角偏移量
+  * @retval HAL_OK 对齐完成；HAL_ERROR 对齐阶段持续过流
+  */
+HAL_StatusTypeDef foc_alignSensor(void)
+{
+    char log_buf[128];
+    uint32_t overcurrent_ms = 0U;
+    uint8_t encoder_timer_stopped = 0U;
+    if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled || !driver_monitor_enabled) return HAL_ERROR;
+    alignment_start_ms = HAL_GetTick();
+
+    /* 设置标志，防止 TIM 回调在对齐期间覆盖 PWM */
+    alignment_in_progress = 1;
+
+    /* 从零开始渐升静态电压矢量，避免阶跃激发机械啸叫。 */
+    foc_forward(0.0f, 0.0f, 0.0f);
+    if (foc_align_ramp(0.0f,
+                       FOC_ALIGN_VOLTAGE_V,
+                       FOC_ALIGN_RAMP_UP_MS,
+                       &overcurrent_ms) != HAL_OK) {
+        goto alignment_failed;
+    }
+
+    if (foc_align_wait(FOC_ALIGN_HOLD_MS, &overcurrent_ms) != HAL_OK) {
+        goto alignment_failed;
+    }
+
+    /* Lower the holding torque before sampling the encoder zero point. */
+    if (foc_align_ramp(FOC_ALIGN_VOLTAGE_V,
+                       FOC_ALIGN_HOLD_VOLTAGE_V,
+                       FOC_ALIGN_RAMP_DOWN_MS,
+                       &overcurrent_ms) != HAL_OK) {
+        goto alignment_failed;
+    }
+
+    /* ── 停止 TIM2 编码器 ISR：主线程独占编码器访问 ── */
+    HAL_TIM_Base_Stop_IT(&htim2);
+    encoder_timer_stopped = 1U;
+
+    /* 多次读取编码器，等待转子稳定 */
+    AS5047P_Sensor_Update(&AngleSensor);
+    if (foc_align_wait(10U, &overcurrent_ms) != HAL_OK) {
+        goto alignment_failed;
+    }
+    AS5047P_Sensor_Update(&AngleSensor);
+    if (foc_align_wait(10U, &overcurrent_ms) != HAL_OK) {
+        goto alignment_failed;
+    }
+    AS5047P_Sensor_Update(&AngleSensor);
+    if (foc_align_wait(100U, &overcurrent_ms) != HAL_OK) {
+        goto alignment_failed;
+    }
+
+    /* 通过平均多次读数计算零电角 */
+    float zero;
+    if (foc_calculate_zero(&zero) != HAL_OK) goto alignment_failed;
+    motor_control.zero_elec_angle = zero;
+
+    /* Remove the holding voltage smoothly after zero-angle sampling. */
+    if (foc_align_ramp(FOC_ALIGN_HOLD_VOLTAGE_V,
+                       0.0f,
+                       FOC_ALIGN_RAMP_DOWN_MS,
+                       &overcurrent_ms) != HAL_OK) {
+        goto alignment_failed;
+    }
+    foc_forward(0.0f, 0.0f, 0.0f);
+
+    /* ── 启动 DMA 流水线并重启 TIM2 编码器 ISR ── */
+    AS5047P_DMA_StartRequest();
+    __HAL_TIM_CLEAR_IT(&htim2, TIM_IT_UPDATE);
+    HAL_TIM_Base_Start_IT(&htim2);
+    encoder_timer_stopped = 0U;
+
+    /* 重置两个电流环 PID，使其从 0V 平滑启动 */
+    current_loop.integral_prev   = 0.0f;
+    current_loop.output_prev     = 0.0f;
+    current_loop.error_prev      = 0.0f;
+    current_loop.timestamp_prev_cycles  = dwt_get_cycles();
+
+    id_current_loop.integral_prev   = 0.0f;
+    id_current_loop.output_prev     = 0.0f;
+    id_current_loop.error_prev      = 0.0f;
+    id_current_loop.timestamp_prev_cycles  = dwt_get_cycles();
+
+    speed_loop.integral_prev   = 0.0f;
+    speed_loop.output_prev     = 0.0f;
+    speed_loop.error_prev      = 0.0f;
+    speed_loop.timestamp_prev_cycles  = dwt_get_cycles();
+
+    /* 重置滤波器状态，避免残余值干扰 */
+    motor_control.id_filter_state = 0.0f;
+    motor_control.iq_filter_state = 0.0f;
+
+    /* Alignment is complete. main() initializes all control state before it
+     * enables the current loop, so the ADC ISR cannot race startup writes. */
+    if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) goto alignment_failed;
+    alignment_in_progress = 0;
+    motor_electrical_calibrated = 1U;
+
+    (void)snprintf(log_buf, sizeof(log_buf),
+                   "[FOC] Zero elec angle = %.3f rad\r\n",
+                   motor_control.zero_elec_angle);
+    UART2_SendString(log_buf);
+    UART2_SendString("[FOC] Encoder Calibration Done!\r\n");
+    return HAL_OK;
+
+alignment_failed:
+    if (!motor_startup_cancelled) motor_fault_trip(MOTOR_FAULT_ALIGN_TIMEOUT);
+    if (encoder_timer_stopped != 0U) {
+        AS5047P_DMA_StartRequest();
+        __HAL_TIM_CLEAR_IT(&htim2, TIM_IT_UPDATE);
+        HAL_TIM_Base_Start_IT(&htim2);
+    }
+    alignment_in_progress = 0;
+    UART2_SendString("[FOC] Alignment aborted: fault or disarm\r\n");
+    return HAL_ERROR;
+}
+#endif /* APP_UART_ENABLE */
