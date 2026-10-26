@@ -52,6 +52,9 @@ void VOFA_ProcessCmd(void);
 void VOFA_NotifyRxError(void);
 void VOFA_CheckCommandTimeout(void);
 
+/* With the CAN supervisor active, UART accepts only SP/SI/SG/SPL/SPH/PP
+ * gain updates while the motor is disabled. Send "TUNE?" for readback. */
+
 #ifdef __cplusplus
 }
 #endif

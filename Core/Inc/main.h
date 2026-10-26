@@ -61,6 +61,8 @@ void App_CalibrationPoll(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define MT6835_CAL_EN_Pin GPIO_PIN_14
+#define MT6835_CAL_EN_GPIO_Port GPIOC
 #define SPI1_CS_Pin GPIO_PIN_4
 #define SPI1_CS_GPIO_Port GPIOA
 #define DRV_EN_Pin GPIO_PIN_10

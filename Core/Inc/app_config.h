@@ -2,9 +2,11 @@
 #define APP_CONFIG_H
 
 #include "motor_profile.h"
+#include "encoder_config.h"
 
-/* Electrical angle polarity relative to the raw encoder, not joint coordinates.
- * This bench motor: positive electrical Iq rotates toward decreasing raw angle.
+/* Electrical angle polarity relative to the normalized encoder, not joint coordinates.
+ * This bench motor: positive electrical Iq rotates toward decreasing common angle.
+ * MT6835 is reversed in encoder.h to match the original AS5047P convention.
  * Also used by the speed PI to preserve negative feedback. */
 #ifndef APP_MOTOR_ELECTRICAL_DIRECTION
 #define APP_MOTOR_ELECTRICAL_DIRECTION (-1)
@@ -40,7 +42,7 @@
 #endif
 
 #ifndef APP_FIRMWARE_VERSION
-#define APP_FIRMWARE_VERSION 0x00010406U
+#define APP_FIRMWARE_VERSION 0x00010411U
 #endif
 
 /* Bump on wiring, encoder installation or electrical-angle semantics changes. */
@@ -59,8 +61,8 @@
 #error "APP_AUTO_CALIBRATE must be 0 or 1"
 #endif
 
-/* Legacy UART-only timeout. Stage-two CAN always uses a 20 ms received-target
- * lease, independently of this setting; UART HB never renews CAN authority. */
+/* Legacy UART-only timeout. CAN uses MOTOR_TARGET_LEASE_MS from
+ * board_safety_profile.h; UART HB never renews CAN authority. */
 #ifndef APP_COMMAND_TIMEOUT_MS
 #define APP_COMMAND_TIMEOUT_MS 0U
 #endif

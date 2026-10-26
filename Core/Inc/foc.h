@@ -17,7 +17,7 @@ extern "C" {
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "utils.h"
-#include "as5047p_ext.h"
+#include "encoder.h"
 #include <stdbool.h>
 #include "current_protection.h"
 
@@ -70,9 +70,9 @@ extern "C" {
 /* The encoder averages about 1 ms. Keep this extra pole short enough for
  * braking during breakaway: 100 Hz at 1 kHz, alpha = 1-exp(-2*pi*100/1000). */
 #define SPEED_LPF_ALPHA    0.4665119f
-#define SPEED_GAIN_SCHEDULE_DEFAULT       1U
-#define SPEED_KP_LOW_SPEED_DEFAULT    0.040f
-#define SPEED_KP_HIGH_SPEED_DEFAULT   0.020f
+#define SPEED_GAIN_SCHEDULE_DEFAULT       0U
+#define SPEED_KP_LOW_SPEED_DEFAULT    0.025f
+#define SPEED_KP_HIGH_SPEED_DEFAULT   0.025f
 #define SPEED_KP_SWITCH_DOWN_RAD_S    8.0f
 #define SPEED_KP_SWITCH_UP_RAD_S      9.0f
 #define SPEED_GAIN_REGION_LOW_SPEED       0U
@@ -94,7 +94,7 @@ extern "C" {
 #define PWM_DUTY_MIN                   0.02f
 
 /* 编码器数据有效性 --------------------------------------------------------*/
-/* 陈旧阈值定义在 as5047p_ext.h (AS5047P_STALE_LIMIT_S)，由缓存模块自行判定 */
+/* 陈旧阈值定义在 as5047p_ext.h (ENCODER_STALE_LIMIT_S)，由缓存模块自行判定 */
 #define FOC_ENCODER_LOST_FRAMES        16U    /* 连续陈旧帧数阈值 → 约 1 ms @16kHz */
 #define FOC_ENCODER_DEGRADE_SCALE      0.3f   /* 陈旧期间电流限幅折减比例        */
 

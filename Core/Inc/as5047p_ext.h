@@ -31,10 +31,10 @@ typedef struct {
     int32_t  turn_count;      /* 整数圈计数器（无浮点漂移）                 */
     float    total_angle;     /* 多圈累积总角度 (rad)                       */
     float    velocity_rad_s;  /* 整数计数窗口速度 (rad/s)                   */
-    uint16_t prev_raw;        /* 上一次 14 位编码器原始值                    */
+    uint32_t prev_raw;        /* 上一次所选编码器原生计数                    */
     uint32_t prev_cycle;      /* 上一次有效更新的 DWT 周期计数               */
     uint32_t sample_cycle;    /* 当前角度帧实际开始采集时的 DWT 周期计数     */
-    int16_t  velocity_count_window[AS5047P_VELOCITY_WINDOW_SIZE];
+    int32_t  velocity_count_window[AS5047P_VELOCITY_WINDOW_SIZE];
     uint32_t velocity_cycle_window[AS5047P_VELOCITY_WINDOW_SIZE];
     int32_t  velocity_count_sum;
     uint32_t velocity_cycle_sum;

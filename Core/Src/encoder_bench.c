@@ -1,5 +1,5 @@
 #include "encoder_bench.h"
-#if APP_UART_ENABLE
+#if APP_UART_ENABLE && APP_ENCODER_TYPE == APP_ENCODER_AS5047P
 #include "as5047p.h"
 #include "as5047p_ext.h"
 #include "foc.h"

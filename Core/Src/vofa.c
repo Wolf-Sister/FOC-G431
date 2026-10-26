@@ -9,6 +9,7 @@
 #include "vofa.h"
 #include "foc.h"        /* UART2_SendString(), motor_control, motor_config    */
 #include "motor_supervisor.h"
+#include "motor_port.h"
 #include "usart.h"      /* huart2, hdma_usart2_rx                             */
 #include "pid.h"        /* foc_set_current_pid(), foc_set_id_current_pid()    */
 #include <stdio.h>
@@ -164,6 +165,33 @@ static void vofa_reject(void)
     UART2_SendString("[CMD] rejected: invalid frame/range/state\r\n");
 }
 
+static void vofa_report_tuning(const char *result)
+{
+    char line[UART_TX_CHUNK_MAX];
+    CAN_NodeStatus status = {0};
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    MotorSupervisor_ReadStatus(&status, HAL_GetTick());
+    float spd_p = motor_config.spd_p_gain;
+    float spd_i = motor_config.spd_i_gain;
+    float spd_p_low = motor_config.spd_p_low_speed;
+    float spd_p_high = motor_config.spd_p_high_speed;
+    float pos_p = motor_config.pos_p_gain;
+    uint8_t schedule = motor_config.spd_gain_schedule;
+    __set_PRIMASK(primask);
+
+    int length = snprintf(line, sizeof(line),
+                          "[TUNE] %s state=%u fault=0x%04X SP=%.5f SI=%.5f SG=%u SPL=%.5f SPH=%.5f PP=%.5f\r\n",
+                          result, (unsigned)status.state, (unsigned)status.faultBits,
+                          (double)spd_p, (double)spd_i, (unsigned)schedule,
+                          (double)spd_p_low, (double)spd_p_high, (double)pos_p);
+    if (length > 0 && (size_t)length < sizeof(line)) {
+        if (!UART_TX_Put(line, (uint16_t)length)) vofa_tx_dropped++;
+    } else {
+        vofa_tx_dropped++;
+    }
+}
+
 /* ========================================================================== */
 /*  RX: Text command parser                                                    */
 /* ========================================================================== */
@@ -211,6 +239,10 @@ static void vofa_parse_cmd(const char *line, uint16_t length)
         vofa_reject();
         return;
     }
+    if (strcmp(line, "TUNE?") == 0) {
+        vofa_report_tuning("status");
+        return;
+    }
     if (EncoderBench_Command(line)) return;
     const char *p = line;
     uint8_t iq_dirty = 0, id_dirty = 0, spd_dirty = 0, pos_dirty = 0;
@@ -218,6 +250,7 @@ static void vofa_parse_cmd(const char *line, uint16_t length)
     uint8_t position_cmd_dirty = 0, position_relative_dirty = 0, mode_dirty = 0;
     uint8_t spd_schedule_dirty = 0, spd_schedule_explicit = 0;
     uint8_t spd_manual_dirty = 0;
+    uint8_t tuning_dirty = 0U, other_command_dirty = 0U;
     uint8_t pos_accel_dirty = 0;
     uint8_t heartbeat = 0U, parsed_tokens = 0U;
     float set_torque = motor_control.set_torque;
@@ -263,6 +296,14 @@ static void vofa_parse_cmd(const char *line, uint16_t length)
         }
         p = end;
         parsed_tokens = 1U;
+
+        if (strcmp(key, "SP") == 0 || strcmp(key, "SI") == 0 ||
+            strcmp(key, "SG") == 0 || strcmp(key, "SPL") == 0 ||
+            strcmp(key, "SPH") == 0 || strcmp(key, "PP") == 0) {
+            tuning_dirty = 1U;
+        } else {
+            other_command_dirty = 1U;
+        }
 
         /* Stage every value locally; commit only after the full frame parses. */
         if      (strcmp(key, "T")  == 0) { set_torque = val; torque_dirty = 1; }
@@ -326,10 +367,46 @@ static void vofa_parse_cmd(const char *line, uint16_t length)
         vofa_reject(); return;
     }
 
+    /* The CAN supervisor keeps all movement commands under CAN authority.
+     * UART may change only speed/position gains, and only while fully disabled. */
+    if (MotorSupervisor_Active()) {
+        CAN_NodeStatus status = {0};
+        motor_health_t health = {0};
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        MotorSupervisor_ReadStatus(&status, HAL_GetTick());
+        MotorPort_ReadHealth(&health);
+        uint8_t tuning_safe = tuning_dirty && !other_command_dirty &&
+            MotorSupervisor_ResetReady() &&
+            (status.state == CAN_STATE_DISABLED || status.state == CAN_STATE_READY) &&
+            status.faultBits == 0U && motor_fault_reason == MOTOR_FAULT_NONE &&
+            !health.outputEnabled && !health.driverEnabled && !health.driverFault &&
+            !alignment_in_progress;
+        if (!tuning_safe) {
+            __set_PRIMASK(primask);
+            vofa_reject();
+            return;
+        }
+
+        if (spd_dirty) {
+            motor_config.spd_p_gain = spd_p;
+            motor_config.spd_i_gain = spd_i;
+        }
+        if (spd_schedule_dirty) {
+            motor_config.spd_p_low_speed = spd_p_low;
+            motor_config.spd_p_high_speed = spd_p_high;
+            motor_config.spd_gain_schedule = spd_schedule;
+        }
+        if (pos_dirty) motor_config.pos_p_gain = pos_p;
+        __set_PRIMASK(primask);
+        vofa_report_tuning("accepted");
+        return;
+    }
+
     encoder_cache_t encoder = {0};
     if (motor_ready && ((mode_dirty && new_mode != motor_control.mode && new_mode == MOTOR_POSITION) ||
                         position_relative_dirty)) {
-        if (!AS5047P_EncoderCache_Read(&encoder) || encoder.stale || !encoder.data_valid) {
+        if (!Encoder_Cache_Read(&encoder) || encoder.stale || !encoder.data_valid) {
             vofa_reject(); return;
         }
     }

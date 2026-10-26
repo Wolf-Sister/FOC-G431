@@ -3,7 +3,7 @@
 #include "main.h"
 #include <stdbool.h>
 
-#if APP_UART_ENABLE
+#if APP_UART_ENABLE && APP_ENCODER_TYPE == APP_ENCODER_AS5047P
 /* UART2 commands and SPI maintenance run in main context only. */
 bool EncoderBench_Command(const char *line);
 void EncoderBench_Poll(void);

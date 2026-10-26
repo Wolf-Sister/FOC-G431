@@ -12,7 +12,7 @@
 #include "tim.h"
 #include "usart.h"
 #include "uart_tx.h"
-#include "as5047p.h"
+#include "encoder.h"
 #include "pid.h"
 #include <math.h>
 #include "arm_math.h"
@@ -188,7 +188,7 @@ void foc_sync_phase_currents(void)
 void motor_control_parm_init(void)
 {
     encoder_cache_t encoder = {0};
-    (void)AS5047P_EncoderCache_Read(&encoder);
+    (void)Encoder_Cache_Read(&encoder);
 
     motor_control.iq_set     = 0.0f;
     motor_control.id_set     = 0.0f;
@@ -409,7 +409,7 @@ bool foc_stage2_begin_driver(void)
     if (EncoderBench_IsActive()) return false;
     if (motor_fault_reason != MOTOR_FAULT_NONE) return false;
     if (!motor_current.Calibrated) { motor_fault_trip(MOTOR_FAULT_CALIBRATION); return false; }
-    if (!AS5047P_DiagnosticsHealthy() || !AS5047P_EncoderCache_Read(&encoder) || encoder.stale) {
+    if (!Encoder_DiagnosticsHealthy() || !Encoder_Cache_Read(&encoder) || encoder.stale) {
         motor_fault_trip(MOTOR_FAULT_ENCODER); return false;
     }
     if (!ina219_bus_valid || !isfinite(ina219_vbus) || ina219_vbus < FOC_BUS_MIN_VALID_V ||
@@ -451,7 +451,7 @@ bool foc_stage2_apply_iq(float iq, float limit, bool first)
     }
     if (first) {
         encoder_cache_t encoder = {0};
-        if (!AS5047P_DiagnosticsHealthy() || !AS5047P_EncoderCache_Read(&encoder) || encoder.stale) {
+        if (!Encoder_DiagnosticsHealthy() || !Encoder_Cache_Read(&encoder) || encoder.stale) {
             motor_fault_trip(MOTOR_FAULT_ENCODER); return false;
         }
         current_loop.integral_prev = current_loop.output_prev = current_loop.error_prev = 0.0f;
@@ -515,7 +515,7 @@ void foc_process_current_sample(uint16_t raw_a, uint16_t raw_c)
     adc_last_cycle = dwt_get_cycles();
     adc_progress_armed = 1U;
     if (motor_fault_reason != MOTOR_FAULT_NONE) return;
-    if (motor_current.Calibrated && !AS5047P_DiagnosticsHealthy()) {
+    if (motor_current.Calibrated && !Encoder_DiagnosticsHealthy()) {
         motor_fault_trip(MOTOR_FAULT_ENCODER);
         return;
     }
@@ -756,7 +756,7 @@ void foc_current_loop(void)
     }
 
     encoder_cache_t encoder = {0};
-    (void)AS5047P_EncoderCache_Read(&encoder);
+    (void)Encoder_Cache_Read(&encoder);
 
     /* ── 0. 速度环降采样: 每 16 次 ADC ISR 运行一次 @ 1 kHz ── */
     {
@@ -773,7 +773,7 @@ void foc_current_loop(void)
     }
 
     /* ── 1. 按 DMA 实际采样时刻，将编码器角度预测到当前电流帧 ──
-     *     encoder.stale 由 AS5047P_EncoderCache_Read() 在读取时刻判定。
+     *     encoder.stale 由 Encoder_Cache_Read() 在读取时刻判定。
      *     两级策略:
      *       1 级 (瞬时陈旧)  : 停止外推，冻结在最后已知角度，并折减电流限幅
      *       2 级 (持续掉线)  : 锁存故障并关断功率级，需复位 MCU 恢复
@@ -1280,9 +1280,9 @@ bool foc_enable_driver(void)
     do {
         App_CalibrationPoll();
         if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled) return false;
-        if (AS5047P_Sensor_Update(&AngleSensor) &&
+        if (Encoder_Sensor_Update(&AngleSensor) &&
             (uint32_t)(dwt_get_cycles() - AngleSensor.sample_cycle) <
-            (uint32_t)((float)SystemCoreClock * AS5047P_STALE_LIMIT_S)) {
+            (uint32_t)((float)SystemCoreClock * ENCODER_STALE_LIMIT_S)) {
             sensor_ready = 1U;
             break;
         }
@@ -1295,7 +1295,7 @@ bool foc_enable_driver(void)
     uint32_t start, stable_since;
     __disable_irq();
     if (motor_fault_reason != MOTOR_FAULT_NONE || motor_startup_cancelled || !motor_current.Calibrated ||
-        !AS5047P_DiagnosticsHealthy()) {
+        !Encoder_DiagnosticsHealthy()) {
         __set_PRIMASK(primask);
         return false;
     }
@@ -1343,7 +1343,7 @@ bool foc_enable_control(void)
     __disable_irq();
     if (!EncoderBench_IsActive() && motor_fault_reason == MOTOR_FAULT_NONE && !motor_startup_cancelled && motor_current.Calibrated &&
         driver_monitor_enabled && !alignment_in_progress &&
-        AS5047P_DiagnosticsHealthy() && AS5047P_EncoderCache_Read(&encoder) &&
+        Encoder_DiagnosticsHealthy() && Encoder_Cache_Read(&encoder) &&
         encoder.data_valid && !encoder.stale) {
         current_loop_enable = 1U;
         motor_ready = 1U;
@@ -1372,10 +1372,10 @@ static HAL_StatusTypeDef foc_calculate_zero(float *zero)
             motor_fault_trip(MOTOR_FAULT_ALIGN_TIMEOUT);
             return HAL_TIMEOUT;
         }
-        if (AS5047P_Sensor_Update(&AngleSensor) &&
+        if (Encoder_Sensor_Update(&AngleSensor) &&
             (uint32_t)(dwt_get_cycles() - AngleSensor.sample_cycle) <
-            (uint32_t)((float)SystemCoreClock * AS5047P_STALE_LIMIT_S)) {
-            float angle = AS5047P_GetAngle(&AngleSensor);
+            (uint32_t)((float)SystemCoreClock * ENCODER_STALE_LIMIT_S)) {
+            float angle = Encoder_GetAngle(&AngleSensor);
             if (!isfinite(angle)) {
                 motor_fault_trip(MOTOR_FAULT_NONFINITE);
                 return HAL_ERROR;
@@ -1532,15 +1532,15 @@ HAL_StatusTypeDef foc_alignSensor(void)
     encoder_timer_stopped = 1U;
 
     /* 多次读取编码器，等待转子稳定 */
-    AS5047P_Sensor_Update(&AngleSensor);
+    Encoder_Sensor_Update(&AngleSensor);
     if (foc_align_wait(10U, &overcurrent_ms) != HAL_OK) {
         goto alignment_failed;
     }
-    AS5047P_Sensor_Update(&AngleSensor);
+    Encoder_Sensor_Update(&AngleSensor);
     if (foc_align_wait(10U, &overcurrent_ms) != HAL_OK) {
         goto alignment_failed;
     }
-    AS5047P_Sensor_Update(&AngleSensor);
+    Encoder_Sensor_Update(&AngleSensor);
     if (foc_align_wait(100U, &overcurrent_ms) != HAL_OK) {
         goto alignment_failed;
     }
@@ -1560,7 +1560,7 @@ HAL_StatusTypeDef foc_alignSensor(void)
     foc_forward(0.0f, 0.0f, 0.0f);
 
     /* ── 启动 DMA 流水线并重启 TIM2 编码器 ISR ── */
-    AS5047P_DMA_StartRequest();
+    Encoder_DMA_StartRequest();
     __HAL_TIM_CLEAR_IT(&htim2, TIM_IT_UPDATE);
     HAL_TIM_Base_Start_IT(&htim2);
     encoder_timer_stopped = 0U;
@@ -1601,7 +1601,7 @@ HAL_StatusTypeDef foc_alignSensor(void)
 alignment_failed:
     if (!motor_startup_cancelled) motor_fault_trip(MOTOR_FAULT_ALIGN_TIMEOUT);
     if (encoder_timer_stopped != 0U) {
-        AS5047P_DMA_StartRequest();
+        Encoder_DMA_StartRequest();
         __HAL_TIM_CLEAR_IT(&htim2, TIM_IT_UPDATE);
         HAL_TIM_Base_Start_IT(&htim2);
     }

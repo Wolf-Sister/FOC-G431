@@ -1,4 +1,5 @@
 #include "can.h"
+#include "encoder_autocal.h"
 #include "can_protocol.h"
 #include "fdcan.h"
 #include "foc.h"
@@ -100,6 +101,7 @@ static void CAN_ReadStatus(CAN_NodeStatus *status)
     __set_PRIMASK(primask);
     if (MotorSupervisor_Active()) MotorSupervisor_ReadStatus(status, HAL_GetTick());
     if (MotorSupervisor_Active()) status->capabilities |= CAN_CAP_SOFTWARE_RESET | CAN_CAP_ELECTRICAL_STORAGE;
+    if (EncoderAutoCal_Supported()) status->capabilities |= CAN_CAP_ENCODER_AUTOCAL;
     status->firmwareVersion = APP_FIRMWARE_VERSION;
     status->uid[0] = HAL_GetUIDw0();
     status->uid[1] = HAL_GetUIDw1();

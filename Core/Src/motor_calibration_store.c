@@ -142,7 +142,8 @@ uint8_t CalStore_Load(cal_store_t *s, const cal_io_t *io, const cal_binding_t *b
     if (!r[i].valid)
         return s->error = CAL_INVALIDATED;
     if (r[i].zero > CAL_ZERO_MAX || (b->direction != -1 && b->direction != 1) || !b->pairs ||
-        b->counts != 16384U || (b->angleMode != 1U && b->angleMode != 2U))
+        b->counts != 16384U || (b->angleMode != 1U && b->angleMode != 2U &&
+                              b->angleMode != 3U && b->angleMode != 4U))
         return s->error = CAL_INCOMPATIBLE;
     return s->error = CAL_OK;
 }

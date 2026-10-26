@@ -441,6 +441,21 @@
               <FilePath>../Core/Src/ina219_service.c</FilePath>
             </File>
             <File>
+              <FileName>encoder_autocal.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\encoder_autocal.c</FilePath>
+            </File>
+            <File>
+              <FileName>encoder_autocal_port.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\encoder_autocal_port.c</FilePath>
+            </File>
+            <File>
+              <FileName>mt6835.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\mt6835.c</FilePath>
+            </File>
+            <File>
               <FileName>as5047p.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\as5047p.c</FilePath>
@@ -540,6 +555,21 @@
               <FileName>uart_tx.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\uart_tx.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_calibration_port.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\motor_calibration_port.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_calibration.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\motor_calibration.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_calibration_store.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\motor_calibration_store.c</FilePath>
             </File>
             <File>
               <FileName>main.c</FileName>
@@ -1059,21 +1089,6 @@
               <FileName>stm32g4xx_hal_msp.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32g4xx_hal_msp.c</FilePath>
-            </File>
-            <File>
-              <FileName>motor_calibration_port.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\motor_calibration_port.c</FilePath>
-            </File>
-            <File>
-              <FileName>motor_calibration.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\motor_calibration.c</FilePath>
-            </File>
-            <File>
-              <FileName>motor_calibration_store.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\motor_calibration_store.c</FilePath>
             </File>
           </Files>
         </Group>

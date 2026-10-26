@@ -1,6 +1,6 @@
 #include "motor_port.h"
 #include "foc.h"
-#include "as5047p.h"
+#include "encoder.h"
 #include "ina219.h"
 #include "pid.h"
 #include "arm_math.h"
@@ -40,10 +40,10 @@ bool MotorPort_RestoreElectrical(float zero) { return foc_restore_electrical(zer
 void MotorPort_ReadHealth(motor_health_t *health)
 {
     encoder_cache_t encoder = {0};
-    bool valid = AS5047P_EncoderCache_Read(&encoder);
+    bool valid = Encoder_Cache_Read(&encoder);
     health->currentCalibrated = motor_current.Calibrated;
     health->electricalCalibrated = motor_electrical_calibrated;
-    health->encoderValid = valid && !encoder.stale && AS5047P_DiagnosticsHealthy() && !EncoderBench_IsActive();
+    health->encoderValid = valid && !encoder.stale && Encoder_DiagnosticsHealthy() && !EncoderBench_IsActive();
     health->busValid = ina219_bus_valid && isfinite(ina219_vbus) &&
                        ina219_vbus >= FOC_BUS_MIN_VALID_V && ina219_vbus <= FOC_BUS_MAX_VALID_V &&
                        (uint32_t)(HAL_GetTick() - ina219_bus_sample_ms) < FOC_BUS_MAX_AGE_MS;
@@ -157,7 +157,7 @@ static uint8_t position_ready_detail(int32_t target, const motor_motion_config_t
 {
     encoder_cache_t e = {0};
     int64_t counts = 0;
-    if (!AS5047P_EncoderCache_Read(&e)) return APPLY_ENCODER_READ;
+    if (!Encoder_Cache_Read(&e)) return APPLY_ENCODER_READ;
     if (snapshot != NULL) snapshot->rawSpeed = e.velocity_rad_s;
     if (e.stale) return APPLY_ENCODER_STALE;
     if (!isfinite(e.velocity_rad_s)) return APPLY_SPEED_NONFINITE;
@@ -238,7 +238,7 @@ bool MotorPort_RunOuterLoop(void)
     if (++motionDivider < MOTOR_OUTER_LOOP_DECIMATION) return true;
     motionDivider = 0U;
     encoder_cache_t e = {0};
-    bool valid = AS5047P_EncoderCache_Read(&e) && !e.stale;
+    bool valid = Encoder_Cache_Read(&e) && !e.stale;
     int64_t counts = 0;
     float velocity = e.velocity_rad_s;
     bool positionValid = valid && motion_position(&e, motionRole, &motionAxis, &counts);
@@ -304,7 +304,7 @@ float MotorPort_GetElectricalZero(void) { return motor_control.zero_elec_angle; 
 void MotorPort_CaptureSample(motor_snapshot_t *sample, uint32_t now)
 {
     encoder_cache_t encoder = {0};
-    bool valid = AS5047P_EncoderCache_Read(&encoder);
+    bool valid = Encoder_Cache_Read(&encoder);
     sample->capturedMs = now;
     sample->encoderSequence = encoder.update_count;
     sample->rawAngle = encoder.raw_angle;
@@ -314,7 +314,7 @@ void MotorPort_CaptureSample(motor_snapshot_t *sample, uint32_t now)
     sample->velocity = encoder.velocity_rad_s;
     sample->outputEnabled = current_loop_enable;
     sample->electricalValid = motor_electrical_calibrated;
-    sample->valid = valid && !encoder.stale && AS5047P_DiagnosticsHealthy() && motor_current.Calibrated &&
+    sample->valid = valid && !encoder.stale && Encoder_DiagnosticsHealthy() && motor_current.Calibrated &&
                     motor_fault_reason == MOTOR_FAULT_NONE;
     update_position_window(&encoder, sample->valid, now);
     sample->maxPhaseCurrent = fmaxf(fabsf(motor_current.I_A),

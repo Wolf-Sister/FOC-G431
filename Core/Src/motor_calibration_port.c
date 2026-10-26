@@ -1,6 +1,6 @@
 #include "adc.h"
 #include "app_config.h"
-#include "as5047p.h"
+#include "encoder.h"
 #include "can.h"
 #include "fdcan.h"
 #include "foc.h"
@@ -184,14 +184,14 @@ bool MotorCalibrationPort_Init(cal_binding_t *b)
     b->pairs = (uint16_t)pairs;
     b->counts = 16384U;
     b->direction = (int8_t)direction;
-    b->angleMode = APP_ENCODER_RAW_ANGLE ? 1U : 2U;
+    b->angleMode = ENCODER_CAL_ANGLE_MODE;
     b->algorithm = 1U;
     return pairs > 0 && pairs <= 65535 && (direction == 1 || direction == -1);
 }
 bool MotorCalibrationPort_Quiesce(void)
 {
     uint32_t key = MotorPort_Lock();
-    if (!MotorCalibration_CanWrite() || !INA219_ServiceStorageReady() || AS5047P_DMA_IsBusy())
+    if (!MotorCalibration_CanWrite() || !INA219_ServiceStorageReady() || Encoder_DMA_IsBusy())
     {
         MotorPort_Unlock(key);
         return false;
@@ -223,7 +223,7 @@ bool MotorCalibrationPort_Resume(void)
     uint32_t key = MotorPort_Lock();
     bool ok = !calResumeFailed;
     Motor_HardwareDisable();
-    AS5047P_Sensor_Resync(&AngleSensor);
+    Encoder_Sensor_Resync(&AngleSensor);
     __HAL_TIM_CLEAR_IT(&htim1, TIM_IT_UPDATE);
     __HAL_TIM_CLEAR_IT(&htim2, TIM_IT_UPDATE);
     __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_JEOC | ADC_FLAG_JEOS | ADC_FLAG_OVR);

@@ -1,4 +1,5 @@
 #include "motor_supervisor.h"
+#include "encoder_autocal.h"
 #include "motor_port.h"
 #include "motor_alignment.h"
 #include "board_safety_profile.h"
@@ -60,10 +61,10 @@ static uint32_t sampleSequence;
 bool MotorSupervisor_Active(void) { return supervisorInitialized != 0U; }
 bool MotorSupervisor_ResetReady(void)
 {
-    return supervisorInitialized && !MotorCalibration_Busy() && !pendingStop && !runtime.armPending &&
+    return supervisorInitialized && !EncoderAutoCal_BlocksReset() && !MotorCalibration_Busy() && !pendingStop && !runtime.armPending &&
            !runtime.calibrating && !runtime.driverWaiting && !runtime.autoPending;
 }
-bool MotorSupervisor_PermitsOutput(void) { return supervisorInitialized && !MotorCalibration_Busy() && !pendingStop && !faultBits && !EncoderBench_IsActive(); }
+bool MotorSupervisor_PermitsOutput(void) { return supervisorInitialized && !EncoderAutoCal_OutputBlocked() && !MotorCalibration_Busy() && !pendingStop && !faultBits && !EncoderBench_IsActive(); }
 void MotorSupervisor_ReadFault(uint8_t *state, uint8_t *mode, uint16_t *seq, uint16_t *detail)
 {
     uint32_t key = MotorPort_Lock();
@@ -438,6 +439,10 @@ static uint8_t get_param(uint16_t index, uint32_t *value)
     case 0x0230: *value = MotorCalibration_Status(); break;
     case 0x0231: *value = MotorCalibration_Sequence(); break;
     case 0x0232: *value = MotorCalibration_Error(); break;
+    case 0x0240: case 0x0241: case 0x0242: case 0x0243: case 0x0244:
+    case 0x0245: case 0x0246:
+        if (!EncoderAutoCal_Read(index,value)) return CAN_RESULT_BAD_INDEX;
+        break;
     default: return CAN_RESULT_BAD_INDEX;
     }
     return CAN_RESULT_OK;
@@ -512,6 +517,19 @@ void MotorSupervisor_Request(const uint8_t request[8], uint32_t receivedEpoch, u
     if (request[0] == CAN_OP_GET_PARAM) {
         result = argument ? CAN_RESULT_BAD_VALUE : get_param(index, &value); goto done;
     }
+    if (request[0] == CAN_OP_ENCODER_AUTOCAL) {
+        if (!EncoderAutoCal_Supported()) { result=CAN_RESULT_UNSUPPORTED; goto done; }
+        if (!runtime.sessionValid || !argument || argument!=runtime.token) { result=CAN_RESULT_BAD_SESSION; goto done; }
+        if ((uint32_t)(now-receivedMs)>=MOTOR_TARGET_LEASE_MS) { result=CAN_RESULT_STALE; goto done; }
+        if (faultBits || MotorCalibration_Busy() || EncoderBench_IsActive() || runtime.role!=MOTOR_ROLE_WHEEL) {
+            result=CAN_RESULT_BAD_STATE; goto done;
+        }
+        if (index==ENCODER_AUTOCAL_PREPARE) result=EncoderAutoCal_Prepare(now);
+        else if (index==ENCODER_AUTOCAL_START) result=EncoderAutoCal_Start(now);
+        else result=CAN_RESULT_BAD_VALUE;
+        goto done;
+    }
+    if (EncoderAutoCal_BlocksActions()) { result=CAN_RESULT_BUSY; goto done; }
     if (MotorCalibration_Busy()) { result = CAN_RESULT_BUSY; goto done; }
     if (request[0] == CAN_OP_SAVE_CONFIG) {
         if (!runtime.sessionValid || !argument || argument != runtime.token) { result = CAN_RESULT_BAD_SESSION; goto done; }

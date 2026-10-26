@@ -29,7 +29,7 @@ typedef struct
     uint32_t revision, uid[3];
     uint16_t profile, profileRevision, pairs, counts, algorithm;
     int8_t direction;
-    uint8_t angleMode;
+    uint8_t angleMode; /* 1/2: AS5047P; 3: old MT6835; 4: reversed MT6835. */
 } cal_binding_t;
 typedef struct
 {

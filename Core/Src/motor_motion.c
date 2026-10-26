@@ -55,11 +55,22 @@ bool MotorMotion_Step(motor_motion_t *s, int64_t counts, float velocity, float k
         if (!isfinite(kp)) { s->failure = MOTION_FAILURE_NONFINITE; return false; }
         if (kp <= 0.0f) { s->failure = MOTION_FAILURE_CONFIG; return false; }
         float error = (float)(s->targetCounts - counts) * (float)MOTION_RAD_PER_COUNT + s->targetRemainder;
-        float ceiling = fminf((float)s->config.positionSpeed * 0.001f, sqrtf(2.0f * accel * fabsf(error)));
+        /* Reserve the distance travelled toward the target before the next
+         * outer-loop update. Moving away must not consume braking distance. */
+        float closingSpeed = error > 0.0f ? fmaxf(velocity, 0.0f) :
+                             error < 0.0f ? fmaxf(-velocity, 0.0f) : 0.0f;
+        float remaining = fmaxf(0.0f, fabsf(error) - closingSpeed * MOTOR_MOTION_LOOP_DT_S);
+        float ceiling = fminf((float)s->config.positionSpeed * 0.001f, sqrtf(2.0f * accel * remaining));
         desired = fmaxf(-ceiling, fminf(ceiling, error * kp));
     }
     float delta = accel * MOTOR_MOTION_LOOP_DT_S;
     s->speed += fmaxf(-delta, fminf(delta, desired - s->speed));
+    if (s->mode == 2U) {
+        /* A shrinking position envelope overrides the reference slew limit:
+         * retaining the old reference here delays braking after a disturbance.
+         * Drop an obsolete direction at target crossing, then ramp the return. */
+        s->speed = fmaxf(fminf(desired, 0.0f), fminf(fmaxf(desired, 0.0f), s->speed));
+    }
     *speed = s->speed;
     if (!isfinite(*speed)) { s->failure = MOTION_FAILURE_NONFINITE; return false; }
     return true;

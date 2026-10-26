@@ -12,12 +12,12 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "as5047p_ext.h"
-#include "as5047p.h"
+#include "encoder.h"
 #include "utils.h"
 #include "encoder_bench.h"
 
-/* 转换常数: AS5047P 14 位 (0–16383) → 0–2π 弧度 -----------*/
-#define AS5047P_RAD_SCALE     (_2PI / AS5047P_ANGLE_STEPS)
+/* Shared estimator uses the selected encoder native count resolution. */
+#define AS5047P_RAD_SCALE     (_2PI / (float)ENCODER_NATIVE_COUNTS)
 #define AS5047P_MAX_SAMPLE_DT 0.1f
 
 /* 全局传感器实例 ----------------------------------------------------*/
@@ -37,7 +37,7 @@ static void AS5047P_VelocityWindow_Reset(AS5047P_Sensor_T *s)
 }
 
 static void AS5047P_VelocityWindow_Update(AS5047P_Sensor_T *s,
-                                          int16_t delta_count,
+                                          int32_t delta_count,
                                           uint32_t delta_cycles)
 {
     uint8_t index = s->velocity_window_index;
@@ -113,13 +113,13 @@ void AS5047P_Sensor_Resync(AS5047P_Sensor_T *s)
 bool AS5047P_Sensor_Update(AS5047P_Sensor_T *s)
 {
     uint32_t angle_sample_cycle = 0U;
-    uint16_t raw = AS5047P_DMA_GetAngleCallback(&angle_sample_cycle);
-    if (raw == 0xFFFFU) {
-        if (!AS5047P_DMA_ExpectedGap()) {
+    uint32_t raw = Encoder_DMA_Read(&angle_sample_cycle);
+    if (raw == UINT32_MAX) {
+        if (!Encoder_DMA_ExpectedGap()) {
             s->total_errors++;
             s->consecutive_errors++;
         }
-        (void)AS5047P_DMA_StartRequest();
+        (void)Encoder_DMA_StartRequest();
         return false;
     }
 
@@ -137,18 +137,18 @@ bool AS5047P_Sensor_Update(AS5047P_Sensor_T *s)
         s->initialized        = 1U;
         s->resync_pending     = 0U;
         s->consecutive_errors = 0;
-        (void)AS5047P_DMA_StartRequest();
+        (void)Encoder_DMA_StartRequest();
         return true;
     }
 
     int32_t delta_count = (int32_t)raw - (int32_t)s->prev_raw;
 
-    if (delta_count > 8192) {
-        delta_count -= 16384;
+    if (delta_count > (int32_t)(ENCODER_NATIVE_COUNTS / 2U)) {
+        delta_count -= (int32_t)ENCODER_NATIVE_COUNTS;
         s->turn_count--;
     }
-    else if (delta_count < -8192) {
-        delta_count += 16384;
+    else if (delta_count < -(int32_t)(ENCODER_NATIVE_COUNTS / 2U)) {
+        delta_count += (int32_t)ENCODER_NATIVE_COUNTS;
         s->turn_count++;
     }
 
@@ -157,7 +157,7 @@ bool AS5047P_Sensor_Update(AS5047P_Sensor_T *s)
     uint32_t delta_cycles = now_cycle - s->prev_cycle;
     float dt = dwt_cycles_to_seconds(delta_cycles);
     if (!s->resync_pending && dt > 0.0f && dt < AS5047P_MAX_SAMPLE_DT) {
-        AS5047P_VelocityWindow_Update(s, (int16_t)delta_count, delta_cycles);
+        AS5047P_VelocityWindow_Update(s, delta_count, delta_cycles);
     } else {
         AS5047P_VelocityWindow_Reset(s);
     }
@@ -169,9 +169,9 @@ bool AS5047P_Sensor_Update(AS5047P_Sensor_T *s)
     s->sample_cycle       = now_cycle;
     s->consecutive_errors = 0;
 
-    EncoderBench_OnSample(raw, now_cycle, s->velocity_rad_s, s->velocity_window_count);
+    EncoderBench_OnSample((uint16_t)(raw >> ENCODER_NATIVE_TO_WIRE_SHIFT), now_cycle, s->velocity_rad_s, s->velocity_window_count);
 
-    (void)AS5047P_DMA_StartRequest();
+    (void)Encoder_DMA_StartRequest();
     return true;
 }
 
@@ -181,7 +181,13 @@ void AS5047P_EncoderCache_Publish(const AS5047P_Sensor_T *s)
     uint8_t next = current ^ 1U;
     uint32_t next_count = encoder_cache_buffers[current].update_count + 1U;
 
+    /* raw_angle is the unchanged CAN/joint/alignment raw14 representation.
+     * angle_raw and velocity retain native encoder resolution. */
+#if APP_ENCODER_TYPE == APP_ENCODER_MT6835
+    encoder_cache_buffers[next].raw_angle = (uint16_t)(s->prev_raw >> 7);
+#else
     encoder_cache_buffers[next].raw_angle = (uint16_t)(s->prev_angle * (16384.0f / _2PI) + 0.5f) & 0x3FFFU;
+#endif
     encoder_cache_buffers[next].turn_count = s->turn_count;
     encoder_cache_buffers[next].angle_raw       = s->prev_angle;
     encoder_cache_buffers[next].velocity_rad_s  = s->velocity_rad_s;
@@ -269,7 +275,7 @@ float AS5047P_GetAccumulateAngle(const AS5047P_Sensor_T *s)
   */
 float AS5047P_GetOnceAngle(const AS5047P_Sensor_T *s)
 {
-    uint16_t raw = AS5047P_DMA_GetAngleCallback(NULL);
-    if (raw == 0xFFFFU) return s->prev_angle;
+    uint32_t raw = Encoder_DMA_Read(NULL);
+    if (raw == UINT32_MAX) return s->prev_angle;
     return (float)raw * AS5047P_RAD_SCALE;
 }

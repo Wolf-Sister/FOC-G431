@@ -23,8 +23,8 @@
 #if APP_UART_ENABLE
 #include <stdio.h>
 #endif
-#include "as5047p.h"
-#include "as5047p_ext.h"
+#include "encoder.h"
+#include "encoder_autocal.h"
 #include "encoder_bench.h"
 #include "foc.h"
 #include "pid.h"
@@ -86,8 +86,18 @@ void App_CalibrationPoll(void)
 
 static void App_ReportEncoderDiagnostics(void)
 {
-  as5047p_diagnostics_t snapshot;
   char log[128];
+#if APP_ENCODER_TYPE == APP_ENCODER_MT6835
+  mt6835_diagnostics_t snapshot;
+  MT6835_GetDiagnostics(&snapshot);
+  (void)snprintf(log, sizeof(log),
+                 "[ENC] MT6835 cause=%s raw=%lu status=%u crc=%02X/%02X spi=%u tries=%u\r\n",
+                 MT6835_DiagnosticStatusName(snapshot.cause), (unsigned long)snapshot.angle,
+                 (unsigned)snapshot.status, (unsigned)snapshot.crc_received,
+                 (unsigned)snapshot.crc_expected, (unsigned)snapshot.spi_status,
+                 (unsigned)snapshot.attempts);
+#else
+  as5047p_diagnostics_t snapshot;
   AS5047P_GetDiagnostics(&snapshot);
   (void)snprintf(log, sizeof(log),
                  "[ENC] cause=%s dia=%04X mag=%04X spi=%u/%u err=%04X/%u tries=%u\r\n",
@@ -95,6 +105,7 @@ static void App_ReportEncoderDiagnostics(void)
                  (unsigned)snapshot.diaagc_raw, (unsigned)snapshot.magnitude_raw,
                  (unsigned)snapshot.diagnostic_spi_status, (unsigned)snapshot.magnitude_spi_status,
                  (unsigned)snapshot.error_raw, (unsigned)snapshot.error_valid, (unsigned)snapshot.attempts);
+#endif
   UART2_SendString(log);
 }
 #endif
@@ -109,6 +120,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+  const uint8_t coldPowerBoot = __HAL_RCC_GET_FLAG(RCC_FLAG_BORRST) != RESET;
   const uint8_t softwareResetBoot = __HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST) != RESET;
   __HAL_RCC_CLEAR_RESET_FLAGS();
   /* USER CODE END 1 */
@@ -155,6 +167,7 @@ int main(void)
   UART2_SendString("========================================\r\n");
 
   DWT_Init();
+  EncoderAutoCal_Init(coldPowerBoot != 0U);
   control_pid_init();
   motor_control_parm_init();
   MotorCalibration_Init();
@@ -167,9 +180,9 @@ int main(void)
   INA219_ServiceInit();
 
   /* 2. Init encoder sensor state */
-  AS5047P_Sensor_Init(&AngleSensor);
-  AS5047P_Init();
-  if (!AS5047P_CheckDiagnostics()) {
+  Encoder_Sensor_Init(&AngleSensor);
+  Encoder_Init();
+  if (!Encoder_CheckDiagnostics()) {
     motor_fault_trip(MOTOR_FAULT_ENCODER);
   } else {
 #if APP_UART_ENABLE
@@ -180,7 +193,7 @@ int main(void)
   if (motor_fault_reason == MOTOR_FAULT_NONE) {
     /* 4. Kick off first DMA encoder read (pipelined: each Update reads previous result).
      *    TIM2 encoder ISR sampling frequency is configured independently of TIM1. */
-    (void)AS5047P_DMA_StartRequest();
+    (void)Encoder_DMA_StartRequest();
 
     /* 4. Keep the gate driver disabled while calibrating current offsets. */
     HAL_GPIO_WritePin(DRV_EN_GPIO_Port, DRV_EN_Pin, GPIO_PIN_RESET);
@@ -253,6 +266,7 @@ int main(void)
     CAN_Poll();
 
     MotorCalibration_Poll();
+    EncoderAutoCal_Poll(HAL_GetTick());
 
     /* Process incoming VOFA+ commands (PC → MCU) */
 #if APP_UART_ENABLE
@@ -413,9 +427,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   {
     /* ── Encoder TIM2 update ── */
     /* ① SPI read raw angle → parity check → angle unwrap → velocity */
-    if (AS5047P_Sensor_Update(&AngleSensor))
+    if (Encoder_Sensor_Update(&AngleSensor))
     {
-      AS5047P_EncoderCache_Publish(&AngleSensor);
+      Encoder_Cache_Publish(&AngleSensor);
     }
   }
   else if (htim->Instance == TIM3)

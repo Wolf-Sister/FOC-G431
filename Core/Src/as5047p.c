@@ -12,6 +12,8 @@
 #include "encoder_bench.h"
 #include "cmsis_compiler.h"               /* __get_BASEPRI / __set_BASEPRI 临界区保护 */
 
+#if APP_ENCODER_TYPE == APP_ENCODER_AS5047P
+
 /* 外部 SPI 句柄 -------------------------------------------------------*/
 extern SPI_HandleTypeDef hspi1;
 
@@ -543,3 +545,5 @@ uint8_t AS5047P_ReadErrorFlags(void)
   if (rx == 0xFFFFU) return 0xFFU;
   return (uint8_t)(rx & 0xFFU);
 }
+
+#endif /* AS5047P */

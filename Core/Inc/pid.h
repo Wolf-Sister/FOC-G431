@@ -20,8 +20,8 @@ extern "C" {
 #define IQ_CURRENT_KI_DEFAULT   371.2500f
 #define ID_CURRENT_KP_DEFAULT     10.4850f
 #define ID_CURRENT_KI_DEFAULT   371.2500f
-#define SPEED_KP_DEFAULT          0.0900f
-#define SPEED_KI_DEFAULT          0.1000f
+#define SPEED_KP_DEFAULT          0.0250f
+#define SPEED_KI_DEFAULT          0.0500f
 #define POSITION_KP_DEFAULT      10.0000f
 #define CURRENT_VECTOR_AW_GAIN_DEFAULT  2000.0f
 
