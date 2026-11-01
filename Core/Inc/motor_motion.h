@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #define MOTOR_MOTION_LOOP_DT_S 0.002f /* 500 Hz outer-loop interval */
 typedef struct {
+    /* acceleration: speed-mode slew / position-mode braking, 0.001 rad/s^2. */
     uint32_t speedLimit, positionSpeed, acceleration; /* 0.001 SI units */
     int32_t positionMin, positionMax; /* 0.0001 rad, current-boot raw axis */
 } motor_motion_config_t;

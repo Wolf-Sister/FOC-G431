@@ -17,7 +17,7 @@ extern "C" {
 #include <stdint.h>
 
 /* Defines -------------------------------------------------------------------*/
-#define VOFA_MAX_CHANNELS   14u
+#define VOFA_MAX_CHANNELS   17u
 #define VOFA_TX_BUF_SIZE    384u
 #define VOFA_RX_BUF_SIZE    256u
 extern volatile uint32_t vofa_rejected_frames;
@@ -52,7 +52,7 @@ void VOFA_ProcessCmd(void);
 void VOFA_NotifyRxError(void);
 void VOFA_CheckCommandTimeout(void);
 
-/* With the CAN supervisor active, UART accepts only SP/SI/SG/SPL/SPH/PP
+/* With the CAN supervisor active, UART accepts only SP/SI/SG/SPL/SPH/PP/PSP/PSI
  * gain updates while the motor is disabled. Send "TUNE?" for readback. */
 
 #ifdef __cplusplus

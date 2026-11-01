@@ -75,6 +75,8 @@ motor_config_t motor_config = {
     .id_i_gain              = ID_CURRENT_KI_DEFAULT,
     .spd_p_gain             = SPEED_KP_DEFAULT,
     .spd_i_gain             = SPEED_KI_DEFAULT,
+    .pos_spd_p_gain         = POSITION_SPEED_KP_DEFAULT,
+    .pos_spd_i_gain         = POSITION_SPEED_KI_DEFAULT,
     .spd_p_low_speed       = SPEED_KP_LOW_SPEED_DEFAULT,
     .spd_p_high_speed      = SPEED_KP_HIGH_SPEED_DEFAULT,
     .spd_gain_schedule     = SPEED_GAIN_SCHEDULE_DEFAULT,
@@ -644,6 +646,9 @@ static void foc_cordic_sin_cos_current(float angle_el, float *s, float *c)
 
 static float foc_select_speed_kp(float speed_ref)
 {
+    if (motor_control.mode == MOTOR_POSITION) {
+        return motor_config.pos_spd_p_gain;
+    }
     if (motor_config.spd_gain_schedule == 0U) {
         return motor_config.spd_p_gain;
     }
@@ -702,7 +707,8 @@ static void foc_speed_loop(const encoder_cache_t *encoder)
         motor_control.vel_raw          = 0.0f;
         motor_control.vel_meas         = 0.0f;
         speed_loop.P = foc_initial_speed_kp(motor_control.set_speed);
-        speed_loop.I = motor_config.spd_i_gain;
+        speed_loop.I = motor_control.mode == MOTOR_POSITION
+                     ? motor_config.pos_spd_i_gain : motor_config.spd_i_gain;
         motor_control.spd_kp_active = speed_loop.P;
         speed_pid_reset();
         motor_control.spd_needs_init   = 0;
@@ -724,7 +730,8 @@ static void foc_speed_loop(const encoder_cache_t *encoder)
     float error = (float)motor_config.dir * (motor_control.set_speed - vel_filt);
     float scheduled_kp = foc_select_speed_kp(motor_control.set_speed);
     foc_set_speed_kp_bumpless(scheduled_kp, error);
-    speed_loop.I = motor_config.spd_i_gain;
+    speed_loop.I = motor_control.mode == MOTOR_POSITION
+                 ? motor_config.pos_spd_i_gain : motor_config.spd_i_gain;
 
     float iq_ref = PIDController_Update(&speed_loop, error);
 

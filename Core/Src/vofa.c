@@ -177,14 +177,17 @@ static void vofa_report_tuning(const char *result)
     float spd_p_low = motor_config.spd_p_low_speed;
     float spd_p_high = motor_config.spd_p_high_speed;
     float pos_p = motor_config.pos_p_gain;
+    float pos_spd_p = motor_config.pos_spd_p_gain;
+    float pos_spd_i = motor_config.pos_spd_i_gain;
     uint8_t schedule = motor_config.spd_gain_schedule;
     __set_PRIMASK(primask);
 
     int length = snprintf(line, sizeof(line),
-                          "[TUNE] %s state=%u fault=0x%04X SP=%.5f SI=%.5f SG=%u SPL=%.5f SPH=%.5f PP=%.5f\r\n",
+                          "[TUNE] %s state=%u fault=0x%04X SP=%.5f SI=%.5f SG=%u SPL=%.5f SPH=%.5f PP=%.5f PSP=%.5f PSI=%.5f\r\n",
                           result, (unsigned)status.state, (unsigned)status.faultBits,
                           (double)spd_p, (double)spd_i, (unsigned)schedule,
-                          (double)spd_p_low, (double)spd_p_high, (double)pos_p);
+                          (double)spd_p_low, (double)spd_p_high, (double)pos_p,
+                          (double)pos_spd_p, (double)pos_spd_i);
     if (length > 0 && (size_t)length < sizeof(line)) {
         if (!UART_TX_Put(line, (uint16_t)length)) vofa_tx_dropped++;
     } else {
@@ -215,6 +218,8 @@ static void vofa_report_tuning(const char *result)
   *   PS=V     设置位置目标值 (多圈弧度 rad)
   *   PR=V     set a relative position step from the measured position (rad)
   *   PP=V     设置位置环 P 增益 (rad/s per rad)
+  *   PSP=V    position-mode inner speed P gain
+  *   PSI=V    position-mode inner speed I gain
   *   PL=V     设置位置环速度限幅 (rad/s，旧版别名)
   *   CVL=V    设置电流环 dq 电压矢量限幅 (V)
   *   SIL=V    设置速度环 Iq 电流限幅 (A)
@@ -250,6 +255,7 @@ static void vofa_parse_cmd(const char *line, uint16_t length)
     uint8_t position_cmd_dirty = 0, position_relative_dirty = 0, mode_dirty = 0;
     uint8_t spd_schedule_dirty = 0, spd_schedule_explicit = 0;
     uint8_t spd_manual_dirty = 0;
+    uint8_t pos_spd_dirty = 0U;
     uint8_t tuning_dirty = 0U, other_command_dirty = 0U;
     uint8_t pos_accel_dirty = 0;
     uint8_t heartbeat = 0U, parsed_tokens = 0U;
@@ -266,6 +272,8 @@ static void vofa_parse_cmd(const char *line, uint16_t length)
     float spd_p = motor_config.spd_p_gain;
     float spd_i = motor_config.spd_i_gain;
     float pos_p = motor_config.pos_p_gain;
+    float pos_spd_p = motor_config.pos_spd_p_gain;
+    float pos_spd_i = motor_config.pos_spd_i_gain;
     float spd_p_low = motor_config.spd_p_low_speed;
     float spd_p_high = motor_config.spd_p_high_speed;
     uint8_t spd_schedule = motor_config.spd_gain_schedule;
@@ -299,7 +307,8 @@ static void vofa_parse_cmd(const char *line, uint16_t length)
 
         if (strcmp(key, "SP") == 0 || strcmp(key, "SI") == 0 ||
             strcmp(key, "SG") == 0 || strcmp(key, "SPL") == 0 ||
-            strcmp(key, "SPH") == 0 || strcmp(key, "PP") == 0) {
+            strcmp(key, "SPH") == 0 || strcmp(key, "PP") == 0 ||
+            strcmp(key, "PSP") == 0 || strcmp(key, "PSI") == 0) {
             tuning_dirty = 1U;
         } else {
             other_command_dirty = 1U;
@@ -315,6 +324,8 @@ static void vofa_parse_cmd(const char *line, uint16_t length)
         else if (strcmp(key, "S")  == 0) { set_speed = val; speed_cmd_dirty = 1; }
         else if (strcmp(key, "SP") == 0) { spd_p = val; spd_dirty = 1; spd_manual_dirty = 1; }
         else if (strcmp(key, "SI") == 0) { spd_i = val; spd_dirty = 1; }
+        else if (strcmp(key, "PSP") == 0) { pos_spd_p = val; pos_spd_dirty = 1U; }
+        else if (strcmp(key, "PSI") == 0) { pos_spd_i = val; pos_spd_dirty = 1U; }
         else if (strcmp(key, "SPL") == 0) { spd_p_low = val; spd_schedule_dirty = 1; }
         else if (strcmp(key, "SPH") == 0) { spd_p_high = val; spd_schedule_dirty = 1; }
         else if (strcmp(key, "SG") == 0) {
@@ -354,6 +365,7 @@ static void vofa_parse_cmd(const char *line, uint16_t length)
     if (iq_p < 0.0f || iq_p > 100.0f || id_p < 0.0f || id_p > 100.0f ||
         iq_i < 0.0f || iq_i > 10000.0f || id_i < 0.0f || id_i > 10000.0f ||
         spd_p < 0.0f || spd_p > 100.0f || spd_i < 0.0f || spd_i > 10000.0f ||
+        pos_spd_p < 0.0f || pos_spd_p > 100.0f || pos_spd_i < 0.0f || pos_spd_i > 10000.0f ||
         spd_p_low < 0.0f || spd_p_low > 100.0f || spd_p_high < 0.0f || spd_p_high > 100.0f ||
         pos_p < 0.0f || pos_p > 1000.0f || fabsf(set_speed) > POS_SPEED_LIMIT_MAX ||
         fabsf(set_position) > 1000000.0f || fabsf(position_delta) > POS_RELATIVE_STEP_MAX_RAD ||
@@ -398,6 +410,10 @@ static void vofa_parse_cmd(const char *line, uint16_t length)
             motor_config.spd_gain_schedule = spd_schedule;
         }
         if (pos_dirty) motor_config.pos_p_gain = pos_p;
+        if (pos_spd_dirty) {
+            motor_config.pos_spd_p_gain = pos_spd_p;
+            motor_config.pos_spd_i_gain = pos_spd_i;
+        }
         __set_PRIMASK(primask);
         vofa_report_tuning("accepted");
         return;
@@ -446,6 +462,10 @@ static void vofa_parse_cmd(const char *line, uint16_t length)
     }
     if (pos_dirty) {
         motor_config.pos_p_gain = pos_p;
+    }
+    if (pos_spd_dirty) {
+        motor_config.pos_spd_p_gain = pos_spd_p;
+        motor_config.pos_spd_i_gain = pos_spd_i;
     }
     if (pos_accel_dirty) {
         motor_config.pos_accel_limit = pos_accel;

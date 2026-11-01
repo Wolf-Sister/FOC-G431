@@ -264,6 +264,11 @@ bool MotorPort_RunOuterLoop(void)
     else if (motor_control.mode == MOTOR_TORQUE) return true;
     else if (MotorMotion_Step(&motion, counts, velocity,
                               motor_config.pos_p_gain, &motor_control.set_speed)) {
+        if (motion.mode == 2U) {
+            motor_control.set_position = (float)motion.target * 0.0001f;
+            motor_control.pos_meas = (float)((double)counts * (6.283185307179586476925286766559 / 16384.0));
+            motor_control.pos_error = MotorMotion_Error(counts, motion.target);
+        }
         if (motionRole == MOTOR_ROLE_JOINT) motor_control.set_speed *= (float)motionAxis.direction;
         return true;
     }

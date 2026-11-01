@@ -200,5 +200,7 @@ void control_pid_init(void)
                    ID_CURRENT_KP_DEFAULT,
                    ID_CURRENT_KI_DEFAULT);
     speed_pid_init(SPEED_KP_DEFAULT, SPEED_KI_DEFAULT);
+    motor_config.pos_spd_p_gain = POSITION_SPEED_KP_DEFAULT;
+    motor_config.pos_spd_i_gain = POSITION_SPEED_KI_DEFAULT;
     motor_config.pos_p_gain = POSITION_KP_DEFAULT;
 }

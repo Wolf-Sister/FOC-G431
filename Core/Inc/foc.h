@@ -146,6 +146,8 @@ typedef struct {
     float id_i_gain;            /* D 轴 (磁通) 电流环 I 增益                    */
     float spd_p_gain;           /* 速度环 P 增益                                */
     float spd_i_gain;           /* 速度环 I 增益                                */
+    float pos_spd_p_gain;       /* Position-mode inner speed PI gains */
+    float pos_spd_i_gain;
     float spd_p_low_speed;      /* 调度低速区 P 增益                            */
     float spd_p_high_speed;     /* 调度高速区 P 增益                            */
     uint8_t spd_gain_schedule;  /* 1 = 启用两段速度 P 增益调度                  */
@@ -183,6 +185,7 @@ typedef struct {
     float set_speed;           /* 速度目标值 (机械角速度 rad/s)                 */
     float set_position;        /* 位置目标值 (多圈弧度 rad)                     */
     float pos_meas;            /* 测量多圈位置 (rad)                            */
+    float pos_error;           /* Position-loop error from local count difference (rad) */
     float vel_meas;            /* 测量速度，滤波后 (rad/s)                      */
     float vel_raw;             /* 滤波前原始速度 (rad/s)                        */
     float vel_filter_state;    /* 速度低通滤波状态变量                          */

@@ -316,8 +316,13 @@ int main(void)
          *   [11] position_meas   - Measured multi-turn position (rad)
          *   [12] bus_voltage    - Bus voltage from INA219 (V)
          *   [13] bus_current    - Bus current from INA219 (A)
+           *   [14] speed_integral - Inner speed PI integral output (A)
+           *   [15] speed_ki_active - Active inner speed I gain
+           *   [16] position_error - Position-loop count-difference error (rad)
          */
-        float vofa_data[14] = {
+          uint32_t telemetry_primask = __get_PRIMASK();
+          __disable_irq();
+          float vofa_data[17] = {
             motor_control.id_target,
             motor_control.id_meas,
             motor_control.set_torque,
@@ -331,9 +336,13 @@ int main(void)
             motor_control.set_position,
             motor_control.pos_meas,
             ina219_vbus,      /* [12] 母线电压 (V) */
-            ina219_ibus       /* [13] 母线电流 (A) */
+              ina219_ibus,      /* [13] 母线电流 (A) */
+              speed_loop.integral_prev,
+              speed_loop.I,
+              motor_control.pos_error
         };
-        VOFA_SendData(vofa_data, 14);
+          __set_PRIMASK(telemetry_primask);
+          VOFA_SendData(vofa_data, 17);
         motor_control.status_flag = 0;  /* clear after TX */
       }
     }

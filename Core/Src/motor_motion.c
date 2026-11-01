@@ -63,13 +63,16 @@ bool MotorMotion_Step(motor_motion_t *s, int64_t counts, float velocity, float k
         float ceiling = fminf((float)s->config.positionSpeed * 0.001f, sqrtf(2.0f * accel * remaining));
         desired = fmaxf(-ceiling, fminf(ceiling, error * kp));
     }
-    float delta = accel * MOTOR_MOTION_LOOP_DT_S;
-    s->speed += fmaxf(-delta, fminf(delta, desired - s->speed));
     if (s->mode == 2U) {
-        /* A shrinking position envelope overrides the reference slew limit:
-         * retaining the old reference here delays braking after a disturbance.
-         * Drop an obsolete direction at target crossing, then ramp the return. */
-        s->speed = fmaxf(fminf(desired, 0.0f), fminf(fmaxf(desired, 0.0f), s->speed));
+        /* Position startup follows the bounded P reference without a slew
+         * ramp. accel still defines the braking-distance envelope above.
+         * Cancel an obsolete direction for one step before reversing. */
+        if ((s->speed > 0.0f && desired < 0.0f) ||
+            (s->speed < 0.0f && desired > 0.0f)) s->speed = 0.0f;
+        else s->speed = desired;
+    } else {
+        float delta = accel * MOTOR_MOTION_LOOP_DT_S;
+        s->speed += fmaxf(-delta, fminf(delta, desired - s->speed));
     }
     *speed = s->speed;
     if (!isfinite(*speed)) { s->failure = MOTION_FAILURE_NONFINITE; return false; }
