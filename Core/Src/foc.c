@@ -692,6 +692,27 @@ static float foc_initial_speed_kp(float speed_ref)
     return foc_select_speed_kp(speed_ref);
 }
 
+static float foc_position_friction_current(float speed_ref, float velocity)
+{
+    float position_error = fabsf(motor_control.pos_error);
+    float width = POSITION_FRICTION_FULL_RAD - POSITION_FRICTION_ZERO_RAD;
+    if (motor_control.mode != MOTOR_POSITION || !isfinite(position_error) ||
+        !isfinite(speed_ref) || !isfinite(velocity) || speed_ref == 0.0f ||
+        position_error <= POSITION_FRICTION_ZERO_RAD || width <= 0.0f ||
+        POSITION_FRICTION_CURRENT_A <= 0.0f || POSITION_FRICTION_SPEED_RAD_S <= 0.0f) return 0.0f;
+
+    /* Fade at the target and once moving. Never add propulsion when the shaft
+     * already meets/exceeds the reference in the requested direction. The
+     * reference is in encoder coordinates, including the JOINT axis mapping. */
+    float direction = speed_ref > 0.0f ? 1.0f : -1.0f;
+    float position_scale = fminf(1.0f, (position_error - POSITION_FRICTION_ZERO_RAD) / width);
+    float tracking_scale = fmaxf(0.0f, fminf(1.0f,
+        (fabsf(speed_ref) - direction * velocity) / fabsf(speed_ref)));
+    float speed_scale = fmaxf(0.0f, 1.0f - fabsf(velocity) / POSITION_FRICTION_SPEED_RAD_S);
+    return (float)motor_config.dir * direction * POSITION_FRICTION_CURRENT_A *
+           position_scale * tracking_scale * speed_scale;
+}
+
 /**
   * @brief  速度外环 — 1 kHz，级联在电流环之上
   *         使用编码器的 20 间隔计数窗口速度，运行
@@ -734,13 +755,24 @@ static void foc_speed_loop(const encoder_cache_t *encoder)
                  ? motor_config.pos_spd_i_gain : motor_config.spd_i_gain;
 
     float iq_ref = PIDController_Update(&speed_loop, error);
+    float friction_current = foc_position_friction_current(motor_control.set_speed, vel_filt);
+    float requested_iq = iq_ref + friction_current;
+    iq_ref = requested_iq;
 
     /* 5. 将 Iq 参考钳位到电机电流限幅值
      *    PIDController_Update 已经钳位到 speed_loop.limit，
      *    此处二次钳位为深度防御 */
     float current_limit = motor_config.speed_current_limit;
+    if (friction_current != 0.0f && speed_loop.limit < current_limit) current_limit = speed_loop.limit;
     if (iq_ref >  current_limit) iq_ref =  current_limit;
     if (iq_ref < -current_limit) iq_ref = -current_limit;
+    if (friction_current != 0.0f && iq_ref != requested_iq &&
+        speed_loop.I > 0.0f && speed_loop.sample_time > 0.0f) {
+        /* Track the total saturated command so adding feedforward cannot hide
+         * saturation from the speed integrator. Keep normal holding integral. */
+        PIDController_ApplyTracking(&speed_loop, iq_ref - requested_iq,
+                                    1.0f / speed_loop.sample_time);
+    }
 
     motor_control.set_torque = iq_ref;
 }

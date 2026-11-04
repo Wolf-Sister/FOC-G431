@@ -25,6 +25,11 @@ extern "C" {
 #define POSITION_SPEED_KP_DEFAULT SPEED_KP_DEFAULT
 #define POSITION_SPEED_KI_DEFAULT SPEED_KI_DEFAULT
 #define POSITION_KP_DEFAULT      10.0000f
+/* Node-4 unloaded bench, symmetric breakaway compensation; not a torque rating. */
+#define POSITION_FRICTION_CURRENT_A       0.030f
+#define POSITION_FRICTION_ZERO_RAD        0.0017453293f /* 0.1 degree */
+#define POSITION_FRICTION_FULL_RAD        0.017453293f  /* 1 degree */
+#define POSITION_FRICTION_SPEED_RAD_S     1.0f
 #define CURRENT_VECTOR_AW_GAIN_DEFAULT  2000.0f
 
 /* PID 控制器状态 ------------------------------------------------------*/
