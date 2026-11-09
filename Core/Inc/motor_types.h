@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include "motor_motion.h"
 #include "motor_axis.h"
+#include "motor_impedance.h"
 
 typedef struct {
     uint32_t sequence, capturedMs, encoderSequence;
@@ -33,7 +34,7 @@ typedef struct {
     uint32_t version, epoch, receivedMs;
     uint16_t seq;
     uint8_t kind;
-    int32_t iqMa; /* Legacy field name: mode 0=mA, 1=mrad/s, 2=0.0001 rad. */
+    int32_t iqMa; /* Legacy field name: mode 0=mA, 1=mrad/s, 2/3=0.0001 rad. */
     uint32_t currentLimitMa;
     float alignmentVoltage;
     uint8_t mode;
@@ -41,5 +42,6 @@ typedef struct {
     int8_t iqDirection;
     motor_axis_config_t axis;
     motor_motion_config_t motion;
+    motor_impedance_config_t impedance;
 } motor_command_t;
 #endif

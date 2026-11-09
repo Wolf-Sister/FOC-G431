@@ -36,7 +36,7 @@ extern "C" {
 /* CONFIG: 16V 量程 | 分流 ±40mV | 12bit ADC | 连续转换 (shunt+bus)            */
 /*   位解算: BRNG=0(16V), PG=00(±40mV), BADC=0011(12bit), SADC=0011(12bit), MODE=111(Continuous) */
 /*   修正说明: 原 0x0FC0 的低三位为 000，会导致器件进入 Power-Down 挂起状态   */
-#define INA219_CONFIG_VALUE    0x019Fu
+#define INA219_CONFIG_VALUE    0x219Fu
 
 /* CALIB: Current_LSB = 100µA/bit → 电流寄存器满量程 ≈3.28A                   */
 /*   CAL = 0.04096 / (Current_LSB × Rshunt) = 0.04096/(1e-4×0.01) = 40960      */

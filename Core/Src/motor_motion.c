@@ -5,15 +5,19 @@ int64_t MotorMotion_Counts(int32_t turns, uint16_t raw) { return (int64_t)turns 
 bool MotorMotion_ConfigValid(const motor_motion_config_t *c, uint8_t mode)
 {
     if (mode == 0U) return true;
-    if (mode > 2U || !c->speedLimit || !c->acceleration) return false;
-    return mode == 1U || (c->positionMin < c->positionMax && c->positionSpeed && c->positionSpeed <= c->speedLimit);
+    if (mode > 3U || !c->speedLimit) return false;
+    if (mode == 1U) return c->acceleration != 0U;
+    if (mode == 2U) return c->acceleration != 0U && c->positionMin < c->positionMax &&
+                            c->positionSpeed != 0U && c->positionSpeed <= c->speedLimit;
+    return mode == 3U && c->positionMin < c->positionMax;
 }
 bool MotorMotion_TargetValid(const motor_motion_config_t *c, uint8_t mode, int32_t v, uint32_t iqLimit)
 {
     if (!MotorMotion_ConfigValid(c, mode)) return false;
     if (!mode) return v <= (int32_t)iqLimit && v >= -(int32_t)iqLimit;
     if (mode == 1U) return v <= (int32_t)c->speedLimit && v >= -(int32_t)c->speedLimit;
-    return v >= c->positionMin && v <= c->positionMax;
+    if (mode == 2U || mode == 3U) return v >= c->positionMin && v <= c->positionMax;
+    return false;
 }
 bool MotorMotion_InRange(const motor_motion_config_t *c, int64_t counts)
 {
@@ -37,7 +41,7 @@ float MotorMotion_Error(int64_t counts, int32_t position)
 bool MotorMotion_Step(motor_motion_t *s, int64_t counts, float velocity, float kp, float *speed)
 {
     s->failure = MOTION_FAILURE_NONE;
-    if (!MotorMotion_ConfigValid(&s->config, s->mode) || !s->mode) {
+    if (s->mode == 3U || !MotorMotion_ConfigValid(&s->config, s->mode) || !s->mode) {
         s->failure = MOTION_FAILURE_CONFIG; return false;
     }
     if (!isfinite(velocity) || !isfinite(s->speed)) {

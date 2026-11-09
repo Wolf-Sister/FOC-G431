@@ -22,6 +22,7 @@ typedef struct {
     uint8_t driverWaiting, driverConfirmed;
     motor_event_t event;
     motor_motion_config_t motion;
+    motor_impedance_config_t impedance;
     motor_axis_config_t axis;
     motor_axis_zero_window_t zeroWindow;
     uint8_t axisDirty, axisStatus, axisCoordinateValid;
@@ -100,7 +101,7 @@ static void publish_command(uint8_t kind, uint32_t received, uint16_t seq, int32
     command.alignmentVoltage = voltage;
     command.mode = runtime.mode; command.motion = runtime.motion;
     command.role = runtime.role; command.iqDirection = MotorProfile_Selected.iqDirection;
-    command.axis = runtime.axis;
+    command.axis = runtime.axis; command.impedance = runtime.impedance;
     commands[next] = command;
     __DMB();
     commandIndex = next;
@@ -148,6 +149,9 @@ void MotorSupervisor_Init(uint32_t seed, uint32_t now, bool automaticCalibration
     runtime.state = CAN_STATE_CALIBRATING;
     runtime.role = MotorProfile_Selected.role;
     runtime.currentLimitMa = MotorProfile_Selected.initialCurrentMa;
+    runtime.impedance.kpMilliAPerRad = MOTOR_IMPEDANCE_KP_DEFAULT_MILLI_A_PER_RAD;
+    runtime.impedance.kdMilliASPerRad = MOTOR_IMPEDANCE_KD_DEFAULT_MILLI_A_S_PER_RAD;
+    runtime.impedance.feedforwardTransitionMs = 100U;
     runtime.motion.speedLimit = MotorProfile_Selected.speedDefaultMradS;
     runtime.motion.positionSpeed = MotorProfile_Selected.positionSpeedDefaultMradS;
     runtime.motion.acceleration = MotorProfile_Selected.accelerationDefaultMradS2;
@@ -443,6 +447,30 @@ static uint8_t get_param(uint16_t index, uint32_t *value)
     case 0x0245: case 0x0246:
         if (!EncoderAutoCal_Read(index,value)) return CAN_RESULT_BAD_INDEX;
         break;
+    case 0x0250: *value = runtime.impedance.kpMilliAPerRad; break;
+    case 0x0251: *value = runtime.impedance.kdMilliASPerRad; break;
+    case 0x0252: *value = MOTOR_IMPEDANCE_KP_MAX_MILLI_A_PER_RAD; break;
+    case 0x0253: *value = MOTOR_IMPEDANCE_KD_MAX_MILLI_A_S_PER_RAD; break;
+    case 0x0254: *value = (uint32_t)runtime.impedance.feedforwardIqMa; break;
+    case 0x0255: *value = runtime.impedance.feedforwardTransitionMs; break;
+    case 0x0260: case 0x0261: case 0x0262: case 0x0263:
+    case 0x0264: case 0x0265: case 0x0266: case 0x0267: case 0x0268: case 0x0269: {
+        motor_impedance_output_t diagnostic = {0};
+        if (!MotorPort_ReadImpedanceDiagnostic(&diagnostic)) return CAN_RESULT_BAD_STATE;
+        switch (index) {
+        case 0x0260: *value = diagnostic.flags; break;
+        case 0x0261: *value = (uint32_t)diagnostic.positionErrorQ; break;
+        case 0x0262: *value = (uint32_t)diagnostic.filteredVelocityMilliRadS; break;
+        case 0x0263: *value = (uint32_t)diagnostic.pCurrentMa; break;
+        case 0x0264: *value = (uint32_t)diagnostic.dCurrentMa; break;
+        case 0x0265: *value = (uint32_t)diagnostic.rawAxisCurrentMa; break;
+        case 0x0266: *value = (uint32_t)diagnostic.commandIqMa; break;
+        case 0x0268: *value = (uint32_t)diagnostic.feedforwardIqMa; break;
+        case 0x0269: *value = (uint32_t)diagnostic.rawElectricalMa; break;
+        default: *value = diagnostic.targetSequence; break;
+        }
+        break;
+    }
     default: return CAN_RESULT_BAD_INDEX;
     }
     return CAN_RESULT_OK;
@@ -465,12 +493,26 @@ static uint8_t set_param(uint16_t index, uint32_t value)
         if (value != 0U) return CAN_RESULT_UNSUPPORTED;
         break;
     case 0x0005:
-        if (value > 2U) return CAN_RESULT_BAD_VALUE;
+        if (value > 3U) return CAN_RESULT_BAD_VALUE;
+        if (value == 3U && runtime.role == MOTOR_ROLE_JOINT &&
+            (!MotorProfile_Selected.installationQualified || !MotorProfile_Selected.motionQualified ||
+             !MotorProfile_Selected.iqDirectionValidated || !MotorProfile_Selected.referencePresent ||
+             !MotorAxis_ConfigValid(&runtime.axis))) return CAN_RESULT_NOT_CONFIGURED;
+        if (value == 3U && !MotorMotion_ConfigValid(&runtime.motion, 3U)) return CAN_RESULT_NOT_CONFIGURED;
         runtime.mode = (uint8_t)value; break;
     case 0x0010:
         if (!value || value > MotorProfile_Selected.currentMaxMa || (float)value * 0.001f > CURRENT_REF_HARD_MAX_A)
             return CAN_RESULT_BAD_VALUE;
         runtime.currentLimitMa = value; break;
+    case 0x0250:
+        if (value > MOTOR_IMPEDANCE_KP_MAX_MILLI_A_PER_RAD) return CAN_RESULT_BAD_VALUE;
+        runtime.impedance.kpMilliAPerRad = value; break;
+    case 0x0251:
+        if (value > MOTOR_IMPEDANCE_KD_MAX_MILLI_A_S_PER_RAD) return CAN_RESULT_BAD_VALUE;
+        runtime.impedance.kdMilliASPerRad = value; break;
+    case 0x0252: case 0x0253: case 0x0260: case 0x0261: case 0x0262:
+    case 0x0263: case 0x0264: case 0x0265: case 0x0266: case 0x0267:
+        return CAN_RESULT_BAD_INDEX;
     case 0x0011:
         if (!value || value > MotorProfile_Selected.speedMaxMradS) return CAN_RESULT_BAD_VALUE;
         runtime.motion.speedLimit = value;
@@ -574,12 +616,60 @@ void MotorSupervisor_Request(const uint8_t request[8], uint32_t receivedEpoch, u
         value = faultBits; goto done;
     }
     if (faultBits) { result = CAN_RESULT_FAULT_LATCHED; goto done; }
+    if (request[0] == CAN_OP_SET_PD_GAINS || request[0] == CAN_OP_SET_PD_FEEDFORWARD) {
+        motor_impedance_config_t config = runtime.impedance;
+        if (!runtime.sessionValid) { result = CAN_RESULT_BAD_SESSION; goto done; }
+        if ((uint32_t)(now - receivedMs) >= MOTOR_TARGET_LEASE_MS) { result = CAN_RESULT_STALE; goto done; }
+        if (runtime.mode != 3U || runtime.armPending || runtime.calibrating ||
+            runtime.autoPending || runtime.driverWaiting || runtime.eventPending ||
+            health.driverFault || EncoderBench_IsActive() ||
+            (runtime.state != CAN_STATE_READY && runtime.state != CAN_STATE_DISABLED &&
+             runtime.state != CAN_STATE_ENABLED)) { result = CAN_RESULT_BAD_STATE; goto done; }
+        if (request[0] == CAN_OP_SET_PD_GAINS) {
+            config.kpMilliAPerRad = argument & 0xFFFFU;
+            config.kdMilliASPerRad = argument >> 16;
+            config.transitionMs = index;
+        } else {
+            int32_t feedforward = CAN_ReadI32(request + 4);
+            int64_t magnitude = feedforward < 0 ? -(int64_t)feedforward : (int64_t)feedforward;
+            if (magnitude > runtime.currentLimitMa || magnitude > MotorProfile_Selected.currentMaxMa) {
+                result = CAN_RESULT_BAD_VALUE; goto done;
+            }
+            config.feedforwardIqMa = feedforward;
+            config.feedforwardTransitionMs = index;
+        }
+        if (!MotorImpedance_ConfigActive(&config)) { result = CAN_RESULT_BAD_VALUE; goto done; }
+        if (runtime.state == CAN_STATE_ENABLED &&
+            (!health.outputEnabled || !runtime.acceptedValid ||
+             (uint32_t)(now - runtime.initialReceivedMs) >= MOTOR_TARGET_LEASE_MS)) {
+            result = CAN_RESULT_BAD_STATE; goto done;
+        }
+        if (runtime.state != CAN_STATE_ENABLED && (health.outputEnabled || health.driverEnabled)) {
+            result = CAN_RESULT_BAD_STATE; goto done;
+        }
+        runtime.impedance = config;
+        runtime.revision++;
+        if (runtime.state == CAN_STATE_ENABLED) {
+            /* Preserve original target timestamp and sequence: gains never renew a lease. */
+            publish_command(MOTOR_CMD_TARGET, runtime.initialReceivedMs,
+                            runtime.acceptedSeq, runtime.initialIqMa, 0.0f);
+        } else {
+            runtime.initialValid = 0U;
+            consumedCandidate = candidateVersion;
+        }
+        value = argument;
+        goto done;
+    }
     if (request[0] == CAN_OP_SET_PARAM || request[0] == CAN_OP_SET_IQ_LIMIT ||
         request[0] == CAN_OP_SET_MODE || request[0] == CAN_OP_SET_SOURCE) {
         if (request[0] != CAN_OP_SET_PARAM && index) { result = CAN_RESULT_BAD_VALUE; goto done; }
         uint16_t parameter = request[0] == CAN_OP_SET_IQ_LIMIT ? 0x0010U :
                              request[0] == CAN_OP_SET_MODE ? 0x0005U :
                              request[0] == CAN_OP_SET_SOURCE ? 0x0004U : index;
+        if ((parameter == 0x0250U || parameter == 0x0251U) &&
+            (health.outputEnabled || health.driverEnabled || health.driverFault || EncoderBench_IsActive())) {
+            result = CAN_RESULT_BAD_STATE; goto done;
+        }
         result = set_param(parameter, argument); value = result ? 0U : argument; goto done;
     }
     if (request[0] == CAN_OP_CAL_KEEPALIVE) {
@@ -623,9 +713,12 @@ void MotorSupervisor_Request(const uint8_t request[8], uint32_t receivedEpoch, u
             (uint32_t)(now - runtime.initialReceivedMs) > MOTOR_INITIAL_TARGET_MAX_AGE_MS) {
             result = CAN_RESULT_STALE; goto done;
         }
+        if (runtime.mode == 3U && !MotorImpedance_ConfigActive(&runtime.impedance)) {
+            result = CAN_RESULT_NOT_CONFIGURED; goto done;
+        }
         if ((runtime.mode == 1U && runtime.initialIqMa != 0) ||
-            (runtime.mode == 2U && !MotorPort_PositionReady(runtime.initialIqMa, &runtime.motion,
-                                                             runtime.role, &runtime.axis))) {
+            ((runtime.mode == 2U || runtime.mode == 3U) &&
+             !MotorPort_PositionReady(runtime.initialIqMa, &runtime.motion, runtime.role, &runtime.axis))) {
             result = CAN_RESULT_BAD_VALUE; goto done;
         }
         runtime.armPending = 1U;

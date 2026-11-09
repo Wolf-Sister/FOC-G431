@@ -41,10 +41,10 @@ extern "C" {
 #define CURRENT_FACTOR      (ADC_VOLTAGE_RANGE / (ADC_RESOLUTION * SHUNT_RESISTOR * AMPLIFIER_GAIN))
 
 /* 电机供电 ---------------------------------------------------------------*/
-#define MOTOR_VBUS                 12.0f  /* 电机供电电压 (V)                    */
+#define MOTOR_VBUS                 16.8f  /* 电机供电电压 (V)                    */
 #define FOC_BUS_MIN_VALID_V        6.0f
 /* Leave margin below the current INA219 16 V measurement range. */
-#define FOC_BUS_MAX_VALID_V        15.5f
+#define FOC_BUS_MAX_VALID_V        18.0f
 /* Also accommodates the bounded startup alignment while main is occupied. */
 #define FOC_BUS_MAX_AGE_MS         1500U
 #define ABSOLUTE_CURRENT_LIMIT     CURRENT_REF_HARD_MAX_A
@@ -128,9 +128,10 @@ extern volatile Phase_Current_t motor_current;
 /*  电机控制模式                                                               */
 /* ========================================================================== */
 typedef enum {
-    MOTOR_TORQUE,          /* 转矩 / 电流闭环                                 */
-    MOTOR_SPEED,           /* 速度闭环                                        */
-    MOTOR_POSITION         /* 位置闭环                                        */
+    MOTOR_TORQUE = 0,      /* 转矩 / 电流闭环                                 */
+    MOTOR_SPEED = 1,       /* 速度闭环                                        */
+    MOTOR_POSITION = 2,    /* 位置闭环                                        */
+    MOTOR_IMPEDANCE = 3    /* PD 阻抗：位置弹簧 + 速度阻尼，输出 Iq           */
 } Motor_Mode_e;
 
 /* ========================================================================== */

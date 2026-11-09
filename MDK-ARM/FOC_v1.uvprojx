@@ -411,6 +411,11 @@
               <FilePath>../Core/Src/motor_motion.c</FilePath>
             </File>
             <File>
+              <FileName>motor_impedance.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/motor_impedance.c</FilePath>
+            </File>
+            <File>
               <FileName>motor_axis.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/motor_axis.c</FilePath>

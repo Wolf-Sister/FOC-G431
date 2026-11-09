@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #define MOTOR_MOTION_LOOP_DT_S 0.002f /* 500 Hz outer-loop interval */
 typedef struct {
-    /* acceleration: speed-mode slew / position-mode braking, 0.001 rad/s^2. */
+    /* Acceleration is used by speed-mode slew and position-mode braking. PD mode uses speedLimit and position bounds only. */
     uint32_t speedLimit, positionSpeed, acceleration; /* 0.001 SI units */
     int32_t positionMin, positionMax; /* 0.0001 rad, current-boot raw axis */
 } motor_motion_config_t;
@@ -26,6 +26,8 @@ typedef struct {
     int32_t target;
     float rawSpeed, filteredSpeed, speedReference;
     float integral, iqReference, iqMeasured;
+    float impedanceError, impedanceP, impedanceD, impedanceRaw, impedanceIq;
+    uint16_t impedanceSeq;
     uint8_t mode, detail, valid;
 } motor_motion_fault_snapshot_t;
 int64_t MotorMotion_Counts(int32_t turns, uint16_t raw);

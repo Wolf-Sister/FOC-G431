@@ -1,6 +1,7 @@
 #ifndef MOTOR_PORT_H
 #define MOTOR_PORT_H
 #include "motor_types.h"
+#include "motor_impedance.h"
 
 uint32_t MotorPort_Lock(void);
 void MotorPort_Unlock(uint32_t key);
@@ -12,6 +13,7 @@ bool MotorPort_ApplyTarget(const motor_command_t *command, bool first);
 bool MotorPort_RunOuterLoop(void);
 uint16_t MotorPort_MotionFaultBits(void);
 uint16_t MotorPort_MotionFaultDetail(void);
+bool MotorPort_ReadImpedanceDiagnostic(motor_impedance_output_t *output);
 /* First outer-loop failure, latched before disarm resets PI state. Keil watch. */
 extern volatile motor_motion_fault_snapshot_t motor_motion_fault;
 bool MotorPort_PositionReady(int32_t target, const motor_motion_config_t *config,

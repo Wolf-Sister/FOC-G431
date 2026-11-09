@@ -100,7 +100,7 @@ static void CAN_ReadStatus(CAN_NodeStatus *status)
                         (canDebug.busOff << 16) | (canDebug.errorPassive << 17);
     __set_PRIMASK(primask);
     if (MotorSupervisor_Active()) MotorSupervisor_ReadStatus(status, HAL_GetTick());
-    if (MotorSupervisor_Active()) status->capabilities |= CAN_CAP_SOFTWARE_RESET | CAN_CAP_ELECTRICAL_STORAGE;
+    if (MotorSupervisor_Active()) status->capabilities |= CAN_CAP_SOFTWARE_RESET | CAN_CAP_ELECTRICAL_STORAGE | CAN_CAP_PD_IMPEDANCE | CAN_CAP_PD_LIVE_GAINS | CAN_CAP_PD_FEEDFORWARD;
     if (EncoderAutoCal_Supported()) status->capabilities |= CAN_CAP_ENCODER_AUTOCAL;
     status->firmwareVersion = APP_FIRMWARE_VERSION;
     status->uid[0] = HAL_GetUIDw0();

@@ -9,10 +9,16 @@
 #include "board_safety_profile.h"
 #include "encoder_bench.h"
 #include "motor_profile.h"
+#include "motor_impedance.h"
 
 #define MOTOR_OUTER_LOOP_DECIMATION 32U
 
 static motor_motion_t motion;
+static motor_impedance_state_t impedanceState;
+static motor_impedance_config_t impedanceConfig;
+static motor_impedance_output_t impedanceDiagnostic;
+static uint32_t impedanceLimitMa;
+static uint8_t impedanceDivider, impedanceLimited;
 static uint8_t motionRole;
 static motor_axis_config_t motionAxis;
 static uint8_t motionDivider;
@@ -34,7 +40,25 @@ static struct {
 
 uint32_t MotorPort_Lock(void) { uint32_t key = __get_PRIMASK(); __disable_irq(); return key; }
 void MotorPort_Unlock(uint32_t key) { __set_PRIMASK(key); }
-void MotorPort_Disable(void) { foc_disarm(); positionWindow.count = 0U; }
+void MotorPort_Disable(void)
+{
+    foc_disarm();
+    positionWindow.count = 0U;
+    motionDivider = impedanceDivider = impedanceLimited = 0U;
+    MotorImpedance_Clear(&impedanceState);
+    memset(&impedanceConfig, 0, sizeof(impedanceConfig));
+    impedanceLimitMa = 0U;
+}
+bool MotorPort_ReadImpedanceDiagnostic(motor_impedance_output_t *output)
+{
+    bool valid;
+    if (output == NULL) return false;
+    uint32_t key = MotorPort_Lock();
+    valid = !current_loop_enable;
+    *output = impedanceDiagnostic;
+    MotorPort_Unlock(key);
+    return valid;
+}
 bool MotorPort_RestoreElectrical(float zero) { return foc_restore_electrical(zero); }
 
 void MotorPort_ReadHealth(motor_health_t *health)
@@ -106,7 +130,7 @@ enum {
     APPLY_NOT_STATIONARY = 0x84, APPLY_POSITION_MAP = 0x85,
     APPLY_POSITION_RANGE = 0x86, APPLY_POSITION_ERROR = 0x87,
     APPLY_JOINT_MARGIN = 0x88, APPLY_CURRENT_REJECTED = 0x89,
-    APPLY_STILL_WINDOW = 0x8A
+    APPLY_STILL_WINDOW = 0x8A, APPLY_IMPEDANCE_CONFIG = 0x8B
 };
 
 /* ADC owns updates. Main-context readers take the same IRQ lock as ADC apply. */
@@ -191,16 +215,66 @@ static bool reject_apply(uint8_t detail, const motor_command_t *command,
     motor_motion_fault = *snapshot;
     return false;
 }
+
+static int8_t impedance_current_direction(uint8_t role, int8_t iqDirection)
+{
+    if (role == MOTOR_ROLE_JOINT)
+        return (iqDirection == 1 || iqDirection == -1) ? iqDirection : 0;
+    return (motor_config.dir == 1 || motor_config.dir == -1) ? (int8_t)motor_config.dir : 0;
+}
+
+static void copy_impedance_fault(motor_motion_fault_snapshot_t *snapshot,
+                                 const motor_impedance_output_t *output)
+{
+    snapshot->impedanceError = output->positionErrorRad;
+    snapshot->impedanceP = (float)output->pCurrentMa * 0.001f;
+    snapshot->impedanceD = (float)output->dCurrentMa * 0.001f;
+    snapshot->impedanceRaw = (float)output->rawAxisCurrentMa * 0.001f;
+    snapshot->impedanceIq = (float)output->commandIqMa * 0.001f;
+    snapshot->impedanceSeq = output->targetSequence;
+}
+
+static bool fail_outer_loop(uint8_t failure, uint16_t detail, int64_t counts,
+                            float rawVelocity, const motor_impedance_output_t *output)
+{
+    motor_motion_fault_snapshot_t snapshot = {0};
+    motion.failure = failure;
+    snapshot.tick = HAL_GetTick(); snapshot.cycle = DWT->CYCCNT;
+    snapshot.counts = counts; snapshot.target = motion.target;
+    snapshot.rawSpeed = rawVelocity; snapshot.filteredSpeed = motor_control.vel_meas;
+    snapshot.speedReference = motor_control.set_speed;
+    snapshot.integral = speed_loop.integral_prev;
+    snapshot.iqReference = motor_control.set_torque; snapshot.iqMeasured = motor_control.iq_meas;
+    snapshot.mode = motion.mode; snapshot.detail = detail; snapshot.valid = 1U;
+    if (output != NULL) copy_impedance_fault(&snapshot, output);
+    motor_motion_fault = snapshot;
+    return false;
+}
+
 bool MotorPort_ApplyTarget(const motor_command_t *command, bool first)
 {
     motor_motion_fault_snapshot_t snapshot = {0};
+    encoder_cache_t encoder = {0};
+    int64_t counts = 0;
+    float velocity = 0.0f;
     if (!MotorMotion_TargetValid(&command->motion, command->mode, command->iqMa, command->currentLimitMa))
         return reject_apply(APPLY_BAD_TARGET, command, &snapshot);
+    if (command->mode == 3U &&
+        (!MotorImpedance_ConfigActive(&command->impedance) ||
+         impedance_current_direction(command->role, command->iqDirection) == 0 ||
+         command->currentLimitMa == 0U))
+        return reject_apply(APPLY_IMPEDANCE_CONFIG, command, &snapshot);
     motionRole = command->role; motionAxis = command->axis;
-    if (command->role == MOTOR_ROLE_JOINT && command->mode == 2U &&
+    if (command->role == MOTOR_ROLE_JOINT && (command->mode == 2U || command->mode == 3U) &&
         (command->iqMa < (int64_t)MotorProfile_Selected.minimumQ + MotorProfile_Selected.positionMarginQ ||
          command->iqMa > (int64_t)MotorProfile_Selected.maximumQ - MotorProfile_Selected.positionMarginQ))
         return reject_apply(APPLY_JOINT_MARGIN, command, &snapshot);
+
+    if (first) {
+        MotorImpedance_Clear(&impedanceState);
+        impedanceDiagnostic = (motor_impedance_output_t){0};
+        impedanceLimited = impedanceDivider = 0U;
+    }
     if (command->mode == 0U) {
         int32_t iqMa = command->role == MOTOR_ROLE_JOINT ?
                        command->iqMa * command->iqDirection : command->iqMa;
@@ -208,35 +282,68 @@ bool MotorPort_ApplyTarget(const motor_command_t *command, bool first)
             return reject_apply(APPLY_CURRENT_REJECTED, command, &snapshot);
         return true;
     }
+    if (first && (command->mode == 2U || command->mode == 3U)) {
+        uint8_t detail = position_ready_detail(command->iqMa, &command->motion,
+                                               command->role, &command->axis, &snapshot);
+        if (detail) return reject_apply(detail, command, &snapshot);
+    }
+    if (command->mode == 3U && first) {
+        if (!Encoder_Cache_Read(&encoder) || encoder.stale ||
+            !motion_position(&encoder, command->role, &command->axis, &counts))
+            return reject_apply(APPLY_ENCODER_READ, command, &snapshot);
+        velocity = encoder.velocity_rad_s;
+        if (command->role == MOTOR_ROLE_JOINT) velocity *= (float)command->axis.direction;
+        if (!isfinite(velocity) || !MotorImpedance_Reset(&impedanceState, velocity))
+            return reject_apply(APPLY_IMPEDANCE_CONFIG, command, &snapshot);
+    }
+    if (first && !MotorPort_ApplyIq(0, command->currentLimitMa, true))
+        return reject_apply(APPLY_CURRENT_REJECTED, command, &snapshot);
     if (first) {
-        if (command->mode == 2U) {
-            uint8_t detail = position_ready_detail(command->iqMa, &command->motion,
-                                                  command->role, &command->axis, &snapshot);
-            if (detail) return reject_apply(detail, command, &snapshot);
-        }
-        if (!MotorPort_ApplyIq(0, command->currentLimitMa, true))
-            return reject_apply(APPLY_CURRENT_REJECTED, command, &snapshot);
         memset(&motion, 0, sizeof(motion));
-        motor_motion_fault = (motor_motion_fault_snapshot_t){0};
-        motion.config = command->motion; motion.mode = command->mode; motionDivider = 0U;
+        memset((void *)&motor_motion_fault, 0, sizeof(motor_motion_fault));
+        motion.config = command->motion; motion.mode = command->mode;
+        motionDivider = impedanceDivider = 0U;
         motionRole = command->role; motionAxis = command->axis;
         motor_control.set_speed = 0.0f;
         motor_control.spd_needs_init = 1U;
         speed_loop.limit = (float)command->currentLimitMa * 0.001f;
-        motor_control.mode = command->mode == 1U ? MOTOR_SPEED : MOTOR_POSITION;
+        motor_control.mode = command->mode == 1U ? MOTOR_SPEED :
+                             command->mode == 3U ? MOTOR_IMPEDANCE : MOTOR_POSITION;
+        impedanceConfig = command->impedance;
+        impedanceLimitMa = command->currentLimitMa;
+    } else if (command->mode == 3U) {
+        impedanceConfig = command->impedance;
+        impedanceLimitMa = command->currentLimitMa;
     }
-    MotorMotion_SetTarget(&motion, command->iqMa);
+    if (command->mode == 3U) {
+        if (!MotorImpedance_SetTarget(&impedanceState, command->iqMa, command->seq))
+            return reject_apply(APPLY_IMPEDANCE_CONFIG, command, &snapshot);
+        motion.target = command->iqMa;
+    } else {
+        MotorMotion_SetTarget(&motion, command->iqMa);
+    }
     return true;
 }
+
 bool MotorPort_RunOuterLoop(void)
 {
-    if (!current_loop_enable) { motionDivider = 0U; return true; }
+    bool impedanceMode;
+    if (!current_loop_enable) { motionDivider = impedanceDivider = 0U; return true; }
+    impedanceMode = motor_control.mode == MOTOR_IMPEDANCE;
     if (motor_control.mode == MOTOR_TORQUE && motionRole != MOTOR_ROLE_JOINT) {
-        motionDivider = 0U;
+        motionDivider = impedanceDivider = 0U;
         return true;
     }
-    if (++motionDivider < MOTOR_OUTER_LOOP_DECIMATION) return true;
-    motionDivider = 0U;
+    if (impedanceMode) {
+        motionDivider = 0U;
+        if (++impedanceDivider < MOTOR_IMPEDANCE_DECIMATION) return true;
+        impedanceDivider = 0U;
+    } else {
+        impedanceDivider = 0U;
+        if (++motionDivider < MOTOR_OUTER_LOOP_DECIMATION) return true;
+        motionDivider = 0U;
+    }
+
     encoder_cache_t e = {0};
     bool valid = Encoder_Cache_Read(&e) && !e.stale;
     int64_t counts = 0;
@@ -246,7 +353,7 @@ bool MotorPort_RunOuterLoop(void)
     uint8_t speedLimitViolation = 0U;
     if (motionRole == MOTOR_ROLE_JOINT) {
         velocity *= (float)motionAxis.direction;
-        if (fabsf(velocity) * 1000.0f > (float)MotorProfile_Selected.speedMaxMradS) {
+        if (!isfinite(velocity) || fabsf(velocity) * 1000.0f > (float)MotorProfile_Selected.speedMaxMradS) {
             speedLimitViolation = 1U;
             positionValid = false;
         }
@@ -259,6 +366,48 @@ bool MotorPort_RunOuterLoop(void)
             if (positionLimitViolation) positionValid = false;
         }
     }
+
+    if (impedanceMode) {
+        motor_impedance_output_t output = {0};
+        uint8_t failure = MOTION_FAILURE_NONE;
+        uint16_t detail = 0U;
+        float speedLimit = (float)motion.config.speedLimit * 0.001f;
+        if (motionRole == MOTOR_ROLE_JOINT &&
+            speedLimit > (float)MotorProfile_Selected.speedMaxMradS * 0.001f)
+            speedLimit = (float)MotorProfile_Selected.speedMaxMradS * 0.001f;
+        if (!positionValid) {
+            failure = speedLimitViolation ? MOTION_FAILURE_OVERSPEED :
+                      positionLimitViolation ? MOTION_FAILURE_POSITION : MOTION_FAILURE_ENCODER;
+        } else if (!MotorMotion_InRange(&motion.config, counts)) {
+            failure = MOTION_FAILURE_POSITION;
+        } else if (!isfinite(velocity) || !isfinite(speedLimit)) {
+            failure = MOTION_FAILURE_NONFINITE;
+        } else if (fabsf(velocity) > speedLimit) {
+            failure = MOTION_FAILURE_OVERSPEED;
+        }
+        if (failure != MOTION_FAILURE_NONE)
+            return fail_outer_loop(failure, detail, counts, e.velocity_rad_s, &output);
+
+        motor_impedance_result_t result = MotorImpedance_Step(
+            &impedanceState, &impedanceConfig, counts, velocity,
+            impedance_current_direction(motionRole, MotorProfile_Selected.iqDirection),
+            impedanceLimitMa, &output);
+        if (result != MOTOR_IMPEDANCE_OK) {
+            failure = result == MOTOR_IMPEDANCE_BAD_INPUT ? MOTION_FAILURE_NONFINITE : MOTION_FAILURE_CONFIG;
+            return fail_outer_loop(failure, (uint16_t)result, counts, e.velocity_rad_s, &output);
+        }
+        impedanceDiagnostic = output;
+        impedanceLimited = (output.flags & MOTOR_IMPEDANCE_FLAG_CLAMPED) != 0U;
+        motor_control.set_torque = output.iqCommandA;
+        motor_control.id_target = 0.0f;
+        motor_control.set_position = (float)motion.target * 0.0001f;
+        motor_control.pos_meas = (float)((double)counts * (6.283185307179586476925286766559 / 16384.0));
+        motor_control.pos_error = output.positionErrorRad;
+        motor_control.vel_raw = velocity;
+        motor_control.vel_meas = output.filteredVelocityRadS;
+        return true;
+    }
+
     if (!positionValid) motion.failure = speedLimitViolation ? MOTION_FAILURE_OVERSPEED :
                                          positionLimitViolation ? MOTION_FAILURE_POSITION : MOTION_FAILURE_ENCODER;
     else if (motor_control.mode == MOTOR_TORQUE) return true;
@@ -286,6 +435,7 @@ bool MotorPort_RunOuterLoop(void)
     }
     return false;
 }
+
 uint16_t MotorPort_MotionFaultDetail(void) { return motor_motion_fault.detail; }
 uint16_t MotorPort_MotionFaultBits(void)
 {
@@ -326,7 +476,8 @@ void MotorPort_CaptureSample(motor_snapshot_t *sample, uint32_t now)
                               fmaxf(fabsf(motor_current.I_B), fabsf(motor_current.I_C)));
     sample->iq = motor_control.iq_meas;
     sample->id = motor_control.id_meas;
-    sample->currentLimited = current_ref_limited;
+    sample->currentLimited = current_ref_limited ||
+                             (motor_control.mode == MOTOR_IMPEDANCE && impedanceLimited);
     if (!current_loop_enable && sample->valid && sample->electricalValid) {
         /* Disabled samples still carry measured dq current, with no PI/output. */
         float s, c;
